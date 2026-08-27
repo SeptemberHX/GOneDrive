@@ -1,0 +1,11 @@
+[package]
+name = "gonedrive-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared D-Bus interface definitions for GOnedrive"
+
+[dependencies]
+serde.workspace = true
+zbus = { version = "5", default-features = false, features = ["tokio"] }

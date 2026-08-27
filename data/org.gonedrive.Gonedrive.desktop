@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=GOnedrive
+Name[zh_CN]=GOnedrive
+Comment=Sync your OneDrive with two-way sync and files on demand
+Comment[zh_CN]=OneDrive 客户端：双向同步与按需下载
+Exec=gonedrive
+Icon=folder-remote
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+Keywords=onedrive;microsoft;sync;cloud;
+StartupNotify=true
+StartupWMClass=gonedrive

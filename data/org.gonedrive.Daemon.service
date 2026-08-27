@@ -1,0 +1,8 @@
+# D-Bus activation: launching the GTK application starts the daemon if it is
+# not already running, so a user who never touches systemd still gets sync.
+#
+#   install: ~/.local/share/dbus-1/services/org.gonedrive.Daemon.service
+[D-BUS Service]
+Name=org.gonedrive.Daemon
+Exec=/usr/bin/env gonedrived run
+SystemdService=gonedrived.service

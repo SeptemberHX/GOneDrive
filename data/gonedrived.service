@@ -1,0 +1,37 @@
+# systemd *user* unit. The sync daemon runs as the user, never as root:
+# it holds the account's tokens and writes into the user's home directory.
+#
+#   install: ~/.config/systemd/user/gonedrived.service
+#   enable:  systemctl --user enable --now gonedrived.service
+[Unit]
+Description=GOnedrive sync daemon
+Documentation=https://github.com/monotune/GOnedrive
+# The daemon needs the session bus for its own interface and the Secret
+# Service for the refresh token.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/gonedrived run
+Restart=on-failure
+RestartSec=10
+# A sync client that dies repeatedly should stop, not thrash the API.
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# It only ever needs the user's own files and the network.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-write
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=graphical-session.target

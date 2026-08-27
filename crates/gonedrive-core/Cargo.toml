@@ -1,0 +1,38 @@
+[package]
+name = "gonedrive-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core sync engine, Microsoft Graph client and state store for GOnedrive"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+time = { workspace = true, features = ["serde-well-known"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "json", "form", "stream", "http2", "charset", "gzip"] }
+rusqlite = { version = "0.40", features = ["bundled", "time"] }
+oo7 = { version = "0.5", default-features = false, features = ["tokio", "native_crypto"] }
+base64 = "0.23"
+url = "2.5"
+percent-encoding = "2.3"
+hex = "0.4"
+dirs = "6"
+toml = "1"
+futures-util = "0.3"
+bytes = "1"
+sha2 = "0.11.0"
+getrandom = "0.4.3"
+libc = "0.2.189"
+xattr = "1.6.1"
+sha1 = "0.11.0"
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"

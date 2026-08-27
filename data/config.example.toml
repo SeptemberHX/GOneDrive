@@ -1,0 +1,40 @@
+# Copy to ~/.config/gonedrive/config.toml
+
+# Entra ID application (client) id.
+#
+# Leave this commented out to use whatever was baked into the binary at build
+# time (`GONEDRIVE_CLIENT_ID=... cargo build --release`). Set it only to
+# override that — for instance if the shared registration starts getting
+# throttled and you would rather have your own quota.
+#
+# It identifies the *application*, not you: you still sign in with your own
+# Microsoft account. It is not a secret.
+#
+# client_id = "your-application-client-id"
+
+# Local folder mirroring the drive root.
+sync_root = "/home/YOU/OneDrive"
+
+# Poll cadence. The client backs off from the first towards the second while
+# nothing is changing, and snaps back the moment something does.
+poll_interval_secs = 30
+max_poll_interval_secs = 300
+
+# Quiet period a local file must have before it is queued for upload. An
+# application saving a document writes it several times in a row; this stops
+# three half-written versions being uploaded.
+local_debounce_ms = 500
+
+# Files at or above this size use a resumable upload session.
+# Graph rejects simple uploads above 4 MiB, so this cannot be raised.
+upload_session_threshold = 4194304
+
+# Resumable upload chunk size. Must be a multiple of 320 KiB (327680).
+# 10 MiB = 32 x 320 KiB.
+upload_chunk_size = 10485760
+
+max_concurrent_transfers = 4
+
+# Files on demand. Not yet implemented (M2); parsed now so config files
+# written today stay valid.
+on_demand = false
