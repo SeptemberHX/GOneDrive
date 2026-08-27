@@ -186,6 +186,10 @@ pub trait Daemon {
 pub mod hsm {
     use serde::{Deserialize, Serialize};
 
+    fn default_true() -> bool {
+        true
+    }
+
     /// Default socket path. The directory is root-owned; the socket itself is
     /// mode 0666 and every connection is checked with `SO_PEERCRED`.
     pub const SOCKET_PATH: &str = "/run/gonedrive/hsm.sock";
@@ -213,9 +217,22 @@ pub mod hsm {
             ok: bool,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             source: Option<String>,
+            /// Where in the placeholder the staged bytes belong.
+            #[serde(default)]
+            offset: u64,
+            /// Whole file, or only the requested range. A partial fill leaves
+            /// the file dehydrated and its watch armed: a 16 KiB sniff costs
+            /// 16 KiB, and only a reader that goes further pays for the rest.
+            #[serde(default = "default_true")]
+            full: bool,
         },
         /// Liveness probe, also used to confirm the helper's version.
         Ping,
+        /// Ask what the helper can do. A helper that predates this variant
+        /// answers with a parse error, which reads as "no optional features" —
+        /// exactly right: nothing optional may be used until the helper
+        /// explicitly says it understands it.
+        Features,
     }
 
     /// Sent by the helper to the daemon.
@@ -235,8 +252,20 @@ pub mod hsm {
             reader: String,
         },
         /// The content was written and the reader released. The daemon
-        /// finalises its own bookkeeping on seeing this.
-        Filled { id: u64, ok: bool, path: String },
+        /// finalises its own bookkeeping on seeing this — but only for a
+        /// `full` fill; a range fill changes nothing about the file's state.
+        Filled {
+            id: u64,
+            ok: bool,
+            path: String,
+            #[serde(default = "default_true")]
+            full: bool,
+        },
+        /// Answer to [`Request::Features`].
+        Features {
+            #[serde(default)]
+            partial_hydration: bool,
+        },
         Ok,
         Error { message: String },
         Pong { version: String },

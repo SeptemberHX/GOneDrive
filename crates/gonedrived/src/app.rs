@@ -360,6 +360,39 @@ impl App {
         self.emit(DaemonEvent::LoginFailed(message.to_string()));
     }
 
+    /// A head-read this small is served as a range, not a download: it is the
+    /// signature of content sniffing, and even when it is not, filling just
+    /// the window is always correct — the watch stays armed for the rest.
+    const PARTIAL_HYDRATION_CEILING: u64 = 256 * 1024;
+
+    /// Stage what a blocked reader needs: the requested range when it is a
+    /// small head-read, the whole file otherwise. Returns the staged path,
+    /// the placement offset, and whether it completes the file.
+    pub async fn stage_for(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        length: u64,
+        allow_partial: bool,
+    ) -> Result<(std::path::PathBuf, u64, bool)> {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let partial = allow_partial
+            && length > 0
+            && length <= Self::PARTIAL_HYDRATION_CEILING
+            && offset + length < size;
+
+        if partial {
+            let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+            let engine = engines
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
+            let staged = engine.stage_range(path, offset, length).await?;
+            return Ok((staged, offset, false));
+        }
+        let staged = self.stage_content(path).await?;
+        Ok((staged, 0, true))
+    }
+
     /// Download a placeholder's content to a staging file for the helper.
     pub async fn stage_content(&self, path: &std::path::Path) -> Result<std::path::PathBuf> {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));

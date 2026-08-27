@@ -77,10 +77,10 @@ struct Cli {
     uid: Option<u32>,
 }
 
-/// A hydration the helper is waiting on. The reply carries the file the daemon
-/// staged the content in, or `None` if it could not fetch it.
+/// A hydration the helper is waiting on. The reply carries the file the
+/// daemon staged the content in (with its placement), or `None` on failure.
 struct Pending {
-    reply: mpsc::Sender<Option<PathBuf>>,
+    reply: mpsc::Sender<Option<(PathBuf, u64, bool)>>,
 }
 
 struct Shared {
@@ -254,6 +254,11 @@ fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
                 version: env!("CARGO_PKG_VERSION").into(),
             });
         }
+        Request::Features => {
+            let _ = shared.send(&Event::Features {
+                partial_hydration: true,
+            });
+        }
         Request::Watch { path } => {
             let path = PathBuf::from(path);
             match authorise(&path, uid) {
@@ -284,14 +289,20 @@ fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
             }
             let _ = shared.send(&Event::Ok);
         }
-        Request::Hydrated { id, ok, source } => {
+        Request::Hydrated {
+            id,
+            ok,
+            source,
+            offset,
+            full,
+        } => {
             let staged = match (ok, source) {
                 (true, Some(source)) => {
                     let source = PathBuf::from(source);
                     // The staged file is named by an unprivileged process, so
                     // it gets the same ownership check as anything else.
                     match authorise(&source, uid) {
-                        Ok(()) => Some(source),
+                        Ok(()) => Some((source, offset, full)),
                         Err(e) => {
                             tracing::warn!(error = %e, "refusing staged content");
                             None
@@ -402,11 +413,11 @@ fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
         return;
     }
 
-    let allow = match hydrate(&shared, &event) {
-        Ok(allow) => allow,
+    let (allow, full) = match hydrate(&shared, &event) {
+        Ok(result) => result,
         Err(e) => {
             tracing::warn!(error = %e, pid = event.pid, "hydration failed");
-            false
+            (false, true)
         }
     };
     // Answered no matter what: an unanswered pre-content event leaves the
@@ -419,11 +430,12 @@ fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
             id: 0,
             ok: allow,
             path: path.to_string_lossy().into_owned(),
+            full,
         });
     }
 }
 
-fn hydrate(shared: &Arc<Shared>, event: &PreContentEvent) -> Result<bool> {
+fn hydrate(shared: &Arc<Shared>, event: &PreContentEvent) -> Result<(bool, bool)> {
     let Some(path) = &event.path else {
         bail!("the event carried no resolvable path");
     };
@@ -460,30 +472,45 @@ fn hydrate(shared: &Arc<Shared>, event: &PreContentEvent) -> Result<bool> {
             bail!("the daemon did not answer within {HYDRATE_TIMEOUT:?}")
         }
     };
-    let Some(staged) = staged else {
-        return Ok(false);
+    let Some((staged, offset, full)) = staged else {
+        return Ok((false, true));
     };
 
     // Written through the event's own descriptor. Any other descriptor would
     // fault the hole back through this same hook and loop forever.
-    let written = fill_from(&staged, &event.fd)
+    let written = fill_from(&staged, &event.fd, offset)
         .with_context(|| format!("filling from {}", staged.display()))?;
     let _ = std::fs::remove_file(&staged);
 
-    // The file now holds its content, so it no longer needs intercepting.
-    if let Err(e) = shared.fan.unwatch(path) {
-        tracing::debug!(path = %path.display(), error = %e, "could not drop the mark");
+    if full {
+        // The file now holds its content, so it no longer needs intercepting.
+        if let Err(e) = shared.fan.unwatch(path) {
+            tracing::debug!(path = %path.display(), error = %e, "could not drop the mark");
+        }
+        tracing::info!(path = %path.display(), bytes = written, %reader, pid = event.pid, "hydrated");
+    } else {
+        // Only the requested window was filled; the watch stays, so a reader
+        // that keeps going comes back for the rest.
+        tracing::info!(
+            path = %path.display(),
+            bytes = written,
+            offset,
+            %reader,
+            pid = event.pid,
+            "hydrated range"
+        );
     }
-    tracing::info!(path = %path.display(), bytes = written, %reader, pid = event.pid, "hydrated");
-    Ok(true)
+    Ok((true, full))
 }
 
-/// Copy a staged file into the placeholder through the event descriptor.
-fn fill_from(source: &Path, target: &std::os::unix::io::OwnedFd) -> Result<u64> {
+/// Copy a staged file into the placeholder through the event descriptor,
+/// starting at `offset` within the placeholder.
+fn fill_from(source: &Path, target: &std::os::unix::io::OwnedFd, offset: u64) -> Result<u64> {
     use std::io::Read;
     let mut reader = std::fs::File::open(source)?;
     let mut buf = vec![0u8; 1024 * 1024];
-    let mut offset = 0u64;
+    let mut offset = offset;
+    let mut total = 0u64;
 
     loop {
         let n = reader.read(&mut buf)?;
@@ -508,9 +535,11 @@ fn fill_from(source: &Path, target: &std::os::unix::io::OwnedFd) -> Result<u64> 
             written += rc as usize;
         }
         offset += n as u64;
+        total += n as u64;
     }
-    Ok(offset)
+    Ok(total)
 }
+
 
 /// Name the process if it is one that should never trigger a download.
 fn background_reader(pid: i32) -> Option<&'static str> {

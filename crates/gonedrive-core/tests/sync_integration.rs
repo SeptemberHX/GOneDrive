@@ -1607,3 +1607,57 @@ async fn auto_free_never_touches_a_file_with_unsaved_changes() {
         b"an unsaved local edit"
     );
 }
+
+#[tokio::test]
+async fn a_range_stage_fetches_only_the_window_and_changes_nothing() {
+    // A file manager sniffing content types reads the first 16 KiB of every
+    // file it shows. Answering that with a full download turns "open a
+    // folder" into "download the folder" — the bug as reported. A range stage
+    // must fetch just the window and leave the placeholder exactly as it was.
+    use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
+    use wiremock::matchers::header;
+
+    const CONTENT: &[u8] = &[0x42u8; 128 * 1024];
+    let h = harness_with_a_downloaded_file(CONTENT).await;
+    let path = h.path("Docs/big.bin");
+    h.engine.free_space(Path::new("Docs")).unwrap();
+
+    h.server.reset().await;
+    // Only a ranged request is mocked: an un-ranged (full) download would 404
+    // and fail the test.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/me/drive/items/F1/content$"))
+        .and(header("Range", "bytes=0-16383"))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(&CONTENT[..16384]))
+        .mount(&h.server)
+        .await;
+
+    let mut events = h.engine.subscribe();
+    let staged = h.engine.stage_range(&path, 0, 16384).await.unwrap();
+
+    // The staged sibling holds exactly the window.
+    assert_eq!(std::fs::read(&staged).unwrap(), &CONTENT[..16384]);
+    assert!(staged
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .ends_with(".gonedrive-partial"));
+
+    // And the placeholder itself is untouched in every way that matters:
+    // still sparse, still marked, still dehydrated in the database.
+    assert_is_placeholder_on_disk(&path);
+    assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
+    assert_eq!(
+        h.store.item("F1").unwrap().unwrap().state,
+        gonedrive_core::db::ItemState::Dehydrated
+    );
+    assert_eq!(Occupancy::read(&path).unwrap().apparent_size, CONTENT.len() as u64);
+
+    // Quiet by design: no progress events, no activity — nothing for a UI to
+    // flash on screen over a 16 KiB sniff.
+    assert!(
+        events.try_recv().is_err(),
+        "a range stage must not emit sync events"
+    );
+    let _ = std::fs::remove_file(&staged);
+}

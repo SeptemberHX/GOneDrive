@@ -966,6 +966,42 @@ impl Engine {
         Ok(staged)
     }
 
+    /// Stage only a byte range of a placeholder, quietly.
+    ///
+    /// This is what makes browsing cheap: a file manager sniffing content
+    /// types reads the first 16 KiB of each file, and answering that with a
+    /// full download turns "open a folder" into "download the folder". The
+    /// range is fetched, nothing else changes — no state transition, no
+    /// progress events, no activity entry — and the kernel watch stays armed
+    /// so a reader that continues past the window comes back for the rest.
+    pub async fn stage_range(
+        &self,
+        path: &Path,
+        offset: u64,
+        length: u64,
+    ) -> Result<PathBuf> {
+        let item_id = Placeholder::item_id(path)
+            .ok_or_else(|| Error::other(format!("{} is not a placeholder", path.display())))?;
+
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".gonedrive-partial");
+        let staged = path.with_file_name(name);
+
+        let response = self
+            .graph
+            .download(&item_id, Some(offset..offset + length))
+            .await?;
+        let bytes = response.bytes().await?;
+        tokio::fs::write(&staged, &bytes).await?;
+        tracing::info!(
+            path = %path.display(),
+            offset,
+            bytes = bytes.len(),
+            "staged range"
+        );
+        Ok(staged)
+    }
+
     /// Record that a placeholder the helper just filled is now complete.
     pub fn finish_hydration(&self, path: &Path) -> Result<()> {
         self.emit(SyncEvent::HydrationFinished {
