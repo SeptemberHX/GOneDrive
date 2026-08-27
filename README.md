@@ -113,12 +113,11 @@ gonedrived sync      # 单次同步后退出
 gonedrived logout    # 移除凭据（本地文件保留）
 ```
 
-开机自启：
+安装（含开机自启与按需下载 helper）：
 
 ```bash
-install -Dm755 target/release/gonedrived ~/.local/bin/gonedrived
-install -Dm644 data/gonedrived.service ~/.config/systemd/user/gonedrived.service
-systemctl --user enable --now gonedrived.service
+sudo ./install.sh     # 二进制 + 特权 helper 系统服务（唯一需要 root 的一半）
+./install.sh --user   # 守护进程用户服务 + Nautilus 集成 + 图标
 ```
 
 ---
@@ -212,6 +211,7 @@ gonedrived fetch 文档/报告.docx    # 手动回填
 | 页 | 内容 |
 |---|---|
 | **概览** | 账户与头像、配额条、同步状态、当前传输进度、立即同步/打开文件夹 |
+| **文件夹** | 对齐 Windows 的 "选择文件夹"：逐级浏览远端目录，开关式选择；关闭即释放本机空间，文件仍可随时打开 |
 | **活动** | 最近同步历史（下载/上传/删除/冲突/失败 + 相对时间），含按需下载 |
 | **设置** | 暂停开关、同步文件夹、退出登录 |
 
@@ -256,12 +256,20 @@ nautilus -q                        # 重启文件管理器
 4. **崩溃残留**：`hydrating` 状态永不恢复 → 启动时以文件 xattr 为准修复。
 5. **同步风暴**：本地扫描自己的 `open()` 被 inotify 当成变更，唤醒下一轮扫描，状态永远在"正在同步/已是最新"间横跳 → 只有真正的写事件才唤醒。
 
-## 尚未完成
+## 自动释放与带宽
 
-- FUSE 兜底后端（内核 < 6.14 或拿不到 CAP_SYS_ADMIN 时）
-- libcloudproviders（Nautilus 侧栏的账户与配额）
-- GUI 里的文件夹选择树（目前经命令行 `ls`/`pin` 与文件管理器右键）
-- LRU 自动释放、带宽限制、多账户
+- **存储感知**（对齐 Windows Storage Sense）：`auto_free_below_bytes` 非零时，空闲空间低于阈值即按 **最久未访问优先** 把已下载且非"始终保留"的文件转回占位，直至恢复到阈值之上；有未上传改动的文件绝不触碰。没有特权 helper 时该功能整体不启用（自动动作绝不能制造读不回来的占位文件）。默认关闭 —— 归还空间是用户选择的策略。
+- **带宽限制**：`download_limit_bytes_per_sec` / `upload_limit_bytes_per_sec`，0 为不限。
+
+## v1.0 范围界定
+
+- **单账户**（引擎层已按多账户结构组织，UI 与 CLI 面向单账户）
+- **内核 ≥ 6.14 + CAP_SYS_ADMIN**（fanotify 预读钩子）；FUSE 兜底与 libcloudproviders 侧栏在路线图上
+- 托盘依赖桌面的 StatusNotifierWatcher；它缺席时 30 秒周期自愈重试
+
+## 已知的开发环境怪癖
+
+`GONEDRIVE_SNAPSHOT` 离屏渲染对"文件夹"页偶发返回空节点（其余页正常）；页面本身在真实屏幕上工作正常，数据层有 D-Bus 级验证。
 
 ## 许可
 

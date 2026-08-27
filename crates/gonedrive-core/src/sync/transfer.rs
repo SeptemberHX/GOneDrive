@@ -14,6 +14,46 @@ use crate::graph::{ChunkOutcome, GraphClient};
 use crate::models::DriveItem;
 use crate::sync::plan::to_filetime;
 
+/// Enforces a bytes-per-second ceiling by sleeping off any surplus.
+///
+/// Deliberately simple: the elapsed wall clock says how many bytes should have
+/// passed; anything beyond that waits. Precise shaping is not the point — not
+/// saturating the user's uplink while they are on a call is.
+pub struct RatePacer {
+    limit: u64,
+    started: std::time::Instant,
+    transferred: u64,
+}
+
+impl RatePacer {
+    /// `limit` of zero disables pacing entirely.
+    pub fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            started: std::time::Instant::now(),
+            transferred: 0,
+        }
+    }
+
+    /// How long to sleep after moving `bytes` more.
+    pub fn record(&mut self, bytes: u64) -> Option<Duration> {
+        if self.limit == 0 {
+            return None;
+        }
+        self.transferred += bytes;
+        let due = std::time::Duration::from_secs_f64(self.transferred as f64 / self.limit as f64);
+        due.checked_sub(self.started.elapsed()).filter(|d| !d.is_zero())
+    }
+
+    pub async fn pace(&mut self, bytes: u64) {
+        if let Some(delay) = self.record(bytes) {
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
+use std::time::Duration;
+
 /// Suffix for the temporary file a download is written to.
 const PARTIAL_SUFFIX: &str = ".gonedrive-partial";
 
@@ -34,6 +74,18 @@ pub async fn download_to_file(
     mtime: Option<OffsetDateTime>,
     mut on_progress: impl FnMut(u64, Option<u64>) -> bool,
 ) -> Result<u64> {
+    download_to_file_limited(graph, item_id, dest, mtime, 0, &mut on_progress).await
+}
+
+/// As [`download_to_file`], with a bytes-per-second ceiling (zero = none).
+pub async fn download_to_file_limited(
+    graph: &GraphClient,
+    item_id: &str,
+    dest: &Path,
+    mtime: Option<OffsetDateTime>,
+    rate_limit: u64,
+    on_progress: &mut (impl FnMut(u64, Option<u64>) -> bool + ?Sized),
+) -> Result<u64> {
     let parent = dest
         .parent()
         .ok_or_else(|| Error::other(format!("{} has no parent directory", dest.display())))?;
@@ -46,12 +98,14 @@ pub async fn download_to_file(
     let mut file = tokio::fs::File::create(&partial).await?;
     let mut written = 0u64;
     let mut stream = response.bytes_stream();
+    let mut pacer = RatePacer::new(rate_limit);
 
     let result = async {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             file.write_all(&chunk).await?;
             written += chunk.len() as u64;
+            pacer.pace(chunk.len() as u64).await;
             if !on_progress(written, expected) {
                 return Err(Error::Cancelled);
             }
@@ -174,6 +228,7 @@ async fn upload_resumable(
     let mut offset = session.committed_offset;
 
     let mut file = tokio::fs::File::open(source).await?;
+    let mut pacer = RatePacer::new(config.upload_limit_bytes_per_sec);
 
     loop {
         if offset >= size {
@@ -203,6 +258,7 @@ async fn upload_resumable(
                 // arithmetic; a retried chunk can leave the two disagreeing.
                 offset = next_offset.unwrap_or(offset + len);
                 store.set_upload_offset(target.session_key, offset)?;
+                pacer.pace(len).await;
                 on_progress(offset, size);
             }
             Err(Error::UploadSessionExpired { .. }) => {
@@ -269,6 +325,26 @@ async fn read_chunk(file: &mut tokio::fs::File, offset: u64, len: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_zero_limit_never_paces() {
+        let mut pacer = RatePacer::new(0);
+        assert!(pacer.record(u64::MAX).is_none());
+    }
+
+    #[test]
+    fn the_pacer_sleeps_off_exactly_the_surplus() {
+        // 1 MiB/s ceiling; pretend 1 MiB arrived instantly. The pacer should
+        // ask for ~1s of sleep (minus the microseconds that really elapsed).
+        let mut pacer = RatePacer::new(1024 * 1024);
+        let delay = pacer.record(1024 * 1024).expect("should require a pause");
+        assert!(delay <= Duration::from_secs(1));
+        assert!(delay > Duration::from_millis(900), "asked only {delay:?}");
+
+        // A transfer that is already slower than the ceiling never waits.
+        let mut slow = RatePacer::new(u64::MAX / 2);
+        assert!(slow.record(10).is_none());
+    }
 
     #[test]
     fn partial_files_are_siblings_so_the_rename_is_atomic() {

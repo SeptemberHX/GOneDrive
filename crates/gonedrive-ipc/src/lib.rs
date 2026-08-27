@@ -46,6 +46,21 @@ pub struct Activity {
     pub when: i64,
 }
 
+/// One entry of a browsable folder listing, for the folder chooser.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct FolderEntry {
+    pub name: String,
+    pub is_folder: bool,
+    /// Whether content under this entry is kept on this device (resolved
+    /// through inheritance).
+    pub selected: bool,
+    /// Whether the choice was made on this entry itself rather than inherited.
+    pub explicit: bool,
+    /// Total remote bytes beneath it.
+    pub bytes: u64,
+    pub files: u64,
+}
+
 /// What the daemon is doing right now.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct SyncStatus {
@@ -120,6 +135,10 @@ pub trait Daemon {
     /// Kept by the daemon rather than the front end so the list survives the
     /// window being closed and reopened.
     fn recent_activity(&self) -> zbus::Result<Vec<Activity>>;
+
+    /// Browse one level of the drive, for the folder chooser. `path` is
+    /// relative to the sync root; empty means the root itself.
+    fn list_folder(&self, path: &str) -> zbus::Result<Vec<FolderEntry>>;
 
     /// Placeholders currently being filled.
     ///

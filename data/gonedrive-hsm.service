@@ -1,0 +1,34 @@
+# System service for GOnedrive's files-on-demand helper.
+#
+# This is the only privileged piece of GOnedrive. It holds no credentials and
+# never touches the network; it forwards kernel pre-content events to the
+# user's unprivileged daemon and writes hydrated bytes through the kernel's
+# own descriptors. See crates/gonedrive-hsm.
+#
+#   install: /etc/systemd/system/gonedrive-hsm.service
+#   enable:  sudo systemctl enable --now gonedrive-hsm.service
+[Unit]
+Description=GOnedrive files-on-demand helper
+Documentation=https://github.com/monotune/GOnedrive
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gonedrive-hsm
+Restart=on-failure
+RestartSec=5
+
+# Runs as root for CAP_SYS_ADMIN (fanotify pre-content), with everything else
+# stripped away.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+RuntimeDirectory=gonedrive
+PrivateTmp=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

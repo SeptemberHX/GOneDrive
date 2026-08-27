@@ -940,8 +940,9 @@ impl Engine {
         let step = (size / 100).clamp(PROGRESS_MIN_STEP, PROGRESS_MAX_STEP);
         let mut last_sent = 0u64;
 
+        let limit = self.config.download_limit_bytes_per_sec;
         let result =
-            transfer::download_to_file(&self.graph, &item_id, &staged, None, move |done, total| {
+            transfer::download_to_file_limited(&self.graph, &item_id, &staged, None, limit, &mut move |done, total| {
                 let total = total.unwrap_or(size);
                 if done == total || done.saturating_sub(last_sent) >= step {
                     last_sent = done;
@@ -1206,6 +1207,78 @@ impl Engine {
         Ok(repaired)
     }
 
+    /// Give space back automatically, least-recently-used first.
+    ///
+    /// Only files whose effective pin is *not* "always keep" are candidates —
+    /// the whole meaning of pinning is that pressure never takes those. Files
+    /// with unsaved local changes are protected by [`Self::dehydrate`] as on
+    /// every other path.
+    pub fn auto_free(&self, keep_free: u64) -> Result<FreeSpaceOutcome> {
+        let account = self.account()?;
+        let mut outcome = FreeSpaceOutcome::default();
+
+        let Some(free) = crate::sync::selection::available_bytes(&account.root_local_path) else {
+            return Ok(outcome);
+        };
+        if free >= keep_free {
+            return Ok(outcome);
+        }
+        let mut still_needed = keep_free - free;
+        tracing::info!(
+            free_bytes = free,
+            target = keep_free,
+            "low on space; releasing unpinned files"
+        );
+
+        let default = self.config.download_new.default_pin();
+        let mut candidates = Vec::new();
+        for record in self.store.items_in_state(&self.account_id, ItemState::Synced)? {
+            if record.is_folder {
+                continue;
+            }
+            if self
+                .store
+                .effective_pin(&record.id, default)?
+                == crate::db::PinState::Pinned
+            {
+                continue;
+            }
+            let Some(path) = self.store.local_path(&account, &record.id)? else {
+                continue;
+            };
+            let Ok(occupancy) = crate::hydrate::Occupancy::read(&path) else {
+                continue;
+            };
+            if occupancy.allocated == 0 {
+                continue; // already a placeholder
+            }
+            let atime = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.accessed().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            candidates.push((atime, occupancy.allocated, path));
+        }
+        // Oldest access first: the file nobody has opened in months goes
+        // before the one from this morning.
+        candidates.sort_by_key(|(atime, _, _)| *atime);
+
+        for (_, allocated, path) in candidates {
+            if still_needed == 0 {
+                break;
+            }
+            match self.dehydrate(&path) {
+                Ok(freed) => {
+                    outcome.freed += freed;
+                    outcome.files += 1;
+                    outcome.paths.push(path);
+                    still_needed = still_needed.saturating_sub(allocated);
+                }
+                Err(e) => outcome.skipped.push((path, e.to_string())),
+            }
+        }
+        Ok(outcome)
+    }
+
     /// Every placeholder that still needs intercepting, for registering with
     /// the privileged helper at start-up.
     pub fn dehydrated_paths(&self) -> Result<Vec<PathBuf>> {
@@ -1371,12 +1444,13 @@ impl Engine {
         self.store.set_item_state(item_id, ItemState::Hydrating)?;
         let name = record.name.clone();
         let events = self.events.clone();
-        transfer::download_to_file(
+        transfer::download_to_file_limited(
             &self.graph,
             item_id,
             &path,
             record.remote_mtime,
-            |done, total| {
+            self.config.download_limit_bytes_per_sec,
+            &mut |done, total| {
                 let _ = events.send(SyncEvent::Progress {
                     name: name.clone(),
                     transferred: done,

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gonedrive_ipc::{AccountInfo, Activity, Hydration, SyncStatus, OBJECT_PATH, SERVICE_NAME};
+use gonedrive_ipc::{AccountInfo, Activity, FolderEntry, Hydration, SyncStatus, OBJECT_PATH, SERVICE_NAME};
 use zbus::object_server::SignalEmitter;
 use zbus::{connection, interface};
 
@@ -133,6 +133,16 @@ impl DaemonService {
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(outcome.freed)
+    }
+
+    async fn list_folder(&self, path: &str) -> zbus::fdo::Result<Vec<FolderEntry>> {
+        // Unlike the action methods, an empty path is legal here: it names the
+        // sync root, which is exactly where the chooser starts.
+        let relative = std::path::PathBuf::from(path);
+        self.app
+            .list_folder(&relative)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
     }
 
     async fn recent_activity(&self) -> Vec<Activity> {

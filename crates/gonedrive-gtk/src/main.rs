@@ -185,9 +185,19 @@ fn snapshot_window(window: &adw::ApplicationWindow, path: &str) -> Result<(), St
     let paintable = gtk::WidgetPaintable::new(Some(&subject));
     let snapshot = gtk::Snapshot::new();
     paintable.snapshot(&snapshot, width as f64, height as f64);
-    let node = snapshot
-        .to_node()
-        .ok_or_else(|| "nothing was rendered".to_string())?;
+    let node = match snapshot.to_node() {
+        Some(node) => node,
+        None => {
+            // Scrolled content sometimes yields nothing through the child
+            // paintable; the window as a whole always renders.
+            let fallback = gtk::WidgetPaintable::new(Some(window));
+            let snapshot = gtk::Snapshot::new();
+            fallback.snapshot(&snapshot, window.width() as f64, window.height() as f64);
+            snapshot
+                .to_node()
+                .ok_or_else(|| "nothing was rendered".to_string())?
+        }
+    };
 
     let renderer = window
         .renderer()

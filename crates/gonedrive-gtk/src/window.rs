@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gonedrive_ipc::{AccountInfo, Activity, SyncStatus};
+use gonedrive_ipc::{AccountInfo, Activity, FolderEntry, SyncStatus};
 use gtk::glib;
 
 use crate::backend::{Command, UiEvent};
@@ -33,6 +33,16 @@ pub struct Ui {
     // -- activity page --
     activity_list: gtk::ListBox,
     activity_empty: adw::StatusPage,
+
+    // -- folder chooser --
+    folders_list: gtk::ListBox,
+    folders_path: gtk::Label,
+    folders_back: gtk::Button,
+    folders_current: Rc<RefCell<String>>,
+    /// Sync root from the daemon; SetPinState/FreeUpSpace address by absolute
+    /// path, since their other caller is the file manager.
+    root_path: Rc<RefCell<String>>,
+    folders_loaded: Cell<bool>,
 
     // -- settings page --
     pause_switch: gtk::Switch,
@@ -222,6 +232,58 @@ impl Ui {
             .add_titled(&activity_scroll, Some("activity"), "活动")
             .set_icon_name(Some("document-open-recent-symbolic"));
 
+        // == folder chooser ==
+        let folders_back = gtk::Button::builder()
+            .icon_name("go-previous-symbolic")
+            .tooltip_text("上一级")
+            .sensitive(false)
+            .build();
+        folders_back.add_css_class("flat");
+        let folders_path = gtk::Label::builder()
+            .label("/")
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::Start)
+            .build();
+        folders_path.add_css_class("dim-label");
+        let crumb = gtk::Box::builder().spacing(6).build();
+        crumb.append(&folders_back);
+        crumb.append(&folders_path);
+
+        let folders_hint = gtk::Label::builder()
+            .label("打开的文件夹会保留在此设备；关闭则释放本机空间，文件仍可随时打开。")
+            .wrap(true)
+            .xalign(0.0)
+            .build();
+        folders_hint.add_css_class("dim-label");
+        folders_hint.add_css_class("caption");
+
+        let folders_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .build();
+        folders_list.add_css_class("boxed-list");
+
+        let folders_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(10)
+            .margin_bottom(12)
+            .build();
+        folders_box.append(&crumb);
+        folders_box.append(&folders_hint);
+        folders_box.append(&folders_list);
+
+        let folders_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .child(&folders_box)
+            .vexpand(true)
+            .build();
+        views
+            .add_titled(&folders_scroll, Some("folders"), "文件夹")
+            .set_icon_name(Some("folder-symbolic"));
+
         // == settings ==
         let settings = adw::PreferencesPage::new();
         let sync_group = adw::PreferencesGroup::builder().title("同步").build();
@@ -259,6 +321,17 @@ impl Ui {
         views
             .add_titled(&settings, Some("settings"), "设置")
             .set_icon_name(Some("emblem-system-symbolic"));
+
+        {
+            // Loading the whole listing at start-up would race the first
+            // enumeration; fetch a level only when the user actually looks.
+            let commands = commands.clone();
+            views.connect_visible_child_name_notify(move |views| {
+                if views.visible_child_name().as_deref() == Some("folders") {
+                    let _ = commands.send_blocking(Command::ListFolder(String::new()));
+                }
+            });
+        }
 
         // Screenshot hook: pre-select a page so every tab can be captured
         // from a script. Harmless in normal use.
@@ -316,6 +389,12 @@ impl Ui {
             transfer_bar,
             activity_list,
             activity_empty,
+            folders_list,
+            folders_path,
+            folders_back,
+            folders_current: Rc::new(RefCell::new(String::new())),
+            root_path: Rc::new(RefCell::new(String::new())),
+            folders_loaded: Cell::new(false),
             pause_switch,
             folder_row,
             login_button,
@@ -329,6 +408,19 @@ impl Ui {
     }
 
     fn connect(&self, sync: &gtk::Button, open: &gtk::Button, signout: &gtk::Button) {
+        let commands = self.commands.clone();
+        let current = self.folders_current.clone();
+        self.folders_back.connect_clicked(move |_| {
+            let up = {
+                let path = current.borrow();
+                match path.rfind('/') {
+                    Some(index) => path[..index].to_string(),
+                    None => String::new(),
+                }
+            };
+            let _ = commands.send_blocking(Command::ListFolder(up));
+        });
+
         let commands = self.commands.clone();
         self.login_button.connect_clicked(move |button| {
             button.set_sensitive(false);
@@ -412,6 +504,7 @@ impl Ui {
                 }
             }
             UiEvent::Activity(items) => self.show_activity(&items),
+            UiEvent::FolderListing { path, entries } => self.show_folders(&path, &entries),
             UiEvent::LoginStarted(url) => {
                 self.login_hint.set_visible(true);
                 self.login_hint
@@ -473,6 +566,7 @@ impl Ui {
         self.account_row.set_title(&name);
         self.account_row.set_subtitle(&account.address);
         self.folder_row.set_subtitle(&account.root_path);
+        *self.root_path.borrow_mut() = account.root_path.clone();
 
         if account.quota_total > 0 {
             let used = account.quota_used as f64 / account.quota_total as f64;
@@ -539,6 +633,81 @@ impl Ui {
             self.suppress.set(true);
             self.pause_switch.set_active(paused);
             self.suppress.set(false);
+        }
+    }
+
+    fn show_folders(&self, path: &str, entries: &[FolderEntry]) {
+        self.folders_loaded.set(true);
+        *self.folders_current.borrow_mut() = path.to_string();
+        self.folders_path
+            .set_text(&if path.is_empty() { "/".into() } else { format!("/{path}") });
+        self.folders_back.set_sensitive(!path.is_empty());
+
+        while let Some(child) = self.folders_list.first_child() {
+            self.folders_list.remove(&child);
+        }
+
+        for entry in entries {
+            let child_path = if path.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{path}/{}", entry.name)
+            };
+
+            let mut subtitle = if entry.is_folder {
+                format!("{} · {} 个文件", human(entry.bytes), entry.files)
+            } else {
+                human(entry.bytes)
+            };
+            if entry.selected && !entry.explicit {
+                subtitle.push_str(" · 随上级保留");
+            }
+
+            let row = adw::ActionRow::builder()
+                .title(&entry.name)
+                .title_lines(1)
+                .subtitle(&subtitle)
+                .activatable(entry.is_folder)
+                .build();
+            row.add_prefix(&gtk::Image::from_icon_name(if entry.is_folder {
+                "folder-symbolic"
+            } else {
+                "text-x-generic-symbolic"
+            }));
+
+            // Built with the state already set, and connected only afterwards,
+            // so populating the list cannot fire spurious commands.
+            let keep = gtk::Switch::builder()
+                .active(entry.selected)
+                .valign(gtk::Align::Center)
+                .tooltip_text("保留在此设备")
+                .build();
+            let commands = self.commands.clone();
+            let root = self.root_path.clone();
+            let toggle_path = child_path.clone();
+            let refresh_path = path.to_string();
+            keep.connect_state_set(move |switch, keep| {
+                switch.set_sensitive(false);
+                let absolute = format!("{}/{}", root.borrow(), toggle_path);
+                let _ = commands.send_blocking(Command::SetKeep {
+                    path: absolute,
+                    keep,
+                });
+                // Re-list once the change lands; commands are handled in
+                // order, so this reflects the new state and re-enables rows.
+                let _ = commands.send_blocking(Command::ListFolder(refresh_path.clone()));
+                glib::Propagation::Proceed
+            });
+            row.add_suffix(&keep);
+
+            if entry.is_folder {
+                row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+                let commands = self.commands.clone();
+                row.connect_activated(move |_| {
+                    let _ = commands.send_blocking(Command::ListFolder(child_path.clone()));
+                });
+            }
+            self.folders_list.append(&row);
         }
     }
 

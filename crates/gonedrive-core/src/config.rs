@@ -83,6 +83,17 @@ pub struct Config {
     /// Files-on-demand. Wired up in M2; parsed now so config files stay stable.
     pub on_demand: bool,
 
+    /// Storage-sense style automatic space recovery: when free space drops
+    /// below this, downloaded-but-unpinned files are turned back into
+    /// placeholders, least recently used first, until it is above it again.
+    /// Zero disables it, which is the default — giving space back is a policy
+    /// the user opts into, not something a sync client does on its own.
+    pub auto_free_below_bytes: u64,
+
+    /// Transfer rate ceilings, bytes per second. Zero means unlimited.
+    pub download_limit_bytes_per_sec: u64,
+    pub upload_limit_bytes_per_sec: u64,
+
     /// What happens to file content the user has not explicitly asked for.
     ///
     /// Defaults to [`DownloadPolicy::Never`]. A drive can easily be larger than
@@ -129,6 +140,9 @@ impl Default for Config {
             upload_chunk_size: 10 * 1024 * 1024, // 32 x 320 KiB
             max_concurrent_transfers: 4,
             min_free_bytes: 2 * 1024 * 1024 * 1024,
+            auto_free_below_bytes: 0,
+            download_limit_bytes_per_sec: 0,
+            upload_limit_bytes_per_sec: 0,
             on_demand: false,
             download_new: DownloadPolicy::Never,
         }

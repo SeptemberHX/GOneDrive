@@ -38,3 +38,12 @@ max_concurrent_transfers = 4
 # Files on demand. Not yet implemented (M2); parsed now so config files
 # written today stay valid.
 on_demand = false
+
+# Storage-sense: when free space drops below this many bytes, files that are
+# downloaded but not "always keep" are turned back into placeholders, least
+# recently used first. 0 (the default) disables it.
+auto_free_below_bytes = 0
+
+# Transfer ceilings in bytes per second; 0 = unlimited.
+download_limit_bytes_per_sec = 0
+upload_limit_bytes_per_sec = 0

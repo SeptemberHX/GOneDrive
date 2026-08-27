@@ -570,6 +570,29 @@ impl App {
         })
     }
 
+    /// One level of the drive, with each entry's effective selection.
+    pub async fn list_folder(
+        &self,
+        relative: &std::path::Path,
+    ) -> Result<Vec<gonedrive_ipc::FolderEntry>> {
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        let engine = engines
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
+        Ok(engine
+            .list(relative)?
+            .into_iter()
+            .map(|entry| gonedrive_ipc::FolderEntry {
+                name: entry.item.name,
+                is_folder: entry.item.is_folder,
+                selected: entry.pin.wants_content(),
+                explicit: entry.explicit,
+                bytes: entry.bytes,
+                files: entry.files,
+            })
+            .collect())
+    }
+
     /// Choose whether a path's content is kept on this device.
     pub async fn set_pin(
         &self,
@@ -656,6 +679,37 @@ impl App {
         did_work
     }
 
+    /// Storage-sense pass: give space back when the disk runs low.
+    ///
+    /// Skipped entirely without the helper: an automatic action must never
+    /// create placeholders that nothing will fill.
+    async fn auto_free_if_low(&self) {
+        let threshold = self.config.auto_free_below_bytes;
+        if threshold == 0 {
+            return;
+        }
+        let Some(hsm) = self.hsm.read().await.clone() else {
+            return;
+        };
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        for engine in engines {
+            match engine.auto_free(threshold) {
+                Ok(outcome) if outcome.files > 0 => {
+                    tracing::info!(
+                        files = outcome.files,
+                        freed = outcome.freed,
+                        "auto-released space"
+                    );
+                    for path in &outcome.paths {
+                        let _ = hsm.watch(path).await;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "auto-free failed"),
+            }
+        }
+    }
+
     /// The poll loop. Runs until `shutdown` resolves.
     ///
     /// The interval backs off while nothing is happening so an idle client is
@@ -674,6 +728,7 @@ impl App {
                 } else {
                     ceiling.min(interval.mul_f64(IDLE_BACKOFF))
                 };
+                self.auto_free_if_low().await;
             }
 
             tokio::select! {

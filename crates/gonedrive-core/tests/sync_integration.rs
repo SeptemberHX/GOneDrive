@@ -1530,3 +1530,80 @@ async fn freeing_one_folder_leaves_its_siblings_alone() {
         PlaceholderState::Hydrated
     );
 }
+
+#[tokio::test]
+async fn auto_free_releases_lru_unpinned_files_and_spares_pinned_ones() {
+    use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
+
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "Keep"),
+            file("F1", "D1", "pinned.bin", "c1", 5, "2026-08-20T10:00:00Z"),
+            folder("D2", ROOT, "Cache"),
+            file("F2", "D2", "old.bin", "c1", 5, "2026-08-20T10:00:00Z"),
+            file("F3", "D2", "new.bin", "c1", 5, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    for (id, content) in [("F1", "pinnd"), ("F2", "old__"), ("F3", "new__")] {
+        h.mock_download(id, content.as_bytes()).await;
+    }
+    h.sync().await;
+    // Under the mirror-everything policy the default pin is "keep", so
+    // nothing is evictable until the user says otherwise — that is the whole
+    // point of the default. Mark the cache folder as not-kept explicitly.
+    h.engine.set_pin(Path::new("Keep"), PinState::Pinned).unwrap();
+    h.engine.set_pin(Path::new("Cache"), PinState::Unpinned).unwrap();
+
+    // A threshold no disk satisfies forces the release path deterministically.
+    let outcome = h.engine.auto_free(u64::MAX).unwrap();
+
+    // Both unpinned files went; the pinned one is untouchable by pressure.
+    assert_eq!(outcome.files, 2, "skipped: {:?}", outcome.skipped);
+    assert_eq!(
+        Placeholder::state(&h.path("Cache/old.bin")),
+        PlaceholderState::Dehydrated
+    );
+    assert_eq!(
+        Placeholder::state(&h.path("Cache/new.bin")),
+        PlaceholderState::Dehydrated
+    );
+    assert!(Occupancy::read(&h.path("Keep/pinned.bin")).unwrap().allocated > 0);
+    assert_eq!(std::fs::read(h.path("Keep/pinned.bin")).unwrap(), b"pinnd");
+
+    // And a second pass finds nothing left to do.
+    let again = h.engine.auto_free(u64::MAX).unwrap();
+    assert_eq!(again.files, 0);
+}
+
+#[tokio::test]
+async fn auto_free_never_touches_a_file_with_unsaved_changes() {
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "Cache"),
+            file("F1", "D1", "edited.bin", "c1", 5, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"hello").await;
+    h.sync().await;
+    h.engine.set_pin(Path::new("Cache"), PinState::Unpinned).unwrap();
+
+    std::fs::write(h.path("Cache/edited.bin"), b"an unsaved local edit").unwrap();
+
+    let outcome = h.engine.auto_free(u64::MAX).unwrap();
+    assert_eq!(outcome.files, 0);
+    assert_eq!(outcome.skipped.len(), 1);
+    assert_eq!(
+        std::fs::read(h.path("Cache/edited.bin")).unwrap(),
+        b"an unsaved local edit"
+    );
+}

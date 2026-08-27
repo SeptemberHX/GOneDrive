@@ -13,7 +13,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/gonedrived run
+ExecStart=/usr/local/bin/gonedrived run
 Restart=on-failure
 RestartSec=10
 # A sync client that dies repeatedly should stop, not thrash the API.

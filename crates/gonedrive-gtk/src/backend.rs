@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use gonedrive_ipc::{AccountInfo, Activity, DaemonProxy, Hydration, SyncStatus};
+use gonedrive_ipc::{AccountInfo, Activity, DaemonProxy, FolderEntry, Hydration, SyncStatus};
 
 use crate::tray::{GonedriveTray, TrayAction};
 
@@ -32,6 +32,11 @@ pub enum UiEvent {
     ItemFailed { name: String, error: String },
     /// The recent-activity list, on request.
     Activity(Vec<Activity>),
+    /// One level of the drive, for the folder chooser.
+    FolderListing {
+        path: String,
+        entries: Vec<FolderEntry>,
+    },
     /// Something opened a placeholder and is waiting for its content.
     HydrationStarted(Hydration),
     HydrationProgress(Hydration),
@@ -49,6 +54,11 @@ pub enum Command {
     CancelHydration(String),
     /// Fetch the recent-activity list.
     GetActivity,
+    /// Browse one level of the drive.
+    ListFolder(String),
+    /// Keep (or stop keeping) a path on this device. `keep: false` also frees
+    /// the space, matching what unticking a folder means on Windows.
+    SetKeep { path: String, keep: bool },
 }
 
 /// How long to wait before retrying a connection to the daemon.
@@ -352,6 +362,26 @@ async fn handle(
             // A refusal here just means it already finished.
             let _ = proxy.cancel_hydration(&path).await;
             true
+        }
+        Command::ListFolder(path) => match proxy.list_folder(&path).await {
+            Ok(entries) => {
+                let _ = ui.send(UiEvent::FolderListing { path, entries }).await;
+                true
+            }
+            Err(_) => false,
+        },
+        Command::SetKeep { path, keep } => {
+            let ok = if keep {
+                proxy.set_pin_state(&path, "pinned").await.is_ok()
+            } else {
+                // Deselecting means "not on this device": stop future
+                // downloads AND give the space back, the way unticking a
+                // folder behaves on Windows.
+                let a = proxy.set_pin_state(&path, "unpinned").await.is_ok();
+                let b = proxy.free_up_space(&path).await.is_ok();
+                a && b
+            };
+            ok
         }
         Command::GetActivity => match proxy.recent_activity().await {
             Ok(items) => {
