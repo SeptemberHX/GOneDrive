@@ -81,6 +81,15 @@ impl Login {
         store.upsert_item(&ItemRecord::root(&account_id, &root.id))?;
 
         std::fs::create_dir_all(&config.sync_root)?;
+
+        // Persist the client id the sign-in just succeeded with. Baked-in and
+        // environment ids are conveniences of the build that produced them; a
+        // rebuild without the variable silently loses the bake, and the daemon
+        // then refuses to start for no visible reason. The config file is the
+        // copy that survives.
+        config.save().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not persist the configuration");
+        });
         Ok(account_id)
     }
 }
