@@ -132,9 +132,19 @@ async fn handle(
             path,
             offset,
             length,
+            reader,
         } => {
             let path = PathBuf::from(path);
-            tracing::debug!(path = %path.display(), offset, length, "hydration requested");
+            // The single most useful line in this log: it names the process
+            // that keeps pulling files down. "gedit" is the user; an indexer
+            // or thumbnailer here is a bug to add to the helper's refusal list.
+            tracing::info!(
+                path = %path.display(),
+                reader = %if reader.is_empty() { "unknown".into() } else { reader },
+                offset,
+                length,
+                "on-demand read"
+            );
 
             // The content is downloaded to a staging file rather than written
             // into the placeholder here: writing to a hole faults the page in,

@@ -436,6 +436,9 @@ fn hydrate(shared: &Arc<Shared>, event: &PreContentEvent) -> Result<bool> {
         .unwrap()
         .insert(id, Pending { reply: tx });
 
+    let reader = std::fs::read_to_string(format!("/proc/{}/comm", event.pid))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     let request = Event::Hydrate {
         id,
         path: path.to_string_lossy().into_owned(),
@@ -443,6 +446,7 @@ fn hydrate(shared: &Arc<Shared>, event: &PreContentEvent) -> Result<bool> {
         // A zero-length range means the kernel did not say; ask for the whole
         // file rather than guessing at a window.
         length: event.length,
+        reader: reader.clone(),
     };
     if let Err(e) = shared.send(&request) {
         shared.pending.lock().unwrap().remove(&id);
@@ -470,7 +474,7 @@ fn hydrate(shared: &Arc<Shared>, event: &PreContentEvent) -> Result<bool> {
     if let Err(e) = shared.fan.unwatch(path) {
         tracing::debug!(path = %path.display(), error = %e, "could not drop the mark");
     }
-    tracing::info!(path = %path.display(), bytes = written, "hydrated");
+    tracing::info!(path = %path.display(), bytes = written, %reader, pid = event.pid, "hydrated");
     Ok(true)
 }
 

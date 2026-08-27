@@ -115,6 +115,7 @@ impl DaemonService {
     }
 
     async fn set_pin_state(&self, path: &str, pin: &str) -> zbus::fdo::Result<()> {
+        tracing::info!(%path, %pin, "SetPinState requested");
         let relative = self.relative(path).await?;
         let pin = gonedrive_core::db::PinState::parse(pin);
         self.app
@@ -126,6 +127,7 @@ impl DaemonService {
     }
 
     async fn free_up_space(&self, path: &str) -> zbus::fdo::Result<u64> {
+        tracing::info!(%path, "FreeUpSpace requested");
         let relative = self.relative(path).await?;
         let outcome = self
             .app
@@ -174,6 +176,7 @@ impl DaemonService {
     }
 
     async fn fetch_now(&self, path: &str) -> zbus::fdo::Result<u64> {
+        tracing::info!(%path, "FetchNow requested");
         self.app
             .hydrate(std::path::Path::new(path))
             .await

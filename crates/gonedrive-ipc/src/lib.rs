@@ -229,6 +229,10 @@ pub mod hsm {
             path: String,
             offset: u64,
             length: u64,
+            /// `comm` of the process whose read is blocked — the answer to
+            /// "what keeps downloading my files", written into the daemon log.
+            #[serde(default)]
+            reader: String,
         },
         /// The content was written and the reader released. The daemon
         /// finalises its own bookkeeping on seeing this.

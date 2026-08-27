@@ -35,6 +35,15 @@ EMBLEM_SYNCING = "gonedrive-syncing"
 EMBLEM_ERROR = "gonedrive-error"
 
 
+def describe_scope(managed):
+    """Human words for exactly what a menu action will touch."""
+    if len(managed) == 1:
+        file, path = managed[0]
+        name = os.path.basename(path)
+        return f"整个文件夹「{name}」" if file.is_directory() else f"「{name}」"
+    return f"选中的 {len(managed)} 项"
+
+
 def _xattr(path, name):
     try:
         return os.getxattr(path, name).decode("utf-8")
@@ -125,12 +134,17 @@ class GOnedriveExtension(
             return []
 
         paths = [p for _, p in managed]
+        # The label carries the exact scope. The report that forced this: a
+        # selection quietly holding one extra file made "释放空间" free a
+        # sibling the user never meant to touch — a label that says what it
+        # will act on turns that from a mystery into a visible mistake.
+        scope = describe_scope(managed)
         items = []
 
         if any(s in (ONLINE_ONLY, AVAILABLE) for s in statuses) or folders:
             keep = Nautilus.MenuItem(
                 name="GOnedrive::pin",
-                label="始终保留在此设备",
+                label=f"始终保留{scope}",
                 tip="下载并保留，之后新增的内容也会自动下载",
             )
             keep.connect("activate", self._on_pin, paths, "pinned")
@@ -139,7 +153,7 @@ class GOnedriveExtension(
         if any(s in (AVAILABLE, ALWAYS_KEEP) for s in statuses) or folders:
             free = Nautilus.MenuItem(
                 name="GOnedrive::free",
-                label="释放空间",
+                label=f"释放{scope}的空间",
                 tip="移除本机内容，文件保留，打开时自动重新下载",
             )
             free.connect("activate", self._on_free, paths)
@@ -148,7 +162,7 @@ class GOnedriveExtension(
         if any(s is ONLINE_ONLY for s in statuses):
             fetch = Nautilus.MenuItem(
                 name="GOnedrive::fetch",
-                label="立即下载",
+                label=f"立即下载{scope}",
                 tip="现在就把内容取回本机",
             )
             fetch.connect("activate", self._on_fetch, paths)
