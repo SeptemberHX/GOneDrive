@@ -557,6 +557,54 @@ async fn a_local_delete_is_propagated_remotely() {
 }
 
 #[tokio::test]
+async fn deleting_an_online_only_file_propagates_the_delete() {
+    // Deleting an online-only placeholder must delete it from the cloud, the
+    // way it does on Windows. The bug: a placeholder never had its inode
+    // recorded, so the delete guard (which spares a download that never
+    // landed) mistook it for one and the deletion never reached the server.
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+    // Never downloaded — a pure placeholder from materialisation, which is the
+    // real case: run_download would have recorded the inode, materialize does
+    // not.
+    let h = Harness::metadata_only().await;
+    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
+        .await;
+    h.sync().await;
+
+    // Materialise it as an online-only placeholder on disk.
+    h.engine.materialize_all(|_, _| true).unwrap();
+    assert!(h.path("a.txt").exists());
+    assert_eq!(Placeholder::state(&h.path("a.txt")), PlaceholderState::Dehydrated);
+    assert!(
+        h.store.item("F1").unwrap().unwrap().local_ino.is_none(),
+        "materialise records no inode — that is the bug this guards"
+    );
+
+    // A scan records the placeholder's inode.
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    h.sync().await;
+    assert!(
+        h.store.item("F1").unwrap().unwrap().local_ino.is_some(),
+        "the placeholder's inode should be recorded so a later delete is seen"
+    );
+
+    // Now delete the online-only file — it must reach the cloud.
+    std::fs::remove_file(h.path("a.txt")).unwrap();
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v2")), vec![], "v3").await;
+    Mock::given(method("DELETE"))
+        .and(path("/me/drive/items/F1"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.deleted_remote, 1, "deleting an online-only file must reach the cloud");
+    assert!(h.store.item("F1").unwrap().is_none());
+}
+
+#[tokio::test]
 async fn a_pending_download_is_not_mistaken_for_a_local_delete() {
     // The dangerous case: an item we recorded but have not written to disk yet
     // looks exactly like a file the user deleted. Deleting it remotely would

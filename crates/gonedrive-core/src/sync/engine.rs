@@ -88,6 +88,11 @@ pub enum SyncEvent {
         name: String,
         direction: Direction,
     },
+    /// An item was deleted — a local deletion propagated to the cloud, or a
+    /// remote deletion applied locally.
+    Deleted {
+        name: String,
+    },
     /// Both sides changed; the local copy was preserved under a new name.
     Conflict {
         original: String,
@@ -840,6 +845,21 @@ impl Engine {
                     || Placeholder::state(&dir.join(name)) != PlaceholderState::Dehydrated);
                 if !content_is_ours {
                     if let Some(record) = record {
+                        // Record the inode of a placeholder we can see on disk.
+                        // Its content is not ours to upload, but its *presence*
+                        // is what tells a later scan that deleting the online-
+                        // only file was a real deletion to propagate — without
+                        // this the file has no local_ino and the delete guard
+                        // mistakes it for a download that never landed, so
+                        // deleting an online-only file never reaches the cloud.
+                        if !stat.is_dir && record.local_ino != Some(stat.ino) {
+                            self.store.set_local_stat(
+                                &record.id,
+                                OffsetDateTime::from_unix_timestamp(stat.mtime).ok(),
+                                Some(stat.size),
+                                Some(stat.ino),
+                            )?;
+                        }
                         if stat.is_dir {
                             stack.push((Some(record.id.clone()), dir.join(name)));
                         }
@@ -2239,6 +2259,12 @@ impl Engine {
             .item_id
             .as_deref()
             .ok_or_else(|| Error::other("delete operation without an item id"))?;
+        // The name for the activity log, read before the record is gone.
+        let name = self
+            .store
+            .item(item_id)?
+            .map(|record| record.name)
+            .unwrap_or_default();
         match self.graph.delete(item_id).await {
             Ok(()) => {}
             // Already gone remotely: the outcome we wanted.
@@ -2247,6 +2273,7 @@ impl Engine {
         }
         self.store.delete_subtree(item_id)?;
         summary.deleted_remote += 1;
+        self.emit(SyncEvent::Deleted { name });
         Ok(())
     }
 

@@ -274,6 +274,9 @@ impl App {
                                 )
                                 .await;
                             }
+                            SyncEvent::Deleted { name } => {
+                                record_activity(&activity, "deleted", name, String::new()).await;
+                            }
                             SyncEvent::Conflict { original, copy } => {
                                 record_activity(
                                     &activity,
