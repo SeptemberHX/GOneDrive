@@ -179,9 +179,22 @@ pub fn decide_remote(
             match (remote_changed, local_changed) {
                 (true, true) => RemoteAction::ConflictCopy,
                 (true, false) => RemoteAction::Download { overwrite: true },
-                // Remote metadata moved without the content: only the
-                // timestamp needs applying.
+                // Remote metadata moved without the content — or so the cTag
+                // claims. But a cTag can run ahead of the bytes it names: a
+                // pass advances the stored cTag when it records a remote
+                // change, and if the download it queued never lands (the
+                // daemon restarts, a transfer is interrupted) the next pass
+                // sees "cTag matches" and would call a stale file synced,
+                // leaving it permanently diverged with no event ever
+                // re-triggering the fetch. Size is a cheap necessary condition
+                // for content equality: when it disagrees the bytes are still
+                // owed, so fetch regardless of the cTag. (`local` here is not a
+                // local edit — that is the `(_, true)` arm — so overwriting is
+                // safe and is what the user's other device already did.)
                 (false, false) => {
+                    if !local.is_dir && local.size != remote.size.unwrap_or(local.size) {
+                        return RemoteAction::Download { overwrite: true };
+                    }
                     let want = remote.effective_mtime().map(|t| t.unix_timestamp());
                     match want {
                         Some(want) if want != local.mtime => RemoteAction::RestampMtime,
@@ -450,6 +463,29 @@ mod tests {
         assert_eq!(
             decide_remote(&new, Some(&known), Some(&local)),
             RemoteAction::ConflictCopy
+        );
+    }
+
+    #[test]
+    fn stale_content_under_a_matching_ctag_is_still_fetched() {
+        // Regression (sync-correctness): a prior pass advanced the stored cTag
+        // and size to the new remote version, but the download it queued was
+        // interrupted — the daemon restarted before the bytes landed — so the
+        // file on disk is the OLD content while the record's cTag already
+        // equals the remote's. Change-detection by cTag alone reports "no
+        // change", and without the size guard the file sits permanently
+        // diverged: the cloud edit is never pulled and nothing re-triggers it.
+        let remote = remote_file("F1", "R", "a.txt", "c2", 9603);
+        let mtime = remote.effective_mtime().unwrap().unix_timestamp();
+        // Local bytes are the stale, larger version. Crucially its size+mtime
+        // match what we last recorded, so this is NOT a local edit (that path
+        // is covered by `local_only_change_is_left_to_the_upload_path`).
+        let local = stat(11191, mtime);
+        let known = synced_record(&remote, &local); // cTag c2, size 9603, local_size 11191
+        assert!(!local_is_modified(&known, &local), "guard: not a local edit");
+        assert_eq!(
+            decide_remote(&remote, Some(&known), Some(&local)),
+            RemoteAction::Download { overwrite: true }
         );
     }
 

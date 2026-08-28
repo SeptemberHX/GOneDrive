@@ -34,6 +34,15 @@
 - **修复**：补两条 wiremock 集成测试——多分片上传完整走通、以及**从已提交偏移续传而非重启**（`createUploadSession` 断言 `expect(0)` 证明未重开会话）。
 - **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_large_upload_completes_in_multiple_chunks`、`::an_interrupted_upload_resumes_from_its_committed_offset`。
 
+## SC-006 · cTag 抢先于内容 → 中断的下载后云端改动永远拉不下来（静默不一致）
+
+- **首次发现**：2026-08-28（真机复现：网页改了 `待购清单.xlsx`，本地始终是旧内容）
+- **现象**：在云端改动一个已 hydrate 的文件后，本地文件长期停留在旧内容，任何轮询都不再更新——DB 里 `state='synced'`、`ctag` 已等于最新远端值，但 `local_size(11191) != 远端 size(9603)`，且 `pending_ops` 为空。
+- **根因**：`apply_remote` 每次都用 `record_from_remote` 把记录的 `ctag/size` 推进到最新远端值（哪怕内容没下载）；`decide_remote` 的变更检测只比 `ctag`。时序：①第一次 pass 见远端变 → `Download{overwrite:true}` + `state=DirtyRemote` 入队，同时 ctag 被推进；②下载还没落地，守护重启/中断（本例是我引入的 `CapabilityBoundingSet` 崩溃循环，见 hydration-and-placeholders 的运维记录）；③再次 apply 时 `known.ctag == remote.ctag` → `remote_content_changed=false` → 走 `(false,false)` → `state` 回落默认 `Synced`，`DirtyRemote` 与待下载意图一并丢失，且没有任何后续事件会重新触发。
+- **修复**：`decide_remote` 的 `(false,false)` 分支即使 ctag 相等，也校验 `!local.is_dir && local.size != remote.size`——尺寸是内容相等的廉价必要条件,不一致即判 `Download{overwrite:true}`。既在重枚举时自愈已卡住的文件,又防复发。覆盖门禁 `local_content_unsynced` 对本地未改动文件返回 false,故会真正覆盖下载、无死循环。
+- **回归测试**：`crates/gonedrive-core/src/sync/plan.rs::stale_content_under_a_matching_ctag_is_still_fetched`（无修复时走 Skip=RED，有修复走 `Download{overwrite:true}`=GREEN）。
+- **后续硬化（待做）**：`apply_remote` 被动分支（RestampMtime / Skip-UpToDate）应沿用 `known.state` 而非默认 `Synced`,让合法的 `DirtyRemote`/`DirtyLocal` 不被重枚举覆盖;根因层面可让记录的 ctag 在内容真正落地前不推进。
+
 ## SC-004 · 上传无 If-Match → 拉取与推送间他端改动被静默覆盖
 
 - **首次发现**：2026-08-28（探索发现）
