@@ -116,6 +116,7 @@ async fn run(
     // restart that handshake can stall — it must never gate the daemon
     // connection, or a wedged tray turns into a blank panel.
     let tray: TrayHandle = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let cell: TrayCell = std::sync::Arc::new(tokio::sync::Mutex::new(TrayState::default()));
     let with_tray = with_tray && std::env::var_os("GONEDRIVE_NO_TRAY").is_none();
     if with_tray {
         // The tray lives on its own thread with its own runtime. Sharing this
@@ -123,6 +124,7 @@ async fn run(
         // may or may not appear depending on scheduling is worse than none.
         // The handle is just a channel sender, so updates cross over freely.
         let slot = tray.clone();
+        let cell_for_tray = cell.clone();
         let actions_for_tray = actions.clone();
         let commands_for_item = tray_commands.clone();
         std::thread::Builder::new()
@@ -152,6 +154,11 @@ async fn run(
                             Ok(handle) => {
                                 tracing::info!("tray registered");
                                 *slot.lock().await = Some(handle);
+                                // Catch up immediately: the connection was very
+                                // likely already established while this thread
+                                // was still handshaking with the shell, so the
+                                // account and status are waiting in the cell.
+                                push_tray(&slot, &cell_for_tray).await;
                                 // Service tasks live on this runtime; park to
                                 // keep them alive.
                                 std::future::pending::<()>().await;
@@ -170,27 +177,27 @@ async fn run(
     }
 
     loop {
-        match connect(&ui, &tray).await {
+        match connect(&ui, &tray, &cell).await {
             Ok(proxy) => {
                 // Returns when the connection drops, so the outer loop
                 // reconnects — a daemon restart should not require restarting
                 // the application.
-                serve(&proxy, &commands, &ui, &tray).await;
+                serve(&proxy, &commands, &ui, &tray, &cell).await;
                 let _ = ui
                     .send(UiEvent::Disconnected("the daemon stopped".into()))
                     .await;
             }
             Err(e) => {
-                if let Some(handle) = tray.lock().await.as_ref() {
-                    handle
-                        .update(|tray| {
-                            tray.set_status(SyncStatus {
-                                state: "offline".into(),
-                                ..Default::default()
-                            });
-                        })
-                        .await;
-                }
+                // Keep the known account; only the connection is gone.
+                tray_set_status(
+                    &tray,
+                    &cell,
+                    SyncStatus {
+                        state: "offline".into(),
+                        ..Default::default()
+                    },
+                )
+                .await;
                 let _ = ui.send(UiEvent::Disconnected(e.to_string())).await;
             }
         }
@@ -203,9 +210,56 @@ async fn run(
 
 type TrayHandle = std::sync::Arc<tokio::sync::Mutex<Option<ksni::Handle<GonedriveTray>>>>;
 
+/// The last account and status we learned, kept so the tray — which registers
+/// asynchronously and may come up long after the first connect — can be brought
+/// up to date the moment it appears, rather than sitting on "未登录" until the
+/// next status change. Every place that learns a new account or status writes
+/// it here and re-pushes.
+#[derive(Default, Clone)]
+struct TrayState {
+    account: Option<AccountInfo>,
+    status: SyncStatus,
+}
+type TrayCell = std::sync::Arc<tokio::sync::Mutex<TrayState>>;
+
+/// Push whatever is in the cell to the tray, if it is registered.
+async fn push_tray(tray: &TrayHandle, cell: &TrayCell) {
+    let snap = cell.lock().await.clone();
+    if let Some(handle) = tray.lock().await.as_ref() {
+        handle
+            .update(move |item| {
+                item.set_account(snap.account.clone());
+                item.set_status(snap.status.clone());
+            })
+            .await;
+    }
+}
+
+/// Record a new status (keeping the known account) and push it.
+async fn tray_set_status(tray: &TrayHandle, cell: &TrayCell, status: SyncStatus) {
+    cell.lock().await.status = status;
+    push_tray(tray, cell).await;
+}
+
+/// Record a new account and status together and push them.
+async fn tray_set_all(
+    tray: &TrayHandle,
+    cell: &TrayCell,
+    account: Option<AccountInfo>,
+    status: SyncStatus,
+) {
+    {
+        let mut state = cell.lock().await;
+        state.account = account;
+        state.status = status;
+    }
+    push_tray(tray, cell).await;
+}
+
 async fn connect(
     ui: &async_channel::Sender<UiEvent>,
     tray: &TrayHandle,
+    cell: &TrayCell,
 ) -> zbus::Result<DaemonProxy<'static>> {
     let connection = zbus::Connection::session().await?;
     let proxy = DaemonProxy::new(&connection).await?;
@@ -213,16 +267,10 @@ async fn connect(
     // does not, because D-Bus resolves the name lazily.
     let accounts = proxy.list_accounts().await?;
     let status = proxy.status().await?;
-    if let Some(handle) = tray.lock().await.as_ref() {
-        let first = accounts.first().cloned();
-        let current = status.clone();
-        handle
-            .update(move |tray| {
-                tray.set_account(first);
-                tray.set_status(current);
-            })
-            .await;
-    }
+    // Record it whether or not the tray has registered yet — if it has not, it
+    // reads this the moment it does, so it never shows "未登录" over a signed-in
+    // account.
+    tray_set_all(tray, cell, accounts.first().cloned(), status.clone()).await;
     let _ = ui.send(UiEvent::Connected { accounts, status }).await;
 
     // Anything already in flight, so a window that opened late shows the
@@ -240,6 +288,7 @@ async fn serve(
     commands: &async_channel::Receiver<Command>,
     ui: &async_channel::Sender<UiEvent>,
     tray: &TrayHandle,
+    cell: &TrayCell,
 ) {
     let Ok(mut status_changed) = proxy.receive_status_changed().await else {
         return;
@@ -270,19 +319,17 @@ async fn serve(
         tokio::select! {
             Some(signal) = status_changed.next() => {
                 if let Ok(args) = signal.args() {
-                    if let Some(handle) = tray.lock().await.as_ref() {
-                        let status = args.status.clone();
-                        handle.update(move |tray| tray.set_status(status)).await;
-                    }
+                    tray_set_status(tray, cell, args.status.clone()).await;
                     let _ = ui.send(UiEvent::Status(args.status)).await;
                 }
             }
             Some(_) = login_completed.next() => {
                 let _ = ui.send(UiEvent::LoginCompleted).await;
-                if let Ok(accounts) = proxy.list_accounts().await {
-                    if let Ok(status) = proxy.status().await {
-                        let _ = ui.send(UiEvent::Connected { accounts, status }).await;
-                    }
+                if let (Ok(accounts), Ok(status)) =
+                    (proxy.list_accounts().await, proxy.status().await)
+                {
+                    tray_set_all(tray, cell, accounts.first().cloned(), status.clone()).await;
+                    let _ = ui.send(UiEvent::Connected { accounts, status }).await;
                 }
             }
             Some(signal) = login_failed.next() => {
@@ -327,7 +374,7 @@ async fn serve(
             command = commands.recv() => {
                 match command {
                     Ok(command) => {
-                        if !handle(proxy, command, ui).await {
+                        if !handle(proxy, command, ui, tray, cell).await {
                             return; // the daemon went away mid-call
                         }
                     }
@@ -344,6 +391,8 @@ async fn handle(
     proxy: &DaemonProxy<'static>,
     command: Command,
     ui: &async_channel::Sender<UiEvent>,
+    tray: &TrayHandle,
+    cell: &TrayCell,
 ) -> bool {
     match command {
         Command::StartLogin => match proxy.start_login().await {
@@ -397,6 +446,7 @@ async fn handle(
                 if let (Ok(accounts), Ok(status)) =
                     (proxy.list_accounts().await, proxy.status().await)
                 {
+                    tray_set_all(tray, cell, accounts.first().cloned(), status.clone()).await;
                     let _ = ui.send(UiEvent::Connected { accounts, status }).await;
                 }
             }
@@ -404,6 +454,7 @@ async fn handle(
         }
         Command::Refresh => match (proxy.list_accounts().await, proxy.status().await) {
             (Ok(accounts), Ok(status)) => {
+                tray_set_all(tray, cell, accounts.first().cloned(), status.clone()).await;
                 let _ = ui.send(UiEvent::Connected { accounts, status }).await;
                 true
             }
