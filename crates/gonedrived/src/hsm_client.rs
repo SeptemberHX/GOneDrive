@@ -261,6 +261,15 @@ async fn handle(
         }
         Event::Filled { ok, path, full, .. } => {
             let path = PathBuf::from(path);
+            // The helper consumes and deletes its staged file, but an older
+            // helper — or one whose delete failed — would leave it in the
+            // user's folder for the hour until the scan sweeps it. The daemon
+            // knows the name it staged, so it removes it here too: by the time
+            // this arrives the fill is done and the staging file is spent.
+            let staged = gonedrive_core::sync::transfer::staging_sibling(&path);
+            if staged.exists() {
+                let _ = std::fs::remove_file(&staged);
+            }
             if ok && full {
                 if let Err(e) = app.finish_hydration(&path).await {
                     tracing::warn!(path = %path.display(), error = %e, "could not finalise");
