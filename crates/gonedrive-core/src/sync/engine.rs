@@ -377,6 +377,43 @@ impl Engine {
         let path = account.root_local_path.join(&parent_rel).join(&name);
         let local = stat_of(&path);
 
+        // A dehydrated placeholder whose remote content changed is refreshed in
+        // place — new size, new timestamp, new ctag — and stays a placeholder.
+        // Its on-disk bytes are holes, not the user's edit, so the ordinary
+        // conflict/download logic (which would see "local differs" and copy it
+        // aside) must not run. The new content arrives when the file is next
+        // opened. This is what makes a cloud change to an un-downloaded file
+        // invisible to the user, as it should be.
+        if !remote.is_folder()
+            && !remote.is_deleted()
+            && Placeholder::state(&path) == PlaceholderState::Dehydrated
+        {
+            if let Some(existing) = &known {
+                let changed = existing.ctag.as_deref() != remote.ctag.as_deref()
+                    || existing.size != remote.size.unwrap_or(0);
+                if changed {
+                    let _ = Placeholder::create(
+                        &path,
+                        remote.size.unwrap_or(0),
+                        &remote.id,
+                        remote.ctag.as_deref(),
+                        remote.effective_mtime(),
+                    );
+                    tracing::debug!(name = %name, "refreshed placeholder from a remote change");
+                }
+            }
+            let mut record =
+                record_from_remote(&self.account_id, remote, ItemState::Dehydrated, PinState::Inherit);
+            if let Some(existing) = &known {
+                record.pin_state = existing.pin_state;
+            }
+            self.store.upsert_item(&record)?;
+            if let Some(generation) = generation {
+                self.store.mark_seen(&[record.id.clone()], generation)?;
+            }
+            return Ok(());
+        }
+
         let action = decide_remote(remote, known.as_ref(), local.as_ref());
         let mut state = ItemState::Synced;
 
@@ -1091,6 +1128,27 @@ impl Engine {
         Ok(staged)
     }
 
+    /// Stage a byte range only if it is already real data on disk, never
+    /// fetching. Returns `None` if any of the window is still a hole.
+    ///
+    /// This is what keeps folder browsing offline: a sniff of a window that was
+    /// filled by an earlier real read is served locally; a sniff of an
+    /// untouched placeholder returns `None`, and the caller lets the read see
+    /// zeros rather than reaching for the network.
+    pub async fn stage_range_if_local(
+        &self,
+        path: &Path,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<PathBuf>> {
+        let Some(bytes) = read_if_materialized(path, offset, length)? else {
+            return Ok(None);
+        };
+        let staged = transfer::staging_sibling(path);
+        tokio::fs::write(&staged, &bytes).await?;
+        Ok(Some(staged))
+    }
+
     /// Record that a placeholder the helper just filled is now complete.
     pub fn finish_hydration(&self, path: &Path) -> Result<()> {
         self.emit(SyncEvent::HydrationFinished {
@@ -1121,6 +1179,8 @@ impl Engine {
             )?;
         }
         self.store.set_item_state(&item_id, ItemState::Synced)?;
+        let account = self.account()?;
+        self.mark_ancestors_local(&account, &item_id)?;
         Ok(())
     }
 
@@ -1344,6 +1404,10 @@ impl Engine {
                 if !path.exists() {
                     std::fs::create_dir_all(&path)?;
                 }
+                // Badge the folder so the file manager shows online/local on
+                // directories, not only files. Aggregate refined below once
+                // materialisation knows which subtrees hold content.
+                let _ = Placeholder::mark_dir(&path, PlaceholderState::Dehydrated, &folder.id);
             }
         }
 
@@ -1382,6 +1446,15 @@ impl Engine {
             }
         }
 
+        // Any folder that already holds downloaded content is marked local, up
+        // the whole chain — a parent of a downloaded file is "available" too.
+        for record in self.store.items_in_state(&self.account_id, ItemState::Synced)? {
+            if record.is_folder || record.local_ino.is_none() {
+                continue;
+            }
+            self.mark_ancestors_local(&account, &record.id)?;
+        }
+
         // Directory timestamps last: creating children moved them off the
         // service's value.
         for folder in &folders {
@@ -1397,6 +1470,30 @@ impl Engine {
 
         progress(total, total);
         Ok(watch)
+    }
+
+    /// Badge every ancestor directory of an item as holding local content.
+    ///
+    /// Stops climbing at the first directory already marked local: if it is,
+    /// everything above it already is too, so a hydration never walks the
+    /// whole chain to the root more than once.
+    fn mark_ancestors_local(&self, account: &Account, item_id: &str) -> Result<()> {
+        let mut current = self.store.item(item_id)?.and_then(|i| i.parent_id);
+        while let Some(id) = current {
+            let Some(folder) = self.store.item(&id)? else { break };
+            if !folder.is_folder {
+                break;
+            }
+            let Some(path) = self.store.local_path(account, &id)? else { break };
+            if path.is_dir() {
+                if Placeholder::state(&path) == PlaceholderState::Hydrated {
+                    break;
+                }
+                let _ = Placeholder::mark_dir(&path, PlaceholderState::Hydrated, &id);
+            }
+            current = folder.parent_id;
+        }
+        Ok(())
     }
 
     /// Reconcile database states with what the files themselves say.

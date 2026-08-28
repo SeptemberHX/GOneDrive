@@ -77,10 +77,19 @@ struct Cli {
     uid: Option<u32>,
 }
 
-/// A hydration the helper is waiting on. The reply carries the file the
-/// daemon staged the content in (with its placement), or `None` on failure.
+/// A hydration the helper is waiting on.
+enum Reply {
+    /// Fill this window from the staged file, then place/finalise it.
+    Fill(PathBuf, u64, bool),
+    /// Let the read proceed against the sparse file, unchanged. A browsing
+    /// sniff of an untouched placeholder — no fetch happened.
+    AllowEmpty,
+    /// The content could not be provided; fail the read.
+    Deny,
+}
+
 struct Pending {
-    reply: mpsc::Sender<Option<(PathBuf, u64, bool)>>,
+    reply: mpsc::Sender<Reply>,
 }
 
 struct Shared {
@@ -296,23 +305,24 @@ fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
             offset,
             full,
         } => {
-            let staged = match (ok, source) {
+            let reply = match (ok, source) {
                 (true, Some(source)) => {
                     let source = PathBuf::from(source);
                     // The staged file is named by an unprivileged process, so
                     // it gets the same ownership check as anything else.
                     match authorise(&source, uid) {
-                        Ok(()) => Some((source, offset, full)),
+                        Ok(()) => Reply::Fill(source, offset, full),
                         Err(e) => {
                             tracing::warn!(error = %e, "refusing staged content");
-                            None
+                            Reply::Deny
                         }
                     }
                 }
-                _ => None,
+                (true, None) => Reply::AllowEmpty,
+                (false, _) => Reply::Deny,
             };
             if let Some(pending) = shared.pending.lock().unwrap().remove(&id) {
-                let _ = pending.reply.send(staged);
+                let _ = pending.reply.send(reply);
             }
         }
     }
@@ -465,15 +475,18 @@ fn hydrate(shared: &Arc<Shared>, event: &PreContentEvent) -> Result<(bool, bool)
         return Err(e);
     }
 
-    let staged = match rx.recv_timeout(HYDRATE_TIMEOUT) {
-        Ok(staged) => staged,
+    let reply = match rx.recv_timeout(HYDRATE_TIMEOUT) {
+        Ok(reply) => reply,
         Err(_) => {
             shared.pending.lock().unwrap().remove(&id);
             bail!("the daemon did not answer within {HYDRATE_TIMEOUT:?}")
         }
     };
-    let Some((staged, offset, full)) = staged else {
-        return Ok((false, true));
+    let (staged, offset, full) = match reply {
+        Reply::Fill(path, offset, full) => (path, offset, full),
+        // Browsing sniff of an untouched placeholder: allow, no fill, offline.
+        Reply::AllowEmpty => return Ok((true, false)),
+        Reply::Deny => return Ok((false, true)),
     };
 
     // Written through the event's own descriptor. Any other descriptor would
@@ -555,7 +568,7 @@ fn background_reader(pid: i32) -> Option<&'static str> {
 fn fail_all_pending(shared: &Arc<Shared>) {
     let pending: Vec<_> = shared.pending.lock().unwrap().drain().collect();
     for (_, entry) in pending {
-        let _ = entry.reply.send(None);
+        let _ = entry.reply.send(Reply::Deny);
     }
 }
 

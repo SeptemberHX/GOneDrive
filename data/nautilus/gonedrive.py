@@ -66,11 +66,24 @@ SYNCING = Status(EMBLEM_SYNCING, "正在同步")
 FAILED = Status(EMBLEM_ERROR, "同步出错")
 
 
-def status_of(path):
+# Folders carry the same xattrs but read as a different pair of states: a
+# directory is a container, not a file, so "online-only" means nothing inside
+# is here and "available" means some content is. Windows badges folders too,
+# and a tree with unbadged folders looks half-managed.
+FOLDER_ONLINE = Status(EMBLEM_CLOUD, "仅在线")
+FOLDER_LOCAL = Status(EMBLEM_LOCAL, "包含本地内容")
+FOLDER_PINNED = Status(EMBLEM_PINNED, "始终保留在此设备")
+
+
+def status_of(path, is_dir=False):
     """Classify a path, or return None if GOnedrive does not manage it."""
     state = _xattr(path, XATTR_STATE)
     if state is None:
         return None
+    if is_dir:
+        if _xattr(path, XATTR_PIN) == "pinned":
+            return FOLDER_PINNED
+        return FOLDER_LOCAL if state == "hydrated" else FOLDER_ONLINE
     if state == "dehydrated":
         return ONLINE_ONLY
     if state == "hydrating":
@@ -109,7 +122,7 @@ class GOnedriveExtension(
         path = self._path_of(file)
         if path is None:
             return
-        status = status_of(path)
+        status = status_of(path, file.is_directory())
         if status is None:
             return
         file.add_emblem(status.emblem)
@@ -126,7 +139,7 @@ class GOnedriveExtension(
         if not managed:
             return []
 
-        statuses = [status_of(p) for _, p in managed]
+        statuses = [status_of(p, f.is_directory()) for f, p in managed]
         # A folder carries no status of its own but still has contents worth
         # acting on, so it counts as actionable when it is inside the tree.
         folders = [p for f, p in managed if f.is_directory()]

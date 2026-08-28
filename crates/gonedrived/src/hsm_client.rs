@@ -227,19 +227,21 @@ async fn handle(
                 partial_hydration.load(std::sync::atomic::Ordering::Relaxed);
             let (ok, source, offset, full) =
                 match app.stage_for(&path, offset, length, &reader, allow_partial).await {
-                Ok((staged, offset, full)) => (
-                    true,
-                    Some(staged.to_string_lossy().into_owned()),
-                    offset,
-                    full,
-                ),
-                Err(e) => {
-                    // Answering false makes the blocked reader see an ordinary
-                    // I/O error. Not answering at all would block it forever.
-                    tracing::error!(path = %path.display(), error = %e, "could not stage content");
-                    (false, None, 0, true)
-                }
-            };
+                    // Fill this window from a staged file.
+                    Ok(Some((staged, offset, full))) => (
+                        true,
+                        Some(staged.to_string_lossy().into_owned()),
+                        offset,
+                        full,
+                    ),
+                    // Allow the read with no fill: a browsing sniff of an
+                    // untouched placeholder reads zeros, offline.
+                    Ok(None) => (true, None, 0, false),
+                    Err(e) => {
+                        tracing::error!(path = %path.display(), error = %e, "could not stage content");
+                        (false, None, 0, true)
+                    }
+                };
 
             let mut reply = match serde_json::to_string(&Request::Hydrated {
                 id,

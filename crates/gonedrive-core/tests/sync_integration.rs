@@ -1966,3 +1966,68 @@ async fn on_demand_mode_places_new_files_from_delta() {
     assert!(p.exists(), "a new file should appear as a placeholder at once");
     assert_eq!(Placeholder::state(&p), PlaceholderState::Dehydrated);
 }
+
+#[tokio::test]
+async fn a_remote_change_to_a_placeholder_refreshes_it_silently() {
+    // In on-demand mode most files are placeholders. When one changes in the
+    // cloud, the tree must update — new size, new timestamp — without a
+    // download and without a conflict copy (its on-disk bytes are holes, not a
+    // local edit). The new content comes on the next open.
+    use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
+
+    let mut config = Config {
+        client_id: "test".into(),
+        on_demand: true,
+        ..Config::default()
+    };
+    config.sync_root = std::path::PathBuf::new();
+    let h = Harness::with_config(config).await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "Docs"),
+            file("F1", "D1", "report.bin", "c1", 1000, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.sync().await; // on-demand: report.bin becomes a placeholder
+    let path = h.path("Docs/report.bin");
+    assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
+    assert_eq!(Occupancy::read(&path).unwrap().apparent_size, 1000);
+
+    // The file changes in the cloud: new ctag, new size, new time.
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![file("F1", "D1", "report.bin", "c2", 5000, "2026-08-25T12:00:00Z")],
+        "v2",
+    )
+    .await;
+    // No download mock and no conflict-copy upload mock: either would fail.
+
+    let summary = h.sync().await;
+    assert_eq!(summary.downloaded, 0);
+    assert_eq!(summary.conflicts, 0);
+    assert_eq!(summary.failed, 0);
+
+    // The placeholder now reflects the new remote metadata, still a placeholder.
+    assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
+    assert_eq!(Occupancy::read(&path).unwrap().apparent_size, 5000);
+    assert_eq!(
+        mtime_secs(&path),
+        time::macros::datetime!(2026-08-25 12:00:00 UTC).unix_timestamp()
+    );
+    let record = h.store.item("F1").unwrap().unwrap();
+    assert_eq!(record.size, 5000);
+    assert_eq!(record.ctag.as_deref(), Some("c2"));
+
+    // No conflict-copy litter left behind.
+    let copies: Vec<_> = std::fs::read_dir(h.path("Docs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains("冲突"))
+        .collect();
+    assert!(copies.is_empty(), "a placeholder change must not conflict-copy");
+}

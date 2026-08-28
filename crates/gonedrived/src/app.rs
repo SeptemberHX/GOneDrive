@@ -56,6 +56,10 @@ pub struct App {
     /// The privileged helper, when files-on-demand is available. Without it a
     /// placeholder is just a file full of zeroes that nothing will ever fill.
     hsm: RwLock<Option<Arc<crate::hsm_client::HsmClient>>>,
+    /// The single progress window, if one is up. Guarded so a burst of
+    /// hydrations does not stack three windows (as it did once). `Arc` so a
+    /// spawned task can hold it without borrowing the whole `App`.
+    monitor: Arc<std::sync::Mutex<Option<std::process::Child>>>,
     events: broadcast::Sender<DaemonEvent>,
 }
 
@@ -83,6 +87,7 @@ impl App {
             hydrations: Arc::new(RwLock::new(HashMap::new())),
             activity: Arc::new(RwLock::new(std::collections::VecDeque::new())),
             hsm: RwLock::new(None),
+            monitor: Arc::new(std::sync::Mutex::new(None)),
             events,
         });
         Ok(app)
@@ -401,20 +406,38 @@ impl App {
         length: u64,
         reader: &str,
         allow_partial: bool,
-    ) -> Result<(std::path::PathBuf, u64, bool)> {
+    ) -> Result<Option<(std::path::PathBuf, u64, bool)>> {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let browsing = is_browsing_reader(reader);
-        // For a consumer, only the very first head-read is served as a range.
-        // Coming back for offset > 0 is the signature of sequential reading —
-        // `cat`, `cp`, a hashing tool — and serving那 32 KiB at a time turns a
-        // 2 MB file into sixty-odd cloud round-trips, observed live. One read
-        // past the head escalates to full hydration.
+
+        if browsing {
+            // Browsing must never touch the network: opening a folder makes the
+            // file manager sniff the head of every file for its type, and a
+            // cloud fetch per file is exactly the "opening a folder loads for a
+            // long time" the user reported. Serve the window only if it is
+            // already on disk from a real earlier read; otherwise let the read
+            // proceed against the sparse file (zeros) and answer offline. The
+            // file's type comes from its name, as on Windows.
+            let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+            if let Some(engine) = engines.first() {
+                if let Ok(Some(staged)) =
+                    engine.stage_range_if_local(path, offset, length.max(1)).await
+                {
+                    return Ok(Some((staged, offset, false)));
+                }
+            }
+            return Ok(None); // allow the read with no fill, no network
+        }
+
+        // A consumer: only the very first head-read is a range. Coming back for
+        // offset > 0 is sequential reading (`cat`, `cp`, a hash), and serving
+        // 32 KiB at a time would be dozens of round-trips, so it escalates to
+        // full hydration.
         let partial = allow_partial
             && length > 0
-            && (browsing
-                || (offset == 0
-                    && length <= Self::PARTIAL_HYDRATION_CEILING
-                    && length < size));
+            && offset == 0
+            && length <= Self::PARTIAL_HYDRATION_CEILING
+            && length < size;
 
         if partial {
             let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
@@ -423,10 +446,10 @@ impl App {
                 .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
             let length = length.min(size.saturating_sub(offset)).max(1);
             let staged = engine.stage_range(path, offset, length).await?;
-            return Ok((staged, offset, false));
+            return Ok(Some((staged, offset, false)));
         }
         let staged = self.stage_content(path).await?;
-        Ok((staged, 0, true))
+        Ok(Some((staged, 0, true)))
     }
 
     /// Download a placeholder's content to a staging file for the helper.
@@ -505,34 +528,13 @@ impl App {
         const DELAY: Duration = Duration::from_millis(400);
         let hydrations = self.hydrations.clone();
 
+        let monitor = self.monitor.clone();
         tokio::spawn(async move {
             tokio::time::sleep(DELAY).await;
             if !hydrations.read().await.contains_key(&path) {
                 return; // finished before anyone would have noticed
             }
-            // "One window for all transfers" is enforced by the window itself:
-            // its GApplication id is unique, so a second spawn just forwards
-            // its activation to the first and exits. No liveness bookkeeping
-            // here — that bookkeeping is how the last version leaked zombies,
-            // because nobody ever `wait`ed on the stored child.
-            let spawned = std::process::Command::new("gonedrive")
-                .arg("--hydration-monitor")
-                .spawn()
-                .or_else(|_| {
-                    // Development: the front end may not be on PATH yet.
-                    std::process::Command::new("./target/release/gonedrive")
-                        .arg("--hydration-monitor")
-                        .spawn()
-                });
-            match spawned {
-                Ok(mut child) => {
-                    // Reap it whenever it exits, so it never lingers defunct.
-                    std::thread::spawn(move || {
-                        let _ = child.wait();
-                    });
-                }
-                Err(e) => tracing::debug!(error = %e, "no progress window available"),
-            }
+            ensure_progress_window(&monitor);
         });
     }
 
@@ -903,13 +905,78 @@ async fn record_activity(
 /// ranges and never change a file's state: browsing must have no side
 /// effects, at any file size.
 fn is_browsing_reader(comm: &str) -> bool {
-    const BROWSERS: &[&str] = &["nautilus", "sushi"];
+    // Anything that reads a file to *describe* it — the file manager itself,
+    // its preview pane, and every thumbnailer. A thumbnail of an online-only
+    // file simply does not render until the file is opened for real, exactly
+    // as on Windows; it must never pull the whole image down. `comm` is
+    // kernel-truncated to 15 characters, so these are prefixes.
+    const BROWSERS: &[&str] = &[
+        "nautilus",
+        "sushi",              // GNOME's preview (spacebar)
+        "glycin",             // GNOME's image loader/thumbnailer sandbox
+        "gdk-pixbuf-thum",
+        "gnome-thumbnail",
+        "gst-video-thumb",
+        "gst-audio-thumb",
+        "heif-thumbnaile",
+        "papers-thumbnai",
+        "totem-video-thu",
+        "ffmpegthumbnail",
+        "evince-thumbnai",
+    ];
     BROWSERS.iter().any(|prefix| comm.starts_with(prefix))
+}
+
+/// Bring up the one progress window, if it is not already up.
+///
+/// The GApplication id is unique, so even a rare double-spawn folds into one
+/// window — but tracking the child avoids the race entirely (a burst of
+/// hydrations once stacked three windows) and lets it be reaped rather than
+/// left defunct.
+fn ensure_progress_window(monitor: &Arc<std::sync::Mutex<Option<std::process::Child>>>) {
+    let Ok(mut slot) = monitor.lock() else {
+        return;
+    };
+    if let Some(child) = slot.as_mut() {
+        if matches!(child.try_wait(), Ok(None)) {
+            return; // still running
+        }
+    }
+    let spawned = std::process::Command::new("gonedrive")
+        .arg("--hydration-monitor")
+        .spawn()
+        .or_else(|_| {
+            std::process::Command::new("./target/release/gonedrive")
+                .arg("--hydration-monitor")
+                .spawn()
+        });
+    match spawned {
+        Ok(child) => *slot = Some(child),
+        Err(e) => tracing::debug!(error = %e, "no progress window available"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::is_browsing_reader;
+
+    #[test]
+    fn thumbnailers_and_previews_browse_never_consume() {
+        // The screenshot bug: clicking one image made Nautilus thumbnail the
+        // others, downloading them. Every thumbnailer and preview helper must
+        // read as "browsing" so it is served offline, never pulling content.
+        for t in [
+            "glycin-thumbnai", "gdk-pixbuf-thum", "gst-video-thumb",
+            "gst-audio-thumb", "heif-thumbnaile", "papers-thumbnai",
+            "nautilus", "sushi",
+        ] {
+            assert!(is_browsing_reader(t), "{t} must browse, not download");
+        }
+        // A real image viewer the user opened is a genuine consumer.
+        for v in ["loupe", "eog", "gimp", "gwenview"] {
+            assert!(!is_browsing_reader(v), "{v} is a real open");
+        }
+    }
 
     #[test]
     fn file_managers_browse_and_applications_consume() {

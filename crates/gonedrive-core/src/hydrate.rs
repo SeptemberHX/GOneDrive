@@ -182,6 +182,21 @@ impl Placeholder {
         String::from_utf8(raw).ok()
     }
 
+    /// Mark a directory with its aggregate state, so a file manager can badge
+    /// folders the way it badges files.
+    ///
+    /// A directory cannot be a sparse placeholder, so this only writes the
+    /// xattrs — no hole punching. `dehydrated` means "nothing inside is on this
+    /// device" (an online-only folder), `hydrated` means "some content is
+    /// here". Mirrors what Windows shows on a folder.
+    pub fn mark_dir(path: &Path, state: PlaceholderState, item_id: &str) -> Result<()> {
+        xattr::set(path, XATTR_STATE, state.as_str().as_bytes()).map_err(|e| {
+            Error::other(format!("could not mark {} ({e})", path.display()))
+        })?;
+        xattr::set(path, XATTR_ITEM_ID, item_id.as_bytes())?;
+        Ok(())
+    }
+
     /// Record the retention choice on the file itself.
     ///
     /// Duplicating this from the database is deliberate: a file manager
