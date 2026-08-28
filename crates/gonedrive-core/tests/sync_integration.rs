@@ -1491,6 +1491,45 @@ async fn materialize_never_zeroes_a_sparse_file_the_user_edited() {
 }
 
 #[tokio::test]
+async fn a_download_preserves_a_hidden_local_edit_as_a_conflict_copy() {
+    // A remote change plus an in-place local edit that kept size and mtime: the
+    // heuristic judges the remote the newer side and would overwrite, losing
+    // the hidden edit. The content-hash guard must turn it into a conflict.
+    let content: &[u8] = b"AAAAAAAA";
+    let h = harness_with_a_downloaded_file(content).await;
+    let path = h.path("Docs/big.bin");
+
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::write(&path, b"BBBBBBBB").unwrap();
+    let f = std::fs::File::options().write(true).open(&path).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(before)).unwrap();
+    drop(f);
+
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![file("F1", "D1", "big.bin", "c2", 8, "2022-05-01T00:00:00Z")],
+        "v2",
+    )
+    .await;
+    h.mock_download("F1", b"REMOTE!!").await;
+    mock_upload(&h.server, "F1copy", "conflict").await;
+
+    let summary = h.sync().await;
+    assert!(summary.conflicts >= 1, "a hidden edit must become a conflict, not be overwritten");
+    assert_eq!(h.read("Docs/big.bin"), "REMOTE!!", "the remote takes the original name");
+
+    let copies: Vec<_> = std::fs::read_dir(h.path("Docs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("的冲突副本"))
+        .collect();
+    assert_eq!(copies.len(), 1, "the hidden edit must survive as a conflict copy: {copies:?}");
+    assert_eq!(h.read(&format!("Docs/{}", copies[0])), "BBBBBBBB");
+}
+
+#[tokio::test]
 async fn placeholders_can_be_created_for_files_never_downloaded() {
     use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
 

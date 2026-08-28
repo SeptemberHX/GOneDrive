@@ -2056,6 +2056,32 @@ impl Engine {
             .or(self.store.local_path(account, item_id)?)
             .ok_or_else(|| Error::other(format!("no local path for {item_id}")))?;
 
+        // A download overwrites whatever is on disk. If that file holds edits
+        // that were never uploaded — an in-place change the size+mtime
+        // heuristic missed, so the remote was judged the newer side — preserve
+        // the local copy under a conflict name first and re-offer it, rather
+        // than let the remote silently win. This is the conflict guarantee,
+        // applied where a remote change races a hidden local edit.
+        if path.exists() && self.local_content_unsynced(&record, &path) {
+            let copy = self.make_conflict_copy(&path)?;
+            self.emit(SyncEvent::Conflict {
+                original: record.name.clone(),
+                copy: copy
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            });
+            summary.conflicts += 1;
+            self.store.enqueue(
+                &self.account_id,
+                OpKind::Upload,
+                None,
+                Some(&copy),
+                None,
+            )?;
+        }
+
         self.store.set_item_state(item_id, ItemState::Hydrating)?;
         let name = record.name.clone();
         let events = self.events.clone();
