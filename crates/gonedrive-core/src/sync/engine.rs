@@ -917,9 +917,7 @@ impl Engine {
             .item(&item_id)?
             .ok_or_else(|| Error::other(format!("unknown item {item_id}")))?;
 
-        let mut name = path.file_name().unwrap_or_default().to_os_string();
-        name.push(".gonedrive-partial");
-        let staged = path.with_file_name(name);
+        let staged = transfer::staging_sibling(path);
 
         tracing::info!(path = %path.display(), size = record.size, "staging content");
         self.store.set_item_state(&item_id, ItemState::Hydrating)?;
@@ -983,9 +981,7 @@ impl Engine {
         let item_id = Placeholder::item_id(path)
             .ok_or_else(|| Error::other(format!("{} is not a placeholder", path.display())))?;
 
-        let mut name = path.file_name().unwrap_or_default().to_os_string();
-        name.push(".gonedrive-partial");
-        let staged = path.with_file_name(name);
+        let staged = transfer::staging_sibling(path);
 
         let response = self
             .graph
@@ -1730,15 +1726,15 @@ fn read_dir(dir: &Path) -> std::io::Result<Vec<(String, LocalStat)>> {
         if INTERNAL_SUFFIXES.iter().any(|s| name.ends_with(s))
             || INTERNAL_NAMES.contains(&name.as_str())
         {
-            // Staging leftovers are pure cache: they are consumed within
-            // seconds when things work, so one that has been sitting for an
-            // hour is an orphan of some failed hand-off. The scan is already
-            // here; sweeping them costs one stat.
+            // Staging leftovers are pure cache: consumed within seconds when
+            // things work, so one still here after fifteen minutes is an
+            // orphan of a failed hand-off. The scan is already walking this
+            // directory; the sweep costs one stat.
             if name.ends_with(".gonedrive-partial") {
                 let stale = entry
                     .metadata()
                     .and_then(|m| m.modified())
-                    .map(|t| t.elapsed().unwrap_or_default() > std::time::Duration::from_secs(3600))
+                    .map(|t| t.elapsed().unwrap_or_default() > std::time::Duration::from_secs(900))
                     .unwrap_or(false);
                 if stale {
                     let _ = std::fs::remove_file(entry.path());

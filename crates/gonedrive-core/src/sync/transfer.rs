@@ -160,9 +160,20 @@ pub fn set_mtime(path: &Path, mtime: OffsetDateTime) -> Result<()> {
 }
 
 fn partial_path(dest: &Path) -> PathBuf {
-    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    staging_sibling(dest)
+}
+
+/// The staging file that belongs beside `path`.
+///
+/// Dot-prefixed on purpose: these exist for seconds, but a file manager showing
+/// one for even that long reads as the client littering the user's folders —
+/// and when a hand-off fails, the orphan would sit in plain view until the
+/// janitor sweeps it. Hidden is where a scratch file belongs.
+pub fn staging_sibling(path: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
     name.push(PARTIAL_SUFFIX);
-    dest.with_file_name(name)
+    path.with_file_name(name)
 }
 
 /// Where an upload should go and what it should be called.
@@ -351,9 +362,10 @@ mod tests {
         let dest = Path::new("/home/u/OneDrive/Docs/report.docx");
         let partial = partial_path(dest);
         assert_eq!(partial.parent(), dest.parent());
+        // Dot-prefixed so the file manager never shows it.
         assert_eq!(
             partial.file_name().unwrap(),
-            "report.docx.gonedrive-partial"
+            ".report.docx.gonedrive-partial"
         );
     }
 
@@ -361,7 +373,7 @@ mod tests {
     fn partial_naming_handles_names_without_an_extension() {
         assert_eq!(
             partial_path(Path::new("/a/README")).file_name().unwrap(),
-            "README.gonedrive-partial"
+            ".README.gonedrive-partial"
         );
     }
 
