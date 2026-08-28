@@ -45,6 +45,40 @@ impl Harness {
         Self::with_policy(DownloadPolicy::Never).await
     }
 
+    async fn with_config(mut config: Config) -> Self {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("OneDrive");
+        std::fs::create_dir_all(&root).unwrap();
+        config.sync_root = root.clone();
+        config.client_id = "test".into();
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_account(&Account {
+                id: ACCOUNT.into(),
+                drive_id: "drive1".into(),
+                root_item_id: Some(ROOT.into()),
+                display_name: Some("Test".into()),
+                address: Some("t@example.com".into()),
+                root_local_path: root.clone(),
+                delta_link: None,
+                enum_link: None,
+                quota_total: None,
+                quota_used: None,
+            })
+            .unwrap();
+        store.upsert_item(&ItemRecord::root(ACCOUNT, ROOT)).unwrap();
+
+        let graph = Arc::new(
+            GraphClient::new(reqwest::Client::new(), TokenSource::Static("token".into()))
+                .with_base_url(server.uri()),
+        );
+        let config = Arc::new(config);
+        let engine = Engine::new(store.clone(), graph, config.clone(), ACCOUNT.into());
+        Self { server, store, engine, config, root, _tmp: tmp }
+    }
+
     async fn with_policy(download_new: DownloadPolicy) -> Self {
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
@@ -1845,4 +1879,90 @@ async fn an_uploaded_file_is_not_recorded_as_pinned() {
         "an upload must not pin; that resurrects deletions"
     );
     assert!(!h.store.explicitly_excluded("NEW").unwrap());
+}
+
+#[tokio::test]
+async fn materialize_all_builds_a_browsable_placeholder_tree() {
+    // The gap the user spotted: the full directory structure lived only in the
+    // database, so the file manager showed only downloaded folders. Windows
+    // presents the whole tree as placeholders. materialize_all does the same:
+    // every folder a real directory, every file a sparse placeholder, browsable
+    // with no network.
+    use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
+
+    let h = Harness::metadata_only().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "文档"),
+            folder("D2", "D1", "深层"),
+            // An empty folder — the case make_on_demand missed entirely.
+            folder("D3", ROOT, "空文件夹"),
+            file("F1", "D2", "报告.docx", "c1", 5000, "2026-08-20T10:00:00Z"),
+            file("F2", "D1", "笔记.txt", "c1", 20, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.sync().await;
+
+    // Nothing on disk yet under the online-only default.
+    assert!(!h.path("文档").exists());
+
+    let watched = h
+        .engine
+        .materialize_all(|_, _| true)
+        .unwrap();
+
+    // The whole tree is now real, including the empty folder.
+    assert!(h.path("文档/深层").is_dir());
+    assert!(h.path("空文件夹").is_dir());
+
+    // Files are sparse placeholders carrying their real size and marks.
+    for (rel, size) in [("文档/深层/报告.docx", 5000u64), ("文档/笔记.txt", 20)] {
+        let p = h.path(rel);
+        assert!(p.exists());
+        assert_eq!(Placeholder::state(&p), PlaceholderState::Dehydrated);
+        assert_eq!(Occupancy::read(&p).unwrap().apparent_size, size);
+    }
+    assert_eq!(watched.len(), 2, "both files need intercepting");
+    // (Folder timestamps are covered by downloaded_folders_keep_their_remote_
+    // timestamps; the folder() helper here carries no fileSystemInfo.)
+
+    // Idempotent: a second run adds nothing and disturbs nothing.
+    let again = h.engine.materialize_all(|_, _| true).unwrap();
+    assert_eq!(again.len(), 2);
+    assert_eq!(std::fs::read(h.path("文档/笔记.txt")).unwrap().len(), 20);
+}
+
+#[tokio::test]
+async fn on_demand_mode_places_new_files_from_delta() {
+    // With the tree materialised, a file that appears later in a delta must
+    // become a placeholder immediately, not wait for a full re-materialisation.
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+
+    let mut config = Config {
+        client_id: "test".into(),
+        on_demand: true,
+        ..Config::default()
+    };
+    config.sync_root = std::path::PathBuf::new(); // set by harness
+    let h = Harness::with_config(config).await;
+    h.mock_delta(None, vec![root_item(), folder("D1", ROOT, "Docs")], "v1")
+        .await;
+    h.sync().await;
+
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![file("F9", "D1", "new.pdf", "c1", 4096, "2026-08-21T10:00:00Z")],
+        "v2",
+    )
+    .await;
+    h.sync().await;
+
+    let p = h.path("Docs/new.pdf");
+    assert!(p.exists(), "a new file should appear as a placeholder at once");
+    assert_eq!(Placeholder::state(&p), PlaceholderState::Dehydrated);
 }

@@ -75,6 +75,9 @@ enum Command {
         #[arg(long)]
         include: bool,
     },
+    /// Present the whole drive as a browsable placeholder tree, so the file
+    /// manager shows every folder and file (true files-on-demand).
+    Materialize,
     /// Show what is on disk, what is a placeholder, and what is neither.
     Storage {
         #[arg(default_value = ".")]
@@ -108,6 +111,7 @@ async fn main() -> Result<()> {
         Command::Unpin { path } => set_pin(path, PinState::Unpinned, true).await,
         Command::FreeSpace { path } => free_space(path).await,
         Command::OnDemand { path } => on_demand(path).await,
+        Command::Materialize => materialize().await,
         Command::Indexer { include } => indexer(include),
         Command::Fetch { path } => fetch(path).await,
         Command::Storage { path } => storage(path),
@@ -133,6 +137,25 @@ async fn run() -> Result<()> {
     // upgrades, and a daemon left orphaned means placeholders that read as
     // zeroes and free-space actions that fail — both learned the hard way.
     tokio::spawn(hsm_supervisor(app.clone()));
+
+    // In on-demand mode the whole drive is presented as placeholders once the
+    // helper is up, so the file manager shows the full tree. Deferred to a
+    // task so start-up is not blocked by materialising a large drive.
+    if app.config.on_demand {
+        let app = app.clone();
+        tokio::spawn(async move {
+            // Give the helper a moment to connect, then materialise.
+            for _ in 0..30 {
+                if app.on_demand_ready().await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            if let Err(e) = app.materialize_tree().await {
+                tracing::warn!(error = %e, "could not materialise the placeholder tree");
+            }
+        });
+    }
 
     let connection = service::serve(app.clone()).await?;
     tracing::info!(
@@ -686,6 +709,17 @@ async fn on_demand(path: PathBuf) -> Result<()> {
         println!("The helper must be running: sudo gonedrive-hsm");
     }
     Ok(())
+}
+
+async fn materialize() -> Result<()> {
+    if let Some(proxy) = running_daemon().await {
+        println!("Materialising the whole drive as placeholders…");
+        let n = proxy.materialize_tree().await?;
+        println!("{n} placeholder(s) ready. Your entire OneDrive is now");
+        println!("browsable in the file manager; files download when opened.");
+        return Ok(());
+    }
+    anyhow::bail!("the daemon is not running; start it with `gonedrived run`")
 }
 
 /// Report what each file under a path actually costs on disk.

@@ -684,6 +684,59 @@ impl Store {
         })
     }
 
+    /// Every folder in an account, shallowest first.
+    ///
+    /// Ordering by the length of the derived path means a parent is always
+    /// returned before its children, so materialising them in order never
+    /// tries to create a directory inside one that does not exist yet.
+    pub fn all_folders_shallow_first(&self, account_id: &str) -> Result<Vec<ItemRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "{ITEM_COLUMNS} WHERE account_id = ?1 AND is_folder = 1 AND parent_id IS NOT NULL"
+            ))?;
+            let rows = stmt.query_map(params![account_id], row_to_item)?;
+            let mut folders: Vec<ItemRecord> =
+                rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            // Depth by ancestor count; cheap because parent_id is indexed and
+            // trees are shallow relative to their node count.
+            let depth_of = |mut id: Option<String>| -> usize {
+                let mut d = 0;
+                while let Some(cur) = id {
+                    match conn
+                        .query_row("SELECT parent_id FROM items WHERE id = ?1", params![cur], |r| {
+                            r.get::<_, Option<String>>(0)
+                        })
+                        .optional()
+                    {
+                        Ok(Some(p)) => {
+                            id = p;
+                            d += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                d
+            };
+            let mut keyed: Vec<(usize, ItemRecord)> = folders
+                .drain(..)
+                .map(|f| (depth_of(f.parent_id.clone()), f))
+                .collect();
+            keyed.sort_by_key(|(d, _)| *d);
+            Ok(keyed.into_iter().map(|(_, f)| f).collect())
+        })
+    }
+
+    /// Every file in an account.
+    pub fn all_files(&self, account_id: &str) -> Result<Vec<ItemRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "{ITEM_COLUMNS} WHERE account_id = ?1 AND is_folder = 0"
+            ))?;
+            let rows = stmt.query_map(params![account_id], row_to_item)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
     /// Find an item by its path relative to the sync root.
     ///
     /// Resolved one component at a time through the case-folded index, so it

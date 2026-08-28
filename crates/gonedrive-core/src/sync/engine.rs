@@ -409,6 +409,20 @@ impl Engine {
                 } else {
                     state = ItemState::Dehydrated;
                     summary.not_downloaded += 1;
+                    // In on-demand mode a newly-seen file becomes a placeholder
+                    // right away, so it shows up in the file manager without
+                    // waiting for a full re-materialisation.
+                    if self.config.on_demand && !path.exists() {
+                        if let Err(e) = Placeholder::create(
+                            &path,
+                            remote.size.unwrap_or(0),
+                            &remote.id,
+                            remote.ctag.as_deref(),
+                            remote.effective_mtime(),
+                        ) {
+                            tracing::debug!(path = %path.display(), error = %e, "placeholder failed");
+                        }
+                    }
                 }
             }
             RemoteAction::RestampMtime => {
@@ -1299,6 +1313,90 @@ impl Engine {
             }
         }
         Ok(outcome)
+    }
+
+    /// Materialise the whole drive as a browsable placeholder tree.
+    ///
+    /// This is the difference between selective sync and true files-on-demand:
+    /// every folder becomes a real (near-free) directory and every file a
+    /// sparse placeholder, so the entire OneDrive is visible and navigable in
+    /// any file manager, offline, with no per-folder network round-trip —
+    /// exactly what Windows does. Content still arrives only when a file is
+    /// opened.
+    ///
+    /// Idempotent and resumable: anything already on disk is left as it is, so
+    /// a run interrupted half-way simply continues next time. `progress` is
+    /// called periodically with (done, total) and returns false to stop.
+    /// Returns the placeholder paths that now need intercepting.
+    pub fn materialize_all(
+        &self,
+        mut progress: impl FnMut(u64, u64) -> bool,
+    ) -> Result<Vec<PathBuf>> {
+        let account = self.account()?;
+
+        // Directories first, shallowest to deepest, so a child never precedes
+        // its parent. Empty folders matter here — `make_on_demand` only ever
+        // created directories as a side effect of placing a file, so a folder
+        // with no files was invisible.
+        let folders = self.store.all_folders_shallow_first(&self.account_id)?;
+        for folder in &folders {
+            if let Some(path) = self.store.local_path(&account, &folder.id)? {
+                if !path.exists() {
+                    std::fs::create_dir_all(&path)?;
+                }
+            }
+        }
+
+        let files = self.store.all_files(&self.account_id)?;
+        let total = files.len() as u64;
+        let mut done = 0u64;
+        let mut watch = Vec::new();
+
+        for file in files {
+            done += 1;
+            let Some(path) = self.store.local_path(&account, &file.id)? else {
+                continue;
+            };
+            // Already present — downloaded, or a placeholder from a prior run.
+            if path.exists() {
+                if Placeholder::state(&path) == PlaceholderState::Dehydrated {
+                    watch.push(path);
+                }
+                continue;
+            }
+            match Placeholder::create(
+                &path,
+                file.size,
+                &file.id,
+                file.ctag.as_deref(),
+                file.remote_mtime,
+            ) {
+                Ok(()) => {
+                    self.store.set_item_state(&file.id, ItemState::Dehydrated)?;
+                    watch.push(path);
+                }
+                Err(e) => tracing::warn!(path = %path.display(), error = %e, "placeholder failed"),
+            }
+            if done % 500 == 0 && !progress(done, total) {
+                return Ok(watch);
+            }
+        }
+
+        // Directory timestamps last: creating children moved them off the
+        // service's value.
+        for folder in &folders {
+            if let (Some(mtime), Some(path)) = (
+                folder.remote_mtime,
+                self.store.local_path(&account, &folder.id)?,
+            ) {
+                if path.is_dir() {
+                    let _ = transfer::set_mtime(&path, mtime);
+                }
+            }
+        }
+
+        progress(total, total);
+        Ok(watch)
     }
 
     /// Reconcile database states with what the files themselves say.

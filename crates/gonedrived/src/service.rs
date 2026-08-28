@@ -203,6 +203,14 @@ impl DaemonService {
         Ok(outcome.files)
     }
 
+    async fn materialize_tree(&self) -> zbus::fdo::Result<u64> {
+        tracing::info!("MaterializeTree requested");
+        self.app
+            .materialize_tree()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+    }
+
     async fn fetch_now(&self, path: &str) -> zbus::fdo::Result<u64> {
         tracing::info!(%path, "FetchNow requested");
         self.app

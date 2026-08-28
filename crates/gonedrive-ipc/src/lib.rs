@@ -130,6 +130,10 @@ pub trait Daemon {
     /// how many were created.
     fn make_on_demand(&self, path: &str) -> zbus::Result<u64>;
 
+    /// Present the whole drive as a browsable placeholder tree (true
+    /// files-on-demand). Returns how many placeholders are now watched.
+    fn materialize_tree(&self) -> zbus::Result<u64>;
+
     /// What was synced recently, newest first.
     ///
     /// Kept by the daemon rather than the front end so the list survives the

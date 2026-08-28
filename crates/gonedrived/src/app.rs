@@ -593,6 +593,38 @@ impl App {
         *self.hsm.write().await = client;
     }
 
+    /// Present the whole drive as a browsable placeholder tree.
+    ///
+    /// Runs on a blocking thread — it can touch a hundred thousand files — and
+    /// registers each placeholder with the helper as it goes. Safe to call
+    /// repeatedly: existing files are left untouched.
+    pub async fn materialize_tree(self: &Arc<Self>) -> Result<u64> {
+        let hsm = self.require_hsm().await?;
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        let engine = engines
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?
+            .clone();
+
+        tracing::info!("materialising the drive as a placeholder tree");
+        let paths = tokio::task::spawn_blocking(move || {
+            engine.materialize_all(|done, total| {
+                if done % 5000 == 0 || done == total {
+                    tracing::info!(done, total, "materialising");
+                }
+                true
+            })
+        })
+        .await??;
+
+        let count = paths.len() as u64;
+        for path in paths {
+            let _ = hsm.watch(&path).await;
+        }
+        tracing::info!(placeholders = count, "placeholder tree ready");
+        Ok(count)
+    }
+
     /// Turn a downloaded subtree back into placeholders.
     ///
     /// Refused outright without the helper. A placeholder nothing is watching
@@ -633,6 +665,11 @@ impl App {
             }
         }
         Ok(outcome)
+    }
+
+    /// Whether the files-on-demand helper is connected.
+    pub async fn on_demand_ready(&self) -> bool {
+        self.hsm.read().await.is_some()
     }
 
     async fn require_hsm(&self) -> Result<Arc<crate::hsm_client::HsmClient>> {
