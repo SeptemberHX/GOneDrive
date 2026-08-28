@@ -13,6 +13,60 @@ use gonedrive_core::sync::engine::{Direction, Engine, SyncEvent};
 use gonedrive_core::{Authenticator, Error, TokenStore};
 use gonedrive_ipc::reader_policy::{is_browsing_reader, is_bulk_copier};
 use gonedrive_ipc::{AccountInfo, Activity, Hydration, SyncStatus};
+
+/// A head-read at or below this is served as a range, not a download: it is the
+/// signature of content sniffing, and even when it is not, filling just the
+/// window is always correct — the watch stays armed for the rest.
+const PARTIAL_HYDRATION_CEILING: u64 = 256 * 1024;
+
+/// What to do for a blocked read, decided purely from the request — no I/O, so
+/// the browsing/copier/consumer policy can be tested on its own.
+#[derive(Debug, PartialEq)]
+enum StagePlan {
+    /// Let the open proceed; the reads that follow drive hydration.
+    AllowOpen,
+    /// Give the reader the whole file before it looks.
+    Full,
+    /// Serve `[offset, offset+length)` only if it is already local, else allow
+    /// an offline read of the sparse file.
+    BrowseLocal { offset: u64, length: u64 },
+    /// Fetch just `[offset, offset+length)`.
+    Range { offset: u64, length: u64 },
+}
+
+/// The staging policy, as a pure function of the request.
+///
+/// - On open: a sparse-aware bulk copier is hydrated fully (it would otherwise
+///   SEEK over the holes and copy zeros); everything else is allowed through.
+/// - A browser/thumbnailer never touches the network: local-or-offline.
+/// - A consumer's first head-read (offset 0, small, smaller than the file) is a
+///   range; coming back for offset > 0 is sequential reading and escalates to a
+///   full hydration rather than dozens of round-trips.
+fn decide_stage(
+    is_open: bool,
+    reader: &str,
+    offset: u64,
+    length: u64,
+    size: u64,
+    allow_partial: bool,
+) -> StagePlan {
+    if is_open {
+        return if is_bulk_copier(reader) { StagePlan::Full } else { StagePlan::AllowOpen };
+    }
+    if is_browsing_reader(reader) {
+        return StagePlan::BrowseLocal { offset, length: length.max(1) };
+    }
+    let partial = allow_partial
+        && length > 0
+        && offset == 0
+        && length <= PARTIAL_HYDRATION_CEILING
+        && length < size;
+    if partial {
+        StagePlan::Range { offset, length: length.min(size.saturating_sub(offset)).max(1) }
+    } else {
+        StagePlan::Full
+    }
+}
 use tokio::sync::{broadcast, Notify, RwLock};
 
 /// How much the poll interval grows after a pass that found nothing.
@@ -397,11 +451,6 @@ impl App {
         self.emit(DaemonEvent::LoginFailed(message.to_string()));
     }
 
-    /// A head-read this small is served as a range, not a download: it is the
-    /// signature of content sniffing, and even when it is not, filling just
-    /// the window is always correct — the watch stays armed for the rest.
-    const PARTIAL_HYDRATION_CEILING: u64 = 256 * 1024;
-
     /// Stage what a blocked reader needs. Returns the staged path, the
     /// placement offset, and whether it completes the file.
     ///
@@ -426,62 +475,41 @@ impl App {
         allow_partial: bool,
     ) -> Result<Option<(std::path::PathBuf, u64, bool)>> {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let browsing = is_browsing_reader(reader);
 
-        if is_open {
-            // The read has not begun. A sparse-aware copier will now SEEK over
-            // the holes and copy zeros unless the file is already whole, so
-            // those tools are hydrated fully here. Everyone else is allowed
-            // through untouched and their actual reads drive hydration — this
-            // keeps a media player streaming a huge file instead of pulling it
-            // all down just to read its header.
-            if is_bulk_copier(reader) {
+        match decide_stage(is_open, reader, offset, length, size, allow_partial) {
+            // Let the open proceed untouched; the reads that follow drive
+            // hydration. Keeps a media player streaming instead of pulling the
+            // whole file just to read a header.
+            StagePlan::AllowOpen => Ok(None),
+            // A sparse-aware copier (on open) or a consumer past the head:
+            // give it the whole file before it looks.
+            StagePlan::Full => {
                 let staged = self.stage_content(path).await?;
-                return Ok(Some((staged, 0, true)));
+                Ok(Some((staged, 0, true)))
             }
-            return Ok(None); // allow the open; reads handle the rest
-        }
-
-        if browsing {
-            // Browsing must never touch the network: opening a folder makes the
-            // file manager sniff the head of every file for its type, and a
-            // cloud fetch per file is exactly the "opening a folder loads for a
-            // long time" the user reported. Serve the window only if it is
-            // already on disk from a real earlier read; otherwise let the read
-            // proceed against the sparse file (zeros) and answer offline. The
-            // file's type comes from its name, as on Windows.
-            let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-            if let Some(engine) = engines.first() {
-                if let Ok(Some(staged)) =
-                    engine.stage_range_if_local(path, offset, length.max(1)).await
-                {
-                    return Ok(Some((staged, offset, false)));
+            // Browsing: serve the window only if it is already on disk from a
+            // real earlier read; otherwise allow the read against the sparse
+            // file with no network. The type comes from the name, as on Windows.
+            StagePlan::BrowseLocal { offset, length } => {
+                let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+                if let Some(engine) = engines.first() {
+                    if let Ok(Some(staged)) = engine.stage_range_if_local(path, offset, length).await
+                    {
+                        return Ok(Some((staged, offset, false)));
+                    }
                 }
+                Ok(None)
             }
-            return Ok(None); // allow the read with no fill, no network
+            // The first head-read of a consumer: fetch just that window.
+            StagePlan::Range { offset, length } => {
+                let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+                let engine = engines
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
+                let staged = engine.stage_range(path, offset, length).await?;
+                Ok(Some((staged, offset, false)))
+            }
         }
-
-        // A consumer: only the very first head-read is a range. Coming back for
-        // offset > 0 is sequential reading (`cat`, `cp`, a hash), and serving
-        // 32 KiB at a time would be dozens of round-trips, so it escalates to
-        // full hydration.
-        let partial = allow_partial
-            && length > 0
-            && offset == 0
-            && length <= Self::PARTIAL_HYDRATION_CEILING
-            && length < size;
-
-        if partial {
-            let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-            let engine = engines
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
-            let length = length.min(size.saturating_sub(offset)).max(1);
-            let staged = engine.stage_range(path, offset, length).await?;
-            return Ok(Some((staged, offset, false)));
-        }
-        let staged = self.stage_content(path).await?;
-        Ok(Some((staged, 0, true)))
     }
 
     /// Download a placeholder's content to a staging file for the helper.
@@ -978,7 +1006,51 @@ fn ensure_progress_window(monitor: &Arc<std::sync::Mutex<Option<std::process::Ch
 
 #[cfg(test)]
 mod tests {
-    use super::is_browsing_reader;
+    use super::{decide_stage, is_browsing_reader, StagePlan, PARTIAL_HYDRATION_CEILING};
+
+    #[test]
+    fn a_bulk_copier_hydrates_fully_on_open_but_others_pass_through() {
+        // cp/tar would SEEK over the holes and copy zeros, so they get the whole
+        // file on open; a normal open is allowed and its reads drive the rest.
+        assert_eq!(decide_stage(true, "cp", 0, 0, 1000, true), StagePlan::Full);
+        assert_eq!(decide_stage(true, "tar", 0, 0, 1000, true), StagePlan::Full);
+        assert_eq!(decide_stage(true, "vlc", 0, 0, 1000, true), StagePlan::AllowOpen);
+        assert_eq!(decide_stage(true, "gedit", 0, 0, 1000, true), StagePlan::AllowOpen);
+    }
+
+    #[test]
+    fn browsing_reads_are_served_local_or_offline_never_downloaded() {
+        // A thumbnailer sniffing a head must never reach the network.
+        assert_eq!(
+            decide_stage(false, "gdk-pixbuf-thum", 0, 4096, 1_000_000, true),
+            StagePlan::BrowseLocal { offset: 0, length: 4096 }
+        );
+        // A zero-length browse sniff still asks for at least one byte.
+        assert_eq!(
+            decide_stage(false, "nautilus", 0, 0, 1_000_000, true),
+            StagePlan::BrowseLocal { offset: 0, length: 1 }
+        );
+    }
+
+    #[test]
+    fn a_consumers_first_head_read_is_a_range_then_it_escalates() {
+        // Small head-read at offset 0: just the window.
+        assert_eq!(
+            decide_stage(false, "sha256sum", 0, 65536, 1_000_000, true),
+            StagePlan::Range { offset: 0, length: 65536 }
+        );
+        // Coming back for offset > 0 is sequential reading: hydrate fully.
+        assert_eq!(decide_stage(false, "sha256sum", 65536, 65536, 1_000_000, true), StagePlan::Full);
+        // A head-read above the ceiling is a real read, not a sniff: full.
+        assert_eq!(
+            decide_stage(false, "cat", 0, PARTIAL_HYDRATION_CEILING + 1, 1_000_000, true),
+            StagePlan::Full
+        );
+        // A read covering the whole (small) file is full, not a range.
+        assert_eq!(decide_stage(false, "cat", 0, 500, 500, true), StagePlan::Full);
+        // Partial hydration disabled by the helper: always full.
+        assert_eq!(decide_stage(false, "cat", 0, 4096, 1_000_000, false), StagePlan::Full);
+    }
 
     #[test]
     fn thumbnailers_and_previews_browse_never_consume() {
