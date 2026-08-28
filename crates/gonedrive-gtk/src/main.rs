@@ -40,7 +40,14 @@ fn main() -> glib::ExitCode {
         return app.run_with_args::<&str>(&[]);
     }
 
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    let mut builder = adw::Application::builder().application_id(APP_ID);
+    // In snapshot mode, refuse to fold into an already-running instance: the
+    // capture must render *this* process's window, not hand its request to a
+    // stale one and exit.
+    if std::env::var_os("GONEDRIVE_SNAPSHOT").is_some() {
+        builder = builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+    }
+    let app = builder.build();
     app.connect_activate(build_ui);
     app.run_with_args::<&str>(&[])
 }
@@ -76,6 +83,7 @@ fn build_ui(app: &adw::Application) {
     let ui = Ui::build(app, commands.clone());
     let window = ui.window.clone();
     let account = ui.current_account();
+    let ready = ui.is_ready();
 
     register_actions(app, &window, &commands, account);
 
@@ -135,34 +143,26 @@ fn build_ui(app: &adw::Application) {
     // all of which make external X11 screenshots of a GL-rendered window lie.
     if let Ok(path) = std::env::var("GONEDRIVE_SNAPSHOT") {
         let target = window.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(6000), move || {
-            // What is actually in the tree at shutter time.
-            fn dump(widget: &gtk::Widget, depth: usize) {
-                use gtk::prelude::*;
-                let name = widget.type_().name().to_string();
-                let visible = widget.is_visible();
-                let extra = if let Some(stack) = widget.downcast_ref::<gtk::Stack>() {
-                    format!(" visible_child={:?}", stack.visible_child_name())
-                } else if let Some(views) = widget.downcast_ref::<adw::ViewStack>() {
-                    format!(" visible_child={:?}", views.visible_child_name())
-                } else {
-                    String::new()
-                };
-                eprintln!("TREE {}{name} visible={visible}{extra}", "  ".repeat(depth));
-                if depth < 6 {
-                    let mut child = widget.first_child();
-                    while let Some(c) = child {
-                        dump(&c, depth + 1);
-                        child = c.next_sibling();
-                    }
+        let ready = ready.clone();
+        // Poll for the first daemon reply, then wait one more frame so the
+        // freshly-shown page has laid out; capture only then. Deadline-bounded
+        // so a disconnected daemon still produces the offline page rather than
+        // hanging the capture forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+            if !ready.get() && std::time::Instant::now() < deadline {
+                return glib::ControlFlow::Continue;
+            }
+            let target = target.clone();
+            let path = path.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+                match snapshot_window(&target, &path) {
+                    Ok(()) => eprintln!("snapshot written to {path}"),
+                    Err(e) => eprintln!("snapshot failed: {e}"),
                 }
-            }
-            dump(target.upcast_ref::<gtk::Widget>(), 0);
-            match snapshot_window(&target, &path) {
-                Ok(()) => eprintln!("snapshot written to {path}"),
-                Err(e) => eprintln!("snapshot failed: {e}"),
-            }
-            std::process::exit(0);
+                std::process::exit(0);
+            });
+            glib::ControlFlow::Break
         });
     }
 }
@@ -171,39 +171,65 @@ fn build_ui(app: &adw::Application) {
 fn snapshot_window(window: &adw::ApplicationWindow, path: &str) -> Result<(), String> {
     use gtk::prelude::PaintableExt;
 
-    // Aim at the window's content, not the window itself: a top-level's
-    // paintable can replay a stale frame, while a plain child renders live.
-    let subject: gtk::Widget = find_stack(window.upcast_ref())
-        .unwrap_or_else(|| window.clone().upcast());
-
-    let width = subject.width();
-    let height = subject.height();
-    if width == 0 || height == 0 {
-        return Err("the window has no size yet".into());
+    // Aim at the toolbar view — the whole panel including its header — rather
+    // than the inner GtkStack. The stack's scrolled pages report a fixed
+    // viewport height, not their content's, so capturing the stack clipped
+    // the folders and overview pages to a sliver; the toolbar view lays out
+    // to its natural size.
+    // Try the whole panel first (natural height), then the page stack, then
+    // the window itself — the first that yields a non-empty render node wins.
+    // A scrolled page occasionally renders nothing through a child paintable,
+    // so the window fallback is what guarantees a capture always succeeds.
+    let mut candidates: Vec<gtk::Widget> = Vec::new();
+    if let Some(w) = find_role(window.upcast_ref(), "AdwToolbarView") {
+        candidates.push(w);
+    }
+    candidates.push(window.clone().upcast());
+    if let Some(w) = find_stack(window.upcast_ref()) {
+        candidates.push(w);
     }
 
-    let paintable = gtk::WidgetPaintable::new(Some(&subject));
-    let snapshot = gtk::Snapshot::new();
-    paintable.snapshot(&snapshot, width as f64, height as f64);
-    let node = match snapshot.to_node() {
-        Some(node) => node,
-        None => {
-            // Scrolled content sometimes yields nothing through the child
-            // paintable; the window as a whole always renders.
-            let fallback = gtk::WidgetPaintable::new(Some(window));
-            let snapshot = gtk::Snapshot::new();
-            fallback.snapshot(&snapshot, window.width() as f64, window.height() as f64);
-            snapshot
-                .to_node()
-                .ok_or_else(|| "nothing was rendered".to_string())?
+    let mut rendered = None;
+    for subject in candidates {
+        let (w, h) = (subject.width(), subject.height());
+        if w == 0 || h == 0 {
+            continue;
         }
-    };
+        let paintable = gtk::WidgetPaintable::new(Some(&subject));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(&snapshot, w as f64, h as f64);
+        if let Some(node) = snapshot.to_node() {
+            rendered = Some((node, w, h));
+            break;
+        }
+    }
+    let (node, width, height) = rendered.ok_or_else(|| "nothing was rendered".to_string())?;
 
     let renderer = window
         .renderer()
         .ok_or_else(|| "the window has no renderer".to_string())?;
-    let texture = renderer.render_texture(node, None);
+    // An explicit viewport rather than None: the node's own bounds can be
+    // empty for a scrolled page whose content has not been measured, and a
+    // None viewport then renders nothing. The subject's allocation is always
+    // the size we want captured.
+    let viewport = gtk::graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
+    let texture = renderer.render_texture(node, Some(&viewport));
     texture.save_to_png(path).map_err(|e| e.to_string())
+}
+
+/// First widget of the given type name, depth-first.
+fn find_role(widget: &gtk::Widget, type_name: &str) -> Option<gtk::Widget> {
+    if widget.type_().name() == type_name {
+        return Some(widget.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(found) = find_role(&c, type_name) {
+            return Some(found);
+        }
+        child = c.next_sibling();
+    }
+    None
 }
 
 /// First GtkStack in the tree — the page container the UI switches.

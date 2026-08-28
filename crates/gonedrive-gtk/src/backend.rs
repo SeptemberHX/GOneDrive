@@ -368,7 +368,7 @@ async fn handle(
                 let _ = ui.send(UiEvent::FolderListing { path, entries }).await;
                 true
             }
-            Err(_) => false,
+            Err(e) => { eprintln!("DBG backend ListFolder err: {e}"); false }
         },
         Command::SetKeep { path, keep } => {
             let ok = if keep {

@@ -53,6 +53,13 @@ pub struct Ui {
     commands: async_channel::Sender<Command>,
     account_id: Rc<RefCell<Option<String>>>,
     suppress: Rc<Cell<bool>>,
+    /// True once the first Connected has been applied. The snapshot hook waits
+    /// on this so a capture never races the initial D-Bus round-trip.
+    ready: Rc<Cell<bool>>,
+    on_folders_page: Rc<Cell<bool>>,
+    /// Set while rebuilding the folder list, so the switches' own state-set
+    /// signals during population do not fire commands.
+    suppress_folder_toggle: Rc<Cell<bool>>,
 }
 
 impl Ui {
@@ -335,8 +342,16 @@ impl Ui {
 
         // Screenshot hook: pre-select a page so every tab can be captured
         // from a script. Harmless in normal use.
+        //
+        // Load explicitly after selecting: the notify handler above fires on
+        // *changes*, and a page selected before the handler was connected —
+        // here, or a restored last-page on a future launch — would otherwise
+        // open empty until the user clicked away and back.
         if let Ok(page) = std::env::var("GONEDRIVE_PAGE") {
             views.set_visible_child_name(&page);
+            if page == "folders" {
+                let _ = commands.send_blocking(Command::ListFolder(String::new()));
+            }
         }
 
         let switcher = adw::ViewSwitcher::builder()
@@ -402,6 +417,11 @@ impl Ui {
             commands,
             account_id: Rc::new(RefCell::new(None)),
             suppress: Rc::new(Cell::new(false)),
+            ready: Rc::new(Cell::new(false)),
+            on_folders_page: Rc::new(Cell::new(
+                std::env::var("GONEDRIVE_PAGE").as_deref() == Ok("folders"),
+            )),
+            suppress_folder_toggle: Rc::new(Cell::new(false)),
         };
         ui.connect(&sync_button, &open_button, &signout_button);
         ui
@@ -473,9 +493,20 @@ impl Ui {
         self.account_id.clone()
     }
 
+    /// True once the first daemon reply has painted the panel.
+    pub fn is_ready(&self) -> Rc<Cell<bool>> {
+        self.ready.clone()
+    }
+
     pub fn apply(&self, event: UiEvent) {
         match event {
             UiEvent::Connected { accounts, status } => {
+                // On the folders page the meaningful "painted" moment is the
+                // listing arriving, not the initial connect; the snapshot hook
+                // keys on `ready`, so leave it for FolderListing there.
+                if !self.on_folders_page.get() {
+                    self.ready.set(true);
+                }
                 self.banner.set_revealed(false);
                 match accounts.first() {
                     Some(account) => {
@@ -504,7 +535,10 @@ impl Ui {
                 }
             }
             UiEvent::Activity(items) => self.show_activity(&items),
-            UiEvent::FolderListing { path, entries } => self.show_folders(&path, &entries),
+            UiEvent::FolderListing { path, entries } => {
+                self.ready.set(true);
+                self.show_folders(&path, &entries);
+            }
             UiEvent::LoginStarted(url) => {
                 self.login_hint.set_visible(true);
                 self.login_hint
@@ -637,6 +671,12 @@ impl Ui {
     }
 
     fn show_folders(&self, path: &str, entries: &[FolderEntry]) {
+        // Populating the list flips each switch to its stored state, and on an
+        // already-mapped ListBox that fires `state-set`. Without a guard the
+        // very first row's handler re-issues ListFolder, which rebuilds the
+        // list mid-population — the observed result was a 20-item folder
+        // rendering as 2 rows. The guard makes programmatic flips inert.
+        self.suppress_folder_toggle.set(true);
         self.folders_loaded.set(true);
         *self.folders_current.borrow_mut() = path.to_string();
         self.folders_path
@@ -686,7 +726,11 @@ impl Ui {
             let root = self.root_path.clone();
             let toggle_path = child_path.clone();
             let refresh_path = path.to_string();
+            let suppress = self.suppress_folder_toggle.clone();
             keep.connect_state_set(move |switch, keep| {
+                if suppress.get() {
+                    return glib::Propagation::Proceed;
+                }
                 switch.set_sensitive(false);
                 let absolute = format!("{}/{}", root.borrow(), toggle_path);
                 let _ = commands.send_blocking(Command::SetKeep {
@@ -709,6 +753,7 @@ impl Ui {
             }
             self.folders_list.append(&row);
         }
+        self.suppress_folder_toggle.set(false);
     }
 
     fn show_activity(&self, items: &[Activity]) {
