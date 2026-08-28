@@ -869,10 +869,7 @@ impl Ui {
                 .subtitle(&size)
                 .activatable(entry.is_folder)
                 .build();
-            row.add_prefix(&tile(
-                if entry.is_folder { "folder-symbolic" } else { "text-x-generic-symbolic" },
-                if entry.is_folder { "od-tile-folder" } else { "od-tile-grey" },
-            ));
+            row.add_prefix(&file_icon(&entry.name, entry.is_folder));
 
             // A navigate chevron for folders, then the keep switch. Files get an
             // empty chevron-width spacer instead, so every switch lines up in
@@ -939,6 +936,20 @@ impl Ui {
             self.peek_list.append(&activity_row(item));
         }
     }
+}
+
+/// The file-type icon from the desktop's own theme, so a row shows what the
+/// file manager shows for the same file — a real PDF, archive, image or folder
+/// icon rather than a generic glyph.
+fn file_icon(name: &str, is_folder: bool) -> gtk::Image {
+    let content_type = if is_folder {
+        glib::GString::from("inode/directory")
+    } else {
+        gio::content_type_guess(Some(std::path::Path::new(name)), None).0
+    };
+    let image = gtk::Image::from_gicon(&gio::content_type_get_icon(&content_type));
+    image.set_pixel_size(32);
+    image
 }
 
 /// A coloured rounded tile with a white symbolic icon — the list-row leading
