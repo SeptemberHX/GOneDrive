@@ -15,7 +15,7 @@ use gonedrive_core::graph::GraphClient;
 use gonedrive_core::sync::engine::{Engine, SyncSummary};
 use gonedrive_core::TokenSource;
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path, path_regex, query_param};
+use wiremock::matchers::{header_exists, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ACCOUNT: &str = "acct";
@@ -1527,6 +1527,44 @@ async fn a_download_preserves_a_hidden_local_edit_as_a_conflict_copy() {
         .collect();
     assert_eq!(copies.len(), 1, "the hidden edit must survive as a conflict copy: {copies:?}");
     assert_eq!(h.read(&format!("Docs/{}", copies[0])), "BBBBBBBB");
+}
+
+#[tokio::test]
+async fn an_upload_that_would_overwrite_a_newer_remote_becomes_a_conflict() {
+    // Someone edits the remote between our pull and our push. Without If-Match
+    // our upload replaces their edit — a lost update. With it the service
+    // returns 412 and we must keep our copy, not overwrite theirs.
+    let h = Harness::new().await;
+    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
+        .await;
+    h.mock_download("F1", b"hello").await;
+    h.sync().await;
+
+    std::fs::write(h.path("a.txt"), b"my local edit").unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    // Rejects only a *conditional* upload — matching on If-Match proves the
+    // header was actually sent. An unconditional PUT would find no matching
+    // mock and never get its 412.
+    Mock::given(method("PUT"))
+        .and(path("/me/drive/items/F1/content"))
+        .and(header_exists("If-Match"))
+        .respond_with(ResponseTemplate::new(412))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert!(summary.conflicts >= 1, "a 412 must become a conflict, not a lost update");
+
+    let copies: Vec<_> = std::fs::read_dir(&h.root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("的冲突副本"))
+        .collect();
+    assert_eq!(copies.len(), 1, "our local edit must be preserved: {copies:?}");
+    assert_eq!(h.read(&copies[0]), "my local edit");
 }
 
 #[tokio::test]

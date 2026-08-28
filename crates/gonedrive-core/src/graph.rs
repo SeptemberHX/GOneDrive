@@ -218,6 +218,7 @@ impl GraphClient {
         item_id: Option<&str>,
         content: Bytes,
         mtime: Option<OffsetDateTime>,
+        if_match: Option<&str>,
     ) -> Result<DriveItem> {
         let url = match item_id {
             Some(id) => format!("{}/me/drive/items/{id}/content", self.base),
@@ -230,11 +231,20 @@ impl GraphClient {
                 )
             }
         };
+        // Replacing a known item is conditional on its etag: if the remote
+        // changed since our last pull, the service returns 412 and we treat it
+        // as a conflict rather than overwriting an edit we never saw.
+        let if_match = if_match.map(|s| s.to_string());
         let response = self
             .send(move |http| {
-                http.put(&url)
+                let mut req = http
+                    .put(&url)
                     .header("Content-Type", "application/octet-stream")
-                    .body(content.clone())
+                    .body(content.clone());
+                if let Some(tag) = &if_match {
+                    req = req.header("If-Match", tag);
+                }
+                req
             })
             .await?;
         let item: DriveItem = response.json().await?;
@@ -258,6 +268,7 @@ impl GraphClient {
         name: &str,
         item_id: Option<&str>,
         mtime: Option<OffsetDateTime>,
+        if_match: Option<&str>,
     ) -> Result<UploadSession> {
         #[derive(Serialize)]
         struct Request<'a> {
@@ -298,7 +309,16 @@ impl GraphClient {
                 )
             }
         };
-        let response = self.send(|http| http.post(&url).json(&body)).await?;
+        let if_match = if_match.map(|s| s.to_string());
+        let response = self
+            .send(move |http| {
+                let mut req = http.post(&url).json(&body);
+                if let Some(tag) = &if_match {
+                    req = req.header("If-Match", tag);
+                }
+                req
+            })
+            .await?;
         Ok(response.json().await?)
     }
 

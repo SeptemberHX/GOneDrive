@@ -2172,9 +2172,16 @@ impl Engine {
         // of the same file picks the session back up.
         let session_key = op.item_id.clone().unwrap_or_else(|| path.to_string_lossy().into_owned());
 
+        // The etag of the version we last pulled, sent as If-Match so the
+        // service refuses to overwrite a newer remote edit we have not seen.
+        let etag = match op.item_id.as_deref() {
+            Some(id) => self.store.item(id)?.and_then(|r| r.etag),
+            None => None,
+        };
+
         let events = self.events.clone();
         let progress_name = name.clone();
-        let item = transfer::upload_file(
+        let result = transfer::upload_file(
             &self.graph,
             &self.store,
             &self.config,
@@ -2187,6 +2194,7 @@ impl Engine {
                 // else the upload must create a new item and refuse to
                 // clobber a file we have never seen.
                 item_id: op.item_id.as_deref(),
+                etag: etag.as_deref(),
                 session_key: &session_key,
             },
             |done, total| {
@@ -2198,7 +2206,39 @@ impl Engine {
                 });
             },
         )
-        .await?;
+        .await;
+
+        let item = match result {
+            Ok(item) => item,
+            // If-Match rejected: the remote changed since our last pull, so our
+            // upload would overwrite an edit we never saw. Preserve our local
+            // copy under a conflict name and re-offer it; forget the stale
+            // record so the next delta brings the remote version down fresh.
+            Err(Error::Graph { status: 412, .. }) => {
+                let copy = self.make_conflict_copy(&path)?;
+                self.emit(SyncEvent::Conflict {
+                    original: name.clone(),
+                    copy: copy
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                });
+                summary.conflicts += 1;
+                if let Some(id) = op.item_id.as_deref() {
+                    self.store.delete_subtree(id)?;
+                }
+                self.store.enqueue(
+                    &self.account_id,
+                    OpKind::Upload,
+                    None,
+                    Some(&copy),
+                    None,
+                )?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
 
         // `Inherit`, never `Pinned`: stamping uploads as always-keep silently
         // converts everything the user ever created into pinned content. The

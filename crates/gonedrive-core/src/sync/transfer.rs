@@ -185,6 +185,10 @@ pub struct UploadTarget<'a> {
     /// file. Uploading to a known id avoids the whole conflict-behaviour
     /// question — see `GraphClient::upload_simple`.
     pub item_id: Option<&'a str>,
+    /// The etag of the remote item being replaced. Sent as `If-Match` so the
+    /// service refuses (412) an overwrite of a version we have not pulled,
+    /// rather than silently losing whoever edited it in the meantime.
+    pub etag: Option<&'a str>,
     /// Stable key for resuming: the item id when we have one, else the path.
     pub session_key: &'a str,
 }
@@ -217,6 +221,7 @@ pub async fn upload_file(
                 target.item_id,
                 content,
                 Some(mtime),
+                target.etag,
             )
             .await;
     }
@@ -310,7 +315,13 @@ async fn resume_or_create(
     }
 
     let created = graph
-        .create_upload_session(target.parent_id, target.name, target.item_id, Some(mtime))
+        .create_upload_session(
+            target.parent_id,
+            target.name,
+            target.item_id,
+            Some(mtime),
+            target.etag,
+        )
         .await?;
 
     let record = UploadSessionRecord {

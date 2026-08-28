@@ -59,4 +59,18 @@
 - **修复**：新增 `names::free_path`——目标已存在则在扩展名前插入 `(2)`/`(3)`… 直到不冲突；`make_conflict_copy` 改用它。
 - **回归测试**：`crates/gonedrive-core/src/names.rs::free_path_dodges_existing_conflict_copies`。
 
-<!-- 后续：DL-005 If-Match 丢失更新。 -->
+## DL-005 · 上传无 If-Match → 拉取与推送之间他端改动被静默覆盖（丢失更新）
+
+- **首次发现**：2026-08-28
+- **现象**：已知项上传用 `conflictBehavior=replace` 且不带 eTag；我们拉取 delta 之后、上传之前，他端（另一设备/网页）对同一文件的改动会被我们的上传无声覆盖。
+- **根因**：`crates/gonedrive-core/src/graph.rs` 的 `upload_simple`/`create_upload_session` 不发 `If-Match`。
+- **修复**：
+  1. `upload_simple`/`create_upload_session` 增 `if_match` 参数，已知项上传带 `If-Match: <etag>`；`UploadTarget` 增 `etag` 字段，`run_upload` 从记录取 etag 传入。
+  2. 服务端 412 → `run_upload` 捕获：`make_conflict_copy` 保留本地、`delete_subtree` 忘掉旧记录（下次 delta 拉回新远端并下载）、把副本作为新文件重传。绝不覆盖他端改动。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::an_upload_that_would_overwrite_a_newer_remote_becomes_a_conflict`（用 `header_exists("If-Match")` 匹配，证明 header 确实发出）。
+
+---
+
+## 小结：size+mtime 启发式的三处破坏面已全部加哈希门禁
+
+`Engine::local_content_unsynced`（内容哈希 vs `user.gonedrive.quickxor` xattr，稀疏文件短路）现同时守护：**dehydrate 打洞**（DL-004）、**下载覆盖**（DL-004b）、**materialize 空洞重建**（DL-003）。加上 **DL-001 批量删除/挂载护栏**、**SC-002 resync 清扫护栏**、**DL-005 If-Match**、**DL-007 冲突副本防碰撞**，Phase 1 数据丢失面已系统性堵住。
