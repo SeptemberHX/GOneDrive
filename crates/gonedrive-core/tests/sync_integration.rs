@@ -445,6 +445,53 @@ async fn an_expired_delta_token_triggers_a_full_resync() {
 }
 
 #[tokio::test]
+async fn a_resync_sweep_keeps_a_locally_edited_file_it_would_have_deleted() {
+    // The delta tombstone path preserves an unsaved local edit and re-uploads
+    // it (KeepLocalAndReupload). The resync generation sweep took a different,
+    // unguarded path and deleted the local file outright — losing the edit.
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z"),
+            file("F2", ROOT, "b.txt", "c1", 5, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"hello").await;
+    h.mock_download("F2", b"world").await;
+    h.sync().await;
+
+    // The user edits b.txt after that sync — not yet uploaded.
+    std::fs::write(h.path("b.txt"), b"EDITED LOCALLY, NOT YET UPLOADED").unwrap();
+
+    h.server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/me/drive/root/delta"))
+        .and(query_param("token", "v1"))
+        .respond_with(ResponseTemplate::new(410).set_body_json(json!({
+            "error": {"code": "resyncRequired", "message": "Resync required."}
+        })))
+        .mount(&h.server)
+        .await;
+    // The fresh enumeration no longer mentions b.txt: gone remotely.
+    h.mock_delta(
+        Some(("$top", "1000")),
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v2",
+    )
+    .await;
+    mock_upload(&h.server, "F2new", "b.txt").await;
+
+    h.sync().await;
+
+    // The edit must survive, exactly as it does down the ordinary delete path.
+    assert!(h.path("b.txt").exists(), "a locally-edited file must survive the resync sweep");
+    assert_eq!(h.read("b.txt"), "EDITED LOCALLY, NOT YET UPLOADED");
+}
+
+#[tokio::test]
 async fn throttling_is_retried_rather_than_failing_the_sync() {
     let h = Harness::new().await;
     // First attempt is throttled with a one-second Retry-After.

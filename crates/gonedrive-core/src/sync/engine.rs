@@ -321,6 +321,27 @@ impl Engine {
                 self.store.delete_subtree(&stale.id)?;
                 continue;
             };
+            // The item is gone from the server, so the local copy would
+            // normally be removed. But a resync must honour the same guarantee
+            // the delta tombstone path does (KeepLocalAndReupload): a local file
+            // carrying edits that were never uploaded is preserved and
+            // re-offered, never deleted. Without this the sweep silently loses
+            // an unsaved edit the ordinary delete path would have kept.
+            if !stale.is_folder {
+                if let Some(local) = stat_of(&path) {
+                    if crate::sync::plan::local_is_modified(&stale, &local) {
+                        self.store.delete_subtree(&stale.id)?;
+                        self.store.enqueue(
+                            &self.account_id,
+                            OpKind::Upload,
+                            None,
+                            Some(&path),
+                            None,
+                        )?;
+                        continue;
+                    }
+                }
+            }
             self.remove_local(&stale, &path, summary)?;
         }
         Ok(())

@@ -16,9 +16,9 @@
 
 - **首次发现**：2026-08-28（探索发现）
 - **现象**：410 resync 触发全量清扫时，对枚举"漏掉"的项直接 `remove_local`，不做 `local_is_modified` 检查，与 delta 路径（保留并重传）不一致——本地有未上传改动的文件被删。
-- **根因**：`engine.rs` full_resync 清扫段缺护栏。
-- **修复**：Phase 1.2——清扫前做与 delta 路径一致的 modified/哈希校验，已改动转 `KeepLocalAndReupload`。（待做）
-- **回归测试**：待补（Phase 1.2）。
+- **根因**：`crates/gonedrive-core/src/sync/engine.rs::full_resync` 清扫段对 `items_missed_by_resync` 的每一项直接 `remove_local`，无 `local_is_modified` 检查——与 delta tombstone 路径的 `KeepLocalAndReupload` 不一致。
+- **修复**：清扫前若为文件且 `local_is_modified(stale, stat)` 为真，则 `delete_subtree` 脱钩 + 入队 `Upload`（保留并重传），与 delta 路径完全一致；否则才 `remove_local`。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_resync_sweep_keeps_a_locally_edited_file_it_would_have_deleted`（已验证：无修复时 RED，有修复 GREEN）。
 
 ## SC-003 · 大小写折叠 / Unicode 碰撞未测
 
