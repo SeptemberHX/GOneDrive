@@ -25,10 +25,11 @@ if [ -d "$SYNC_ROOT" ]; then
         && echo "  folder icon -> $SYNC_ROOT"
 fi
 
-# Start the tray front-end on login. It is a persistent status-notifier item,
-# not a window — without an autostart entry there is simply no tray until the
-# user launches GOnedrive from the app menu by hand.
-install -m644 data/org.gonedrive.Gonedrive.desktop "$AUTOSTART/org.gonedrive.Gonedrive.desktop"
+# Start the tray front-end on login — silently: --background brings up the
+# status-notifier item without popping the window. (Launching from the app menu
+# has no such flag, so a deliberate open still shows the window.)
+sed 's/^Exec=gonedrive$/Exec=gonedrive --background/' \
+    data/org.gonedrive.Gonedrive.desktop > "$AUTOSTART/org.gonedrive.Gonedrive.desktop"
 
 # Without this the new emblems resolve to nothing until the next login.
 gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true

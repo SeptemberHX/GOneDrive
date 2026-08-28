@@ -74,8 +74,10 @@ fn build_monitor(app: &adw::Application) {
 fn build_ui(app: &adw::Application) {
     // Launching the app while it is already running means "bring it to the
     // front", the way every status-area application behaves — not "open a
-    // second copy of the window".
-    if let Some(window) = app.active_window() {
+    // second copy of the window". `windows()` rather than `active_window()`,
+    // so a window kept hidden (a background/autostart launch) is still found
+    // and presented instead of a second one being built.
+    if let Some(window) = app.windows().into_iter().next() {
         window.present();
         return;
     }
@@ -136,7 +138,17 @@ fn build_ui(app: &adw::Application) {
         }
     });
 
-    window.present();
+    // Start hidden when launched in the background (autostart): the tray is up,
+    // but the window stays out of the way until the user opens it. Any other
+    // launch presents it. A snapshot capture must always present, or it renders
+    // nothing.
+    let background = std::env::args().any(|arg| arg == "--background")
+        && std::env::var_os("GONEDRIVE_SNAPSHOT").is_none();
+    if background {
+        window.set_visible(false);
+    } else {
+        window.present();
+    }
 
     // Development hook: render the window into a PNG and exit. The capture
     // comes from GTK's own renderer, so it shows exactly what the user would
