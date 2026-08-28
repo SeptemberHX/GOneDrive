@@ -1730,6 +1730,20 @@ fn read_dir(dir: &Path) -> std::io::Result<Vec<(String, LocalStat)>> {
         if INTERNAL_SUFFIXES.iter().any(|s| name.ends_with(s))
             || INTERNAL_NAMES.contains(&name.as_str())
         {
+            // Staging leftovers are pure cache: they are consumed within
+            // seconds when things work, so one that has been sitting for an
+            // hour is an orphan of some failed hand-off. The scan is already
+            // here; sweeping them costs one stat.
+            if name.ends_with(".gonedrive-partial") {
+                let stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| t.elapsed().unwrap_or_default() > std::time::Duration::from_secs(3600))
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
             continue;
         }
         let meta = match entry.metadata() {

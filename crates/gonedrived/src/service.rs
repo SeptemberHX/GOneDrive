@@ -28,12 +28,25 @@ impl DaemonService {
             .map(|a| std::path::PathBuf::from(&a.root_path))
             .ok_or_else(|| zbus::fdo::Error::Failed("no account is signed in".into()))?;
 
-        std::path::Path::new(path)
+        let relative = std::path::Path::new(path)
             .strip_prefix(&root)
             .map(|p| p.to_path_buf())
             .map_err(|_| {
                 zbus::fdo::Error::InvalidArgs(format!("{path} is outside {}", root.display()))
-            })
+            })?;
+
+        // The sync root itself is off limits to these single-shot calls. The
+        // audit log has a real entry where one context-menu click asked to
+        // dehydrate the entire drive — an operation that big gets a place
+        // where its scope is unmistakable (the panel's folder page, entry by
+        // entry), not a menu item next to "open".
+        if relative.as_os_str().is_empty() {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "refusing to act on the whole sync folder at once;                  choose folders individually in the GOnedrive panel"
+                    .into(),
+            ));
+        }
+        Ok(relative)
     }
 }
 
