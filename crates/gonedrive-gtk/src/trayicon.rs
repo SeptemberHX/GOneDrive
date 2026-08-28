@@ -97,6 +97,16 @@ fn render(category: &str, size: i32) -> Option<ksni::Icon> {
     Some(ksni::Icon { width: w, height: h, data })
 }
 
+/// The plain OneDrive cloud as a texture, for the login page and the avatar
+/// badge. `None` if the SVG loader is unavailable.
+pub fn cloud_texture(size: i32) -> Option<gtk::gdk::Texture> {
+    let svg = svg("idle");
+    let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from(svg.as_bytes()));
+    let pixbuf =
+        Pixbuf::from_stream_at_scale(&stream, size, size, true, gio::Cancellable::NONE).ok()?;
+    Some(gtk::gdk::Texture::for_pixbuf(&pixbuf))
+}
+
 /// The sync-state categories the tray distinguishes.
 pub const CATEGORIES: &[&str] = &["idle", "sync", "paused", "offline", "error"];
 
