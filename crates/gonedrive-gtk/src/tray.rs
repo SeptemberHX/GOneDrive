@@ -26,6 +26,10 @@ pub struct GonedriveTray {
     actions: async_channel::Sender<TrayAction>,
     /// Requests aimed at the daemon.
     commands: async_channel::Sender<Command>,
+    /// The OneDrive cloud icon per sync-state, pre-rendered once. Empty if the
+    /// SVG loader was unavailable, in which case `icon_name` carries a themed
+    /// fallback instead.
+    icons: std::collections::HashMap<&'static str, Vec<ksni::Icon>>,
 }
 
 impl GonedriveTray {
@@ -38,6 +42,18 @@ impl GonedriveTray {
             account: None,
             actions,
             commands,
+            icons: crate::trayicon::render_all(),
+        }
+    }
+
+    /// The icon category for the current state.
+    fn icon_category(&self) -> &'static str {
+        match self.status.state.as_str() {
+            "syncing" | "enumerating" | "downloading" | "uploading" => "sync",
+            "paused" => "paused",
+            "offline" => "offline",
+            "signed_out" | "error" => "error",
+            _ => "idle",
         }
     }
 
@@ -90,9 +106,13 @@ impl Tray for GonedriveTray {
         "GOnedrive".into()
     }
 
-    /// Theme icon names rather than bundled pixmaps, so the icon follows the
-    /// user's theme and their light/dark preference without us redrawing it.
+    /// The OneDrive cloud, rendered with the state's badge. Left empty when the
+    /// pixmap rendered, so the host uses the pixmap; only if rendering was
+    /// unavailable does this carry a themed symbolic name as a fallback.
     fn icon_name(&self) -> String {
+        if !self.icons.is_empty() {
+            return String::new();
+        }
         match self.status.state.as_str() {
             "syncing" | "enumerating" | "downloading" | "uploading" => {
                 "emblem-synchronizing-symbolic".into()
@@ -104,12 +124,18 @@ impl Tray for GonedriveTray {
         }
     }
 
+    /// The OneDrive brand icon for the current state, at the sizes the panel
+    /// might want. Empty when rendering was unavailable — `icon_name` covers it.
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        self.icons.get(self.icon_category()).cloned().unwrap_or_default()
+    }
+
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
             title: "GOnedrive".into(),
             description: self.summary(),
-            icon_name: self.icon_name(),
-            icon_pixmap: Vec::new(),
+            icon_name: String::new(),
+            icon_pixmap: self.icon_pixmap(),
         }
     }
 

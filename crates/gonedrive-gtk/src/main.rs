@@ -8,6 +8,7 @@
 mod backend;
 mod monitor;
 mod tray;
+mod trayicon;
 mod window;
 
 use adw::prelude::*;
