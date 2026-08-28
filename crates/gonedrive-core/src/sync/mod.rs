@@ -1,5 +1,6 @@
 //! The sync engine.
 
+pub mod emblems;
 pub mod engine;
 pub mod plan;
 pub mod selection;

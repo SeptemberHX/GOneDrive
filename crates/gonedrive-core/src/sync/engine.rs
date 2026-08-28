@@ -144,12 +144,15 @@ pub struct SyncSummary {
 }
 
 pub struct Engine {
-    store: Store,
-    graph: Arc<GraphClient>,
-    config: Arc<Config>,
-    account_id: String,
-    events: broadcast::Sender<SyncEvent>,
-    hostname: String,
+    // `pub(super)` so cohesive groups of methods can live in sibling modules of
+    // `sync` (emblems, hydration, …) while still reaching the engine's state.
+    // The fields stay invisible outside the `sync` module.
+    pub(super) store: Store,
+    pub(super) graph: Arc<GraphClient>,
+    pub(super) config: Arc<Config>,
+    pub(super) account_id: String,
+    pub(super) events: broadcast::Sender<SyncEvent>,
+    pub(super) hostname: String,
     /// Names already reported as unsyncable, so a file that cannot be renamed
     /// is mentioned once rather than on every pass forever.
     reported_skips: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -1715,76 +1718,6 @@ impl Engine {
         Ok(watch)
     }
 
-    /// Recompute a folder's badge from its direct children and return whether
-    /// it changed.
-    ///
-    /// The rule the user expects, and Windows uses: a folder is "available on
-    /// this device" (a check) only when *everything* inside is here — every
-    /// file downloaded, every subfolder itself fully local — or when it was
-    /// explicitly kept. A folder with some content still in the cloud shows the
-    /// cloud, because opening it may still need the network. "Any one file is
-    /// local" is not enough.
-    fn recompute_folder_mark(&self, account: &Account, folder_id: &str) -> Result<bool> {
-        let Some(path) = self.store.local_path(account, folder_id)? else {
-            return Ok(false);
-        };
-        if !path.is_dir() {
-            return Ok(false);
-        }
-        // An explicit "always keep on this device" wins outright.
-        if self.store.explicitly_pinned(folder_id)? {
-            let changed = Placeholder::state(&path) != PlaceholderState::Hydrated;
-            let _ = Placeholder::mark_dir(&path, PlaceholderState::Hydrated, folder_id);
-            let _ = Placeholder::set_pin(&path, "pinned");
-            return Ok(changed);
-        }
-
-        let mut all_local = true;
-        for child in self.store.children(&self.account_id, folder_id)? {
-            let local = if child.is_folder {
-                // A subfolder counts as local only if it, too, is fully local.
-                self.store
-                    .local_path(account, &child.id)?
-                    .map(|p| Placeholder::state(&p) == PlaceholderState::Hydrated)
-                    .unwrap_or(false)
-            } else {
-                child.state == ItemState::Synced && child.local_ino.is_some()
-            };
-            if !local {
-                all_local = false;
-                break;
-            }
-        }
-
-        let target = if all_local {
-            PlaceholderState::Hydrated
-        } else {
-            PlaceholderState::Dehydrated
-        };
-        let changed = Placeholder::state(&path) != target;
-        if changed {
-            let _ = Placeholder::mark_dir(&path, target, folder_id);
-        }
-        Ok(changed)
-    }
-
-    /// Recompute the badges of an item's ancestor folders after its state
-    /// changed, stopping as soon as one is unchanged — nothing above a folder
-    /// whose own badge did not move can have moved either.
-    fn refresh_folder_ancestors(&self, account: &Account, item_id: &str) -> Result<()> {
-        let mut current = self.store.item(item_id)?.and_then(|i| i.parent_id);
-        while let Some(id) = current {
-            let Some(folder) = self.store.item(&id)? else { break };
-            if !folder.is_folder {
-                break;
-            }
-            if !self.recompute_folder_mark(account, &id)? {
-                break;
-            }
-            current = folder.parent_id;
-        }
-        Ok(())
-    }
 
     /// Reconcile database states with what the files themselves say.
     ///
