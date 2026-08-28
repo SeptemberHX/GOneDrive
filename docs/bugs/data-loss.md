@@ -43,4 +43,20 @@
 - **修复**：重建前增加 `safe_to_rebuild` 门禁——仅当"记录的内容哈希 xattr 存在**且**与当前文件哈希相等"（即确为我们写入的、已在服务端的字节）才重建；否则（哈希不符=用户编辑过，或无记录哈希）保持原样，绝不清零。
 - **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::materialize_never_zeroes_a_sparse_file_the_user_edited`（已验证：无门禁 RED，有门禁 GREEN）。
 
-<!-- 后续：DL-005 If-Match 丢失更新、DL-007 冲突副本碰撞、以及下载覆盖路径门禁。 -->
+## DL-004b · 下载覆盖前未查内容 → 保留 mtime 的原地编辑被远端静默覆盖
+
+- **首次发现**：2026-08-28
+- **现象**：远端变更 + 本地保留 size/mtime 的原地编辑同时发生时，`decide_remote` 判远端为新方（`plan.rs:181` `Download{overwrite:true}`），`run_download` 直接覆盖本地，丢失未上传的编辑，且不生成冲突副本。
+- **根因**：`run_download` 覆盖前不查本地内容。
+- **修复**：`run_download` 覆盖前调用 `local_content_unsynced`（同 DL-004 哈希门禁）；若本地有未上传编辑，先 `make_conflict_copy` 保留并重传，远端再落到原名。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_download_preserves_a_hidden_local_edit_as_a_conflict_copy`（已验证 RED→GREEN）。
+
+## DL-007 · 冲突副本命名一秒内碰撞，第二份覆盖第一份
+
+- **首次发现**：2026-08-28
+- **现象**：冲突副本名精确到秒（`names::conflict_copy_name`），同一文件在一秒内两次冲突会生成同名副本，第二次 `rename` 覆盖第一份——保留下来的第一份本地内容反被丢失。
+- **根因**：`crates/gonedrive-core/src/sync/engine.rs::make_conflict_copy` 直接 `rename`，无目标存在性检查。
+- **修复**：新增 `names::free_path`——目标已存在则在扩展名前插入 `(2)`/`(3)`… 直到不冲突；`make_conflict_copy` 改用它。
+- **回归测试**：`crates/gonedrive-core/src/names.rs::free_path_dodges_existing_conflict_copies`。
+
+<!-- 后续：DL-005 If-Match 丢失更新。 -->

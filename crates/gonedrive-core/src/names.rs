@@ -124,6 +124,35 @@ pub fn conflict_copy_name(name: &str, host: &str, when: time::OffsetDateTime) ->
     }
 }
 
+/// A variant of `candidate` that does not already exist on disk, inserting
+/// " (2)", " (3)", … before the extension until the name is free.
+///
+/// Conflict-copy names are stamped to the second, so two conflicts on the same
+/// file within one second would otherwise resolve to the same name and the
+/// second rename would clobber the first — losing the first preserved copy.
+pub fn free_path(candidate: &std::path::Path) -> std::path::PathBuf {
+    if !candidate.exists() {
+        return candidate.to_path_buf();
+    }
+    let name = candidate
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let (stem, ext) = split_extension(&name);
+    for n in 2..u32::MAX {
+        let numbered = match ext {
+            Some(ext) => format!("{stem} ({n}).{ext}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = candidate.with_file_name(numbered);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    candidate.to_path_buf()
+}
+
 /// Split a name into stem and extension, treating dotfiles as extension-less.
 pub fn split_extension(name: &str) -> (&str, Option<&str>) {
     match name.rfind('.') {
@@ -143,6 +172,26 @@ mod tests {
         for name in ["report.docx", "照片 2024.jpg", "a", "file.tar.gz", ".hidden"] {
             assert!(validate_name(name).is_ok(), "rejected {name}");
         }
+    }
+
+    #[test]
+    fn free_path_dodges_existing_conflict_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("report 的冲突副本.docx");
+        // Nothing there yet: the base name is free.
+        assert_eq!(free_path(&base), base);
+
+        // Once it exists, the next call must not return it — two conflicts in
+        // the same second must not clobber each other.
+        std::fs::write(&base, b"first").unwrap();
+        let p2 = free_path(&base);
+        assert_eq!(p2.file_name().unwrap().to_string_lossy(), "report 的冲突副本 (2).docx");
+
+        std::fs::write(&p2, b"second").unwrap();
+        let p3 = free_path(&base);
+        assert_eq!(p3.file_name().unwrap().to_string_lossy(), "report 的冲突副本 (3).docx");
+        // The first copy is untouched.
+        assert_eq!(std::fs::read(&base).unwrap(), b"first");
     }
 
     #[test]

@@ -702,7 +702,10 @@ impl Engine {
             .to_string_lossy()
             .into_owned();
         let copy_name = conflict_copy_name(&name, &self.hostname, OffsetDateTime::now_utc());
-        let copy = path.with_file_name(copy_name);
+        // Dodge an existing copy: two conflicts on the same file within one
+        // second stamp to the same name, and a blind rename would clobber the
+        // first preserved copy — itself a data loss.
+        let copy = crate::names::free_path(&path.with_file_name(copy_name));
         std::fs::rename(path, &copy)?;
         tracing::info!(from = %path.display(), to = %copy.display(), "kept local copy");
         Ok(copy)
