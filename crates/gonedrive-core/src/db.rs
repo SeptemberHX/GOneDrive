@@ -21,7 +21,7 @@ use time::OffsetDateTime;
 use crate::error::{Error, Result};
 use crate::names::fold_case;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// What we know about a file relative to the service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +300,22 @@ impl Store {
                 // Where a part-finished enumeration left off, so an interrupted
                 // first pass over a large drive resumes instead of restarting.
                 conn.execute_batch("ALTER TABLE accounts ADD COLUMN enum_link TEXT")?;
+            }
+            if version < 3 {
+                // An earlier build stamped every *upload* as `pinned`. That
+                // turned a later local deletion into "a pinned file vanished —
+                // put it back", resurrecting folders, and made those items read
+                // as explicitly-excluded so deletions were vetoed. The upload
+                // path is fixed; this scrubs the records it already poisoned.
+                // Genuine user pins are re-established the moment the user
+                // pins something, so clearing the ambiguous ones is safe.
+                let scrubbed = conn.execute(
+                    "UPDATE items SET pin_state = 'inherit' WHERE pin_state = 'pinned'",
+                    [],
+                )?;
+                if scrubbed > 0 {
+                    tracing::info!(scrubbed, "cleared pin flags an old upload path set wrongly");
+                }
             }
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             Ok(())
