@@ -23,4 +23,16 @@
 
 ---
 
-<!-- 后续 data-loss 类修复（DL-002 full_resync 清扫、DL-003 materialize 清零、DL-004 mtime 保留原地编辑、DL-005 If-Match 丢失更新、DL-006 xattr/DB 失同步、DL-007 冲突副本碰撞）依次追加于此。 -->
+## DL-004 · 保留 size+mtime 的原地编辑被 dehydrate 打洞清零（含 xattr/DB 失同步放大）
+
+- **首次发现**：2026-08-28
+- **现象**：文件被原地编辑但保持了相同长度、且 mtime 被还原（保留 mtime 的编辑器、`rsync --times`、等长重写）时，`local_is_modified` 的 size+mtime 判据看不出改动，dehydrate/释放空间会把这些**从未上传的字节**打成空洞，永久丢失。xattr/DB 失同步（DB 标 Dehydrated 但磁盘实为满内容）会经 `state==Dehydrated` 跳过护栏的捷径进一步放大。
+- **根因**：`crates/gonedrive-core/src/sync/engine.rs::dehydrate` 的护栏仅用 `plan::local_is_modified`（`plan.rs` 的 size+mtime 启发式），且对 `state==Dehydrated` 直接跳过。
+- **修复（哈希级）**：
+  1. 新增 `crates/gonedrive-core/src/hash.rs`：Microsoft quickXorHash 流式实现，已对 25 个真实服务端哈希逐字节验证（25/25）。
+  2. 写内容时记录哈希 xattr `user.gonedrive.quickxor`：`Placeholder::mark_hydrated`（覆盖全部 hydration 完成点）与上传成功后（`run_upload`）都按**实际磁盘字节**计算并写入。
+  3. dehydrate 护栏改为 `Engine::local_content_unsynced`：满分配文件必须"当前内容哈希 == 记录哈希"才放行；稀疏占位符（含 range 缓存）直接放行；无记录哈希才回退 size+mtime。**不再信任 DB 状态**，故同时堵住 xattr/DB 失同步（原 DL-006/ES-002 的 dehydrate 面）。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::freeing_space_refuses_an_in_place_edit_that_kept_size_and_mtime`（已验证：无哈希门禁时 RED，有则 GREEN）；`hash.rs` 三个单测。
+- **待续**：下载覆盖路径（`plan.rs:181` `Download{overwrite:true}`）与 `materialize_all` 空洞重建（DL-003）复用同一 `local_content_unsynced` 门禁，随后提交。
+
+<!-- 后续：DL-003 materialize 清零、DL-005 If-Match 丢失更新、DL-007 冲突副本碰撞。 -->

@@ -1432,6 +1432,33 @@ async fn freeing_space_refuses_a_file_with_unsaved_changes() {
 }
 
 #[tokio::test]
+async fn freeing_space_refuses_an_in_place_edit_that_kept_size_and_mtime() {
+    // The corruption the size+mtime heuristic cannot see: an in-place edit of
+    // the same length with the mtime restored. Only the content hash catches
+    // it — and freeing must never punch holes in bytes never uploaded.
+    let content: &[u8] = b"12345678";
+    let h = harness_with_a_downloaded_file(content).await;
+    let path = h.path("Docs/big.bin");
+
+    // Edit in place to the same length, then put the mtime back: nothing the
+    // heuristic keys on has moved.
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+    std::fs::write(&path, b"EDITED!!").unwrap();
+    let f = std::fs::File::options().write(true).open(&path).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(before)).unwrap();
+    drop(f);
+
+    let outcome = h.engine.free_space(Path::new("Docs")).unwrap();
+    assert_eq!(outcome.files, 0, "a same-size, same-mtime edit must still be protected");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"EDITED!!",
+        "the un-uploaded edit must not have been punched away"
+    );
+}
+
+#[tokio::test]
 async fn placeholders_can_be_created_for_files_never_downloaded() {
     use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
 

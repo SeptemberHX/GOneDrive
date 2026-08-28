@@ -33,6 +33,13 @@ pub const XATTR_CTAG: &str = "user.gonedrive.ctag";
 /// from "always keep here" without asking the daemon.
 pub const XATTR_PIN: &str = "user.gonedrive.pin";
 
+/// quickXorHash of the content we last wrote to this file (download, hydration,
+/// or the local content at the moment we uploaded it). It is the reference the
+/// dehydrate/rebuild/overwrite guards compare the file's *current* content
+/// against, so an in-place edit that preserved size and mtime — invisible to
+/// the size+mtime heuristic — is still caught before the bytes are discarded.
+pub const XATTR_QUICKXOR: &str = "user.gonedrive.quickxor";
+
 /// What a placeholder currently holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceholderState {
@@ -161,7 +168,16 @@ impl Placeholder {
 
     /// Mark a fully-filled placeholder as holding its content.
     pub fn mark_hydrated(path: &Path, item_id: &str, ctag: Option<&str>) -> Result<()> {
-        Self::write_marks(path, PlaceholderState::Hydrated, item_id, ctag)
+        Self::write_marks(path, PlaceholderState::Hydrated, item_id, ctag)?;
+        // Record the content hash of the bytes now on disk, so a later
+        // dehydrate/rebuild can tell an untouched copy from an in-place edit
+        // that the size+mtime heuristic would miss. Computed from the actual
+        // file rather than trusting a stored server hash, so the xattr always
+        // reflects exactly what is on disk.
+        if let Ok(hash) = crate::hash::quick_xor_file(path) {
+            let _ = xattr::set(path, XATTR_QUICKXOR, hash.as_bytes());
+        }
+        Ok(())
     }
 
     /// Read what the file itself claims about its state.
@@ -209,6 +225,19 @@ impl Placeholder {
 
     pub fn pin(path: &Path) -> Option<String> {
         let raw = xattr::get(path, XATTR_PIN).ok()??;
+        String::from_utf8(raw).ok()
+    }
+
+    /// Record the content hash of the bytes we just wrote, so a later guard can
+    /// tell whether the file has been edited since.
+    pub fn set_content_hash(path: &Path, hash: &str) -> Result<()> {
+        xattr::set(path, XATTR_QUICKXOR, hash.as_bytes())?;
+        Ok(())
+    }
+
+    /// The content hash recorded the last time we wrote this file, if any.
+    pub fn content_hash(path: &Path) -> Option<String> {
+        let raw = xattr::get(path, XATTR_QUICKXOR).ok()??;
         String::from_utf8(raw).ok()
     }
 

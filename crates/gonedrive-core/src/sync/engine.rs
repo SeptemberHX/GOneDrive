@@ -1293,6 +1293,40 @@ impl Engine {
         Ok(())
     }
 
+    /// Whether the file at `path` holds content that is not safely on the
+    /// server, so discarding its bytes — a dehydrate punch, a placeholder
+    /// rebuild, an overwrite by a download — would lose data.
+    ///
+    /// The content hash is the authority. A fully-allocated file whose current
+    /// quickXorHash matches the hash we recorded when we last wrote it is
+    /// unchanged and safe to discard, whatever its size and mtime say; a
+    /// mismatch means it has been edited since and holds bytes the server does
+    /// not have. A still-sparse file owns nothing (its bytes are holes, or
+    /// range-fill cache), so it is always safe. Only when no hash was ever
+    /// recorded does it fall back to the size+mtime heuristic.
+    fn local_content_unsynced(&self, record: &ItemRecord, path: &Path) -> bool {
+        let occ = match crate::hydrate::Occupancy::read(path) {
+            Ok(o) => o,
+            Err(_) => return false,
+        };
+        if occ.allocated < occ.apparent_size {
+            // Still sparse: a placeholder or partial cache, not owned content.
+            return false;
+        }
+        if let Some(recorded) = Placeholder::content_hash(path) {
+            return match crate::hash::quick_xor_file(path) {
+                Ok(current) => current != recorded,
+                // A full file we cannot read to verify is not safe to discard.
+                Err(_) => true,
+            };
+        }
+        // No recorded hash (a file written before content hashing, or one that
+        // arrived some other way): fall back to the size+mtime heuristic.
+        stat_of(path)
+            .map(|local| crate::sync::plan::local_is_modified(record, &local))
+            .unwrap_or(false)
+    }
+
     /// Record that a placeholder the helper just filled is now complete.
     pub fn finish_hydration(&self, path: &Path) -> Result<()> {
         self.emit(SyncEvent::HydrationFinished {
@@ -1358,20 +1392,17 @@ impl Engine {
             .item(&item_id)?
             .ok_or_else(|| Error::other(format!("unknown item {item_id}")))?;
 
-        // The unsaved-changes guard protects *hydrated* files. A record
-        // already in Dehydrated state owns none of its on-disk bytes — they
-        // are cache from range fills, and a range fill also moves the mtime,
-        // which is exactly what this guard keys on. Applying it here made
-        // "free a file you merely looked at" impossible.
-        if record.state != ItemState::Dehydrated {
-            if let Some(local) = stat_of(path) {
-                if crate::sync::plan::local_is_modified(&record, &local) {
-                    return Err(Error::other(format!(
-                        "{} has local changes that are not uploaded yet",
-                        path.display()
-                    )));
-                }
-            }
+        // Never punch holes in bytes that are not safely on the server. The
+        // content hash is the authority here, not size and mtime: it catches an
+        // in-place edit that preserved both, and it catches an xattr/DB desync
+        // where the record wrongly says Dehydrated while the file is actually
+        // full of un-uploaded content. A genuine placeholder — still sparse —
+        // owns nothing and passes straight through.
+        if self.local_content_unsynced(&record, path) {
+            return Err(Error::other(format!(
+                "{} has local changes that are not uploaded yet",
+                path.display()
+            )));
         }
 
         let mtime = record.remote_mtime;
@@ -2145,6 +2176,12 @@ impl Engine {
                 Some(local.size),
                 Some(local.ino),
             )?;
+        }
+        // The bytes on disk are now the bytes on the server: record their hash
+        // so a later dehydrate recognises the file as synced and safe to free,
+        // and so an in-place edit after this point is caught.
+        if let Ok(hash) = crate::hash::quick_xor_file(&path) {
+            let _ = Placeholder::set_content_hash(&path, &hash);
         }
         summary.uploaded += 1;
         self.emit(SyncEvent::ItemDone {
