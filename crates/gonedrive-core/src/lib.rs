@@ -11,6 +11,7 @@ pub mod credentials;
 pub mod db;
 pub mod error;
 pub mod graph;
+pub mod hash;
 pub mod hydrate;
 pub mod models;
 pub mod names;
