@@ -380,27 +380,41 @@ impl App {
     /// the window is always correct — the watch stays armed for the rest.
     const PARTIAL_HYDRATION_CEILING: u64 = 256 * 1024;
 
-    /// Stage what a blocked reader needs: the requested range when it is a
-    /// small head-read, the whole file otherwise. Returns the staged path,
-    /// the placement offset, and whether it completes the file.
+    /// Stage what a blocked reader needs. Returns the staged path, the
+    /// placement offset, and whether it completes the file.
+    ///
+    /// Two rules decide, in order:
+    ///
+    /// * **Who is reading.** A file manager reads files to *describe* them,
+    ///   not to use them; whatever it asks for is served as a range and the
+    ///   file's state never changes. Without this, looking at a folder of
+    ///   small files flips every one of them to "downloaded" — silently
+    ///   reversing the user's explicit online-only choice, which is precisely
+    ///   the complaint that shaped this function.
+    /// * **How much is asked.** For everyone else, a small head-read is served
+    ///   as a range; anything more is a real consumer and hydrates the file,
+    ///   the way Windows does it.
     pub async fn stage_for(
         &self,
         path: &std::path::Path,
         offset: u64,
         length: u64,
+        reader: &str,
         allow_partial: bool,
     ) -> Result<(std::path::PathBuf, u64, bool)> {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let browsing = is_browsing_reader(reader);
         let partial = allow_partial
             && length > 0
-            && length <= Self::PARTIAL_HYDRATION_CEILING
-            && offset + length < size;
+            && (browsing
+                || (length <= Self::PARTIAL_HYDRATION_CEILING && offset + length < size));
 
         if partial {
             let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
             let engine = engines
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
+            let length = length.min(size.saturating_sub(offset)).max(1);
             let staged = engine.stage_range(path, offset, length).await?;
             return Ok((staged, offset, false));
         }
@@ -598,11 +612,17 @@ impl App {
         }
 
         let outcome = engine.free_space(relative)?;
-        // Registered immediately, not at the next start-up: between freeing a
-        // file and watching it, any read of it returns zeroes.
-        for path in &outcome.paths {
-            if let Err(e) = hsm.watch(path).await {
-                tracing::error!(path = %path.display(), error = %e, "could not intercept");
+        // Re-arm from the ground truth, not from the outcome: the unwatch
+        // above stripped the whole subtree, and a file the free *skipped* is
+        // still a placeholder that needs intercepting. Watching only what was
+        // freed once left skipped files readable with no one to fill them.
+        for path in engine.subtree_local_files(relative)? {
+            if gonedrive_core::hydrate::Placeholder::state(&path)
+                == gonedrive_core::hydrate::PlaceholderState::Dehydrated
+            {
+                if let Err(e) = hsm.watch(&path).await {
+                    tracing::error!(path = %path.display(), error = %e, "could not intercept");
+                }
             }
         }
         Ok(outcome)
@@ -824,4 +844,30 @@ async fn record_activity(
         when: time::OffsetDateTime::now_utc().unix_timestamp(),
     });
     guard.truncate(ACTIVITY_LIMIT);
+}
+
+/// Processes that read files in order to *describe* them — type sniffing,
+/// previews — rather than to use them. Their reads are always served as
+/// ranges and never change a file's state: browsing must have no side
+/// effects, at any file size.
+fn is_browsing_reader(comm: &str) -> bool {
+    const BROWSERS: &[&str] = &["nautilus", "sushi"];
+    BROWSERS.iter().any(|prefix| comm.starts_with(prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_browsing_reader;
+
+    #[test]
+    fn file_managers_browse_and_applications_consume() {
+        // The line this draws: looking at a file must never flip its state;
+        // using it may.
+        for browser in ["nautilus", "sushi"] {
+            assert!(is_browsing_reader(browser), "{browser}");
+        }
+        for consumer in ["cat", "gedit", "cp", "libreoffice", "md5sum", ""] {
+            assert!(!is_browsing_reader(consumer), "{consumer:?}");
+        }
+    }
 }

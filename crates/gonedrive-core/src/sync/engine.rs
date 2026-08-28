@@ -983,6 +983,20 @@ impl Engine {
 
         let staged = transfer::staging_sibling(path);
 
+        // A range that is already real data on disk — a window some earlier
+        // sniff filled — is served from the file itself. Browsing the same
+        // folder twice must not fetch the same 16 KiB from the cloud twice.
+        if let Some(bytes) = read_if_materialized(path, offset, length)? {
+            tokio::fs::write(&staged, &bytes).await?;
+            tracing::info!(
+                path = %path.display(),
+                offset,
+                bytes = bytes.len(),
+                "staged range from local data"
+            );
+            return Ok(staged);
+        }
+
         let response = self
             .graph
             .download(&item_id, Some(offset..offset + length))
@@ -1061,12 +1075,19 @@ impl Engine {
             .item(&item_id)?
             .ok_or_else(|| Error::other(format!("unknown item {item_id}")))?;
 
-        if let Some(local) = stat_of(path) {
-            if crate::sync::plan::local_is_modified(&record, &local) {
-                return Err(Error::other(format!(
-                    "{} has local changes that are not uploaded yet",
-                    path.display()
-                )));
+        // The unsaved-changes guard protects *hydrated* files. A record
+        // already in Dehydrated state owns none of its on-disk bytes — they
+        // are cache from range fills, and a range fill also moves the mtime,
+        // which is exactly what this guard keys on. Applying it here made
+        // "free a file you merely looked at" impossible.
+        if record.state != ItemState::Dehydrated {
+            if let Some(local) = stat_of(path) {
+                if crate::sync::plan::local_is_modified(&record, &local) {
+                    return Err(Error::other(format!(
+                        "{} has local changes that are not uploaded yet",
+                        path.display()
+                    )));
+                }
             }
         }
 
@@ -1758,6 +1779,33 @@ fn stat_of(path: &Path) -> Option<LocalStat> {
     // `symlink_metadata` so a symlink is never mistaken for its target.
     let meta = std::fs::symlink_metadata(path).ok()?;
     (meta.is_file() || meta.is_dir()).then(|| LocalStat::from_metadata(&meta))
+}
+
+/// The requested window, if every byte of it is already data rather than hole.
+///
+/// `SEEK_DATA`/`SEEK_HOLE` ask the filesystem directly which parts of a sparse
+/// file are materialized, so this needs no bookkeeping of past fills.
+fn read_if_materialized(path: &Path, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let end = (offset + length).min(size);
+    if offset >= end {
+        return Ok(None);
+    }
+
+    // SAFETY: valid fd; lseek with SEEK_HOLE finds the next hole at or after
+    // `offset`. If that hole starts at or beyond `end`, the window is data.
+    let next_hole = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, libc::SEEK_HOLE) };
+    if next_hole < 0 || (next_hole as u64) < end {
+        return Ok(None);
+    }
+
+    let mut buf = vec![0u8; (end - offset) as usize];
+    file.read_exact_at(&mut buf, offset)?;
+    Ok(Some(buf))
 }
 
 /// Backoff between retries of a queued operation: 2s, 4s, 8s … capped at 5min.

@@ -226,7 +226,7 @@ async fn handle(
             let allow_partial =
                 partial_hydration.load(std::sync::atomic::Ordering::Relaxed);
             let (ok, source, offset, full) =
-                match app.stage_for(&path, offset, length, allow_partial).await {
+                match app.stage_for(&path, offset, length, &reader, allow_partial).await {
                 Ok((staged, offset, full)) => (
                     true,
                     Some(staged.to_string_lossy().into_owned()),

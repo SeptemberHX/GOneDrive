@@ -1661,3 +1661,37 @@ async fn a_range_stage_fetches_only_the_window_and_changes_nothing() {
     );
     let _ = std::fs::remove_file(&staged);
 }
+
+#[tokio::test]
+async fn a_browsed_placeholder_can_still_be_freed() {
+    // A range fill (a file manager sniffing the head) writes into the
+    // placeholder and moves its mtime. That must never trip the
+    // unsaved-changes guard: the bytes are cloud-owned cache, and refusing
+    // made "free a file you merely looked at" impossible — found live as
+    // `FreeUpSpace done files=0 kept=2`.
+    use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
+
+    const CONTENT: &[u8] = &[7u8; 64 * 1024];
+    let h = harness_with_a_downloaded_file(CONTENT).await;
+    let path = h.path("Docs/big.bin");
+    h.engine.free_space(Path::new("Docs")).unwrap();
+
+    // Simulate the helper filling the sniff window through the event fd.
+    Placeholder::fill(&path, 0, &CONTENT[..16384]).unwrap();
+    assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
+
+    let outcome = h.engine.free_space(Path::new("Docs")).unwrap();
+    assert_eq!(outcome.files, 1, "skipped: {:?}", outcome.skipped);
+    assert!(outcome.skipped.is_empty());
+    assert_eq!(Occupancy::read(&path).unwrap().allocated, 0, "cache punched");
+
+    // The guard still protects what it is for: a *hydrated* file with a real
+    // local edit.
+    h.server.reset().await;
+    h.mock_download("F1", CONTENT).await;
+    h.engine.hydrate(&path).await.unwrap();
+    std::fs::write(&path, b"a real unsaved edit").unwrap();
+    let outcome = h.engine.free_space(Path::new("Docs")).unwrap();
+    assert_eq!(outcome.files, 0);
+    assert_eq!(outcome.skipped.len(), 1);
+}
