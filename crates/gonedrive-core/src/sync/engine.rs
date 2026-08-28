@@ -2039,9 +2039,12 @@ impl Engine {
         }
 
         self.store.set_item_state(item_id, ItemState::Hydrating)?;
+        // Show a syncing emblem while the content comes down; cleared below
+        // whether the download succeeds or fails.
+        Placeholder::set_syncing(&path, true);
         let name = record.name.clone();
         let events = self.events.clone();
-        transfer::download_to_file_limited(
+        let result = transfer::download_to_file_limited(
             &self.graph,
             item_id,
             &path,
@@ -2057,7 +2060,9 @@ impl Engine {
                 true
             },
         )
-        .await?;
+        .await;
+        Placeholder::set_syncing(&path, false);
+        result?;
 
         if let Some(local) = stat_of(&path) {
             self.store.set_local_stat(
@@ -2134,6 +2139,8 @@ impl Engine {
 
         let events = self.events.clone();
         let progress_name = name.clone();
+        // Syncing emblem while the upload is in flight.
+        Placeholder::set_syncing(&path, true);
         let result = transfer::upload_file(
             &self.graph,
             &self.store,
@@ -2160,6 +2167,7 @@ impl Engine {
             },
         )
         .await;
+        Placeholder::set_syncing(&path, false);
 
         let item = match result {
             Ok(item) => item,

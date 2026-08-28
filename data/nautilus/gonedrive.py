@@ -22,6 +22,7 @@ from gi.repository import Gio, GLib, GObject, Nautilus  # noqa: E402
 
 XATTR_STATE = "user.gonedrive.state"
 XATTR_PIN = "user.gonedrive.pin"
+XATTR_SYNCING = "user.gonedrive.syncing"
 
 BUS_NAME = "org.gonedrive.Daemon"
 OBJECT_PATH = "/org/gonedrive/Daemon"
@@ -80,6 +81,10 @@ def status_of(path, is_dir=False):
     state = _xattr(path, XATTR_STATE)
     if state is None:
         return None
+    # A transfer in flight wins over the resting state, so an upload or download
+    # reads as "syncing" rather than the check or cloud it will settle into.
+    if _xattr(path, XATTR_SYNCING) is not None:
+        return SYNCING
     if is_dir:
         if _xattr(path, XATTR_PIN) == "pinned":
             return FOLDER_PINNED

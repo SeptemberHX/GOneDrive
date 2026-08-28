@@ -21,7 +21,26 @@ use time::OffsetDateTime;
 use crate::error::{Error, Result};
 use crate::names::fold_case;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
+
+const ACTIVITY_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS activity (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind     TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    detail   TEXT NOT NULL DEFAULT '',
+    when_ts  INTEGER NOT NULL
+);
+"#;
+
+/// One entry in the persisted activity log.
+#[derive(Debug, Clone)]
+pub struct ActivityRow {
+    pub kind: String,
+    pub name: String,
+    pub detail: String,
+    pub when: i64,
+}
 
 /// What we know about a file relative to the service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +349,11 @@ impl Store {
                 // server-side. Recorded on first scan, checked on every scan.
                 conn.execute_batch("ALTER TABLE accounts ADD COLUMN root_dev INTEGER")?;
             }
+            if version < 5 {
+                // The activity log, persisted so it survives a restart instead
+                // of living only in the front end's memory.
+                conn.execute_batch(ACTIVITY_TABLE)?;
+            }
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             Ok(())
         })
@@ -414,6 +438,48 @@ impl Store {
                 params![account_id, dev as i64],
             )?;
             Ok(())
+        })
+    }
+
+    /// Append an activity entry and trim the log to its most recent `keep`
+    /// rows, so it survives a restart without growing without bound.
+    pub fn push_activity(
+        &self,
+        kind: &str,
+        name: &str,
+        detail: &str,
+        when: i64,
+        keep: i64,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO activity (kind, name, detail, when_ts) VALUES (?1, ?2, ?3, ?4)",
+                params![kind, name, detail, when],
+            )?;
+            conn.execute(
+                "DELETE FROM activity WHERE id NOT IN
+                   (SELECT id FROM activity ORDER BY id DESC LIMIT ?1)",
+                params![keep],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The most recent activity entries, newest first.
+    pub fn recent_activity(&self, limit: i64) -> Result<Vec<ActivityRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT kind, name, detail, when_ts FROM activity ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit], |row| {
+                Ok(ActivityRow {
+                    kind: row.get(0)?,
+                    name: row.get(1)?,
+                    detail: row.get(2)?,
+                    when: row.get(3)?,
+                })
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }
 
@@ -1320,6 +1386,23 @@ mod tests {
         store.migrate().unwrap();
         store.migrate().unwrap();
         assert!(store.accounts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn activity_persists_newest_first_and_is_trimmed() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .push_activity("downloaded", &format!("f{i}.txt"), "", 1000 + i, 3)
+                .unwrap();
+        }
+        let recent = store.recent_activity(10).unwrap();
+        // Trimmed to the last 3, newest first.
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].name, "f4.txt");
+        assert_eq!(recent[2].name, "f2.txt");
+        assert_eq!(recent[0].kind, "downloaded");
+        assert_eq!(recent[0].when, 1004);
     }
 
     #[test]

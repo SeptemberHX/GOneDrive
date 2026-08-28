@@ -40,6 +40,10 @@ pub const XATTR_PIN: &str = "user.gonedrive.pin";
 /// the size+mtime heuristic — is still caught before the bytes are discarded.
 pub const XATTR_QUICKXOR: &str = "user.gonedrive.quickxor";
 
+/// Transient flag: set while an upload or download is in flight, so the file
+/// manager can show a syncing emblem, and removed when it finishes.
+pub const XATTR_SYNCING: &str = "user.gonedrive.syncing";
+
 /// What a placeholder currently holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceholderState {
@@ -239,6 +243,18 @@ impl Placeholder {
     pub fn content_hash(path: &Path) -> Option<String> {
         let raw = xattr::get(path, XATTR_QUICKXOR).ok()??;
         String::from_utf8(raw).ok()
+    }
+
+    /// Flag a file as actively transferring, so the file manager shows the
+    /// syncing emblem while an upload or download is in flight, and clear it
+    /// when the transfer finishes. A transient marker layered over the durable
+    /// state, so nothing about the placeholder's real state changes.
+    pub fn set_syncing(path: &Path, syncing: bool) {
+        if syncing {
+            let _ = xattr::set(path, XATTR_SYNCING, b"1");
+        } else {
+            let _ = xattr::remove(path, XATTR_SYNCING);
+        }
     }
 
     /// Remove GOnedrive's marks, leaving an ordinary file behind.

@@ -5,8 +5,6 @@
 //! reads item state and writes directory xattrs, touching none of the transfer
 //! or reconciliation machinery.
 
-use std::path::Path;
-
 use crate::db::{Account, ItemState};
 use crate::error::Result;
 use crate::hydrate::{Placeholder, PlaceholderState};

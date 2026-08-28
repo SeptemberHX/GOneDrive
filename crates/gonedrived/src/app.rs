@@ -107,9 +107,6 @@ pub struct App {
     pub wake: Arc<Notify>,
     /// Placeholders being filled right now, keyed by absolute path.
     hydrations: Arc<RwLock<HashMap<std::path::PathBuf, InFlight>>>,
-    /// Recently finished work, newest first. Bounded, because this is a
-    /// convenience for the user rather than an audit log.
-    activity: Arc<RwLock<std::collections::VecDeque<Activity>>>,
 
     /// The privileged helper, when files-on-demand is available. Without it a
     /// placeholder is just a file full of zeroes that nothing will ever fill.
@@ -143,7 +140,6 @@ impl App {
             paused: AtomicBool::new(false),
             wake: Arc::new(Notify::new()),
             hydrations: Arc::new(RwLock::new(HashMap::new())),
-            activity: Arc::new(RwLock::new(std::collections::VecDeque::new())),
             hsm: RwLock::new(None),
             monitor: Arc::new(std::sync::Mutex::new(None)),
             events,
@@ -226,7 +222,7 @@ impl App {
         let sender = self.events.clone();
         let shared = self.status.clone();
         let hydrations = self.hydrations.clone();
-        let activity = self.activity.clone();
+        let store = self.store.clone();
 
         tokio::spawn(async move {
             let mut current = SyncStatus::idle(0);
@@ -264,7 +260,7 @@ impl App {
                                 current.transferred = 0;
                                 current.total = 0;
                                 record_activity(
-                                    &activity,
+                                    &store,
                                     match direction {
                                         Direction::Download => "downloaded",
                                         Direction::Upload => "uploaded",
@@ -275,11 +271,11 @@ impl App {
                                 .await;
                             }
                             SyncEvent::Deleted { name } => {
-                                record_activity(&activity, "deleted", name, String::new()).await;
+                                record_activity(&store, "deleted", name, String::new()).await;
                             }
                             SyncEvent::Conflict { original, copy } => {
                                 record_activity(
-                                    &activity,
+                                    &store,
                                     "conflict",
                                     original.clone(),
                                     copy.clone(),
@@ -290,7 +286,7 @@ impl App {
                             }
                             SyncEvent::Failed { name, error } => {
                                 current.last_error = error.clone();
-                                record_activity(&activity, "failed", name.clone(), error.clone())
+                                record_activity(&store, "failed", name.clone(), error.clone())
                                     .await;
                                 let _ = sender.send(DaemonEvent::ItemFailed { name, error });
                             }
@@ -298,7 +294,7 @@ impl App {
                                 current.state = "paused".into();
                                 current.last_error = reason.clone();
                                 record_activity(
-                                    &activity,
+                                    &store,
                                     "safety-stop",
                                     reason.clone(),
                                     String::new(),
@@ -347,7 +343,7 @@ impl App {
                                         .unwrap_or_default()
                                         .to_string_lossy()
                                         .into_owned();
-                                    record_activity(&activity, "downloaded", name, "按需".into())
+                                    record_activity(&store, "downloaded", name, "按需".into())
                                         .await;
                                 }
                                 let _ = sender.send(DaemonEvent::HydrationFinished {
@@ -558,7 +554,17 @@ impl App {
 
     /// What was synced recently, newest first.
     pub async fn recent_activity(&self) -> Vec<Activity> {
-        self.activity.read().await.iter().cloned().collect()
+        self.store
+            .recent_activity(ACTIVITY_LIMIT as i64)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| Activity {
+                kind: row.kind,
+                name: row.name,
+                detail: row.detail,
+                when: row.when,
+            })
+            .collect()
     }
 
     /// Placeholders being filled right now.
@@ -958,20 +964,11 @@ fn build_http_client() -> Result<reqwest::Client> {
 /// How many finished items the activity list keeps.
 const ACTIVITY_LIMIT: usize = 100;
 
-async fn record_activity(
-    activity: &Arc<RwLock<std::collections::VecDeque<Activity>>>,
-    kind: &str,
-    name: String,
-    detail: String,
-) {
-    let mut guard = activity.write().await;
-    guard.push_front(Activity {
-        kind: kind.to_string(),
-        name,
-        detail,
-        when: time::OffsetDateTime::now_utc().unix_timestamp(),
-    });
-    guard.truncate(ACTIVITY_LIMIT);
+async fn record_activity(store: &Store, kind: &str, name: String, detail: String) {
+    let when = time::OffsetDateTime::now_utc().unix_timestamp();
+    if let Err(e) = store.push_activity(kind, &name, &detail, when, ACTIVITY_LIMIT as i64) {
+        tracing::debug!(error = %e, "could not record activity");
+    }
 }
 
 /// Processes that read files in order to *describe* them — type sniffing,
