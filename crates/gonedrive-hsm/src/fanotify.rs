@@ -252,3 +252,55 @@ fn read_range(mut tail: &[u8]) -> Option<(u64, u64)> {
 fn path_of(fd: &OwnedFd) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The raw bytes of a `#[repr(C)]` value, as the kernel would lay them out.
+    fn as_bytes<T: Copy>(v: &T) -> Vec<u8> {
+        // SAFETY: reading `size_of::<T>()` bytes of a value we hold by ref.
+        unsafe {
+            std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>())
+        }
+        .to_vec()
+    }
+
+    fn range_record(offset: u64, count: u64) -> RangeInfo {
+        RangeInfo {
+            header: InfoHeader {
+                info_type: FAN_EVENT_INFO_TYPE_RANGE,
+                pad: 0,
+                len: std::mem::size_of::<RangeInfo>() as u16,
+            },
+            pad: 0,
+            offset,
+            count,
+        }
+    }
+
+    #[test]
+    fn read_range_decodes_a_range_record() {
+        let buf = as_bytes(&range_record(4096, 65536));
+        assert_eq!(read_range(&buf), Some((4096, 65536)));
+    }
+
+    #[test]
+    fn read_range_skips_records_of_other_types_to_find_the_range() {
+        // A leading non-range info record, then the range: the parser must walk
+        // past the first by its len and still find the second.
+        let other = InfoHeader { info_type: 1, pad: 0, len: 8 };
+        let mut buf = as_bytes(&other);
+        buf.extend_from_slice(&[0u8; 4]); // pad the 'other' record out to len 8
+        buf.extend_from_slice(&as_bytes(&range_record(512, 16)));
+        assert_eq!(read_range(&buf), Some((512, 16)));
+    }
+
+    #[test]
+    fn read_range_returns_none_for_empty_or_rangeless_buffers() {
+        assert_eq!(read_range(&[]), None);
+        // A record whose declared len is zero must not loop forever.
+        let zero = InfoHeader { info_type: 1, pad: 0, len: 0 };
+        assert_eq!(read_range(&as_bytes(&zero)), None);
+    }
+}

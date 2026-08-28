@@ -579,6 +579,47 @@ mod tests {
         unsafe { libc::getuid() }
     }
 
+    // fill_from is the byte-writing core: it pwrites fetched content into the
+    // placeholder at an explicit offset. A wrong offset or an over-write here
+    // corrupts data beneath every core-level safety net, so it is pinned down.
+
+    #[test]
+    fn fill_from_places_content_at_offset_zero_exactly() {
+        use std::os::unix::io::OwnedFd;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("staged");
+        let target = dir.path().join("placeholder");
+        std::fs::write(&source, b"the real content").unwrap();
+        // A sparse placeholder the size of the file: zeros to be filled.
+        std::fs::write(&target, vec![0u8; 16]).unwrap();
+
+        let fd: OwnedFd = std::fs::OpenOptions::new().write(true).open(&target).unwrap().into();
+        let n = fill_from(&source, &fd, 0).unwrap();
+        assert_eq!(n, 16);
+        assert_eq!(std::fs::read(&target).unwrap(), b"the real content");
+    }
+
+    #[test]
+    fn fill_from_lands_a_range_at_its_offset_and_leaves_the_rest() {
+        use std::os::unix::io::OwnedFd;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("staged");
+        let target = dir.path().join("placeholder");
+        std::fs::write(&source, b"MIDDLE").unwrap();
+        // 32 bytes of 'A'; the fill must touch only [10, 16).
+        std::fs::write(&target, vec![b'A'; 32]).unwrap();
+
+        let fd: OwnedFd = std::fs::OpenOptions::new().write(true).open(&target).unwrap().into();
+        let n = fill_from(&source, &fd, 10).unwrap();
+        assert_eq!(n, 6);
+
+        let got = std::fs::read(&target).unwrap();
+        assert_eq!(&got[..10], &[b'A'; 10], "bytes before the offset are untouched");
+        assert_eq!(&got[10..16], b"MIDDLE", "the range landed at its offset");
+        assert_eq!(&got[16..], &[b'A'; 16], "bytes after the range are untouched");
+        assert_eq!(got.len(), 32, "the file was not grown past its size");
+    }
+
     #[test]
     fn the_daemons_own_access_is_never_questioned() {
         // The deadlock this prevents: the daemon writes to a watched file,
