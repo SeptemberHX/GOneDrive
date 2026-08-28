@@ -948,12 +948,12 @@ fn tile(icon: &str, variant: &str) -> gtk::Box {
     image.set_pixel_size(18);
     image.set_hexpand(true);
     image.set_vexpand(true);
-    // A fixed 34×34 square, centred in the prefix slot rather than stretched
-    // to fill it.
+    // A fixed 34×34 square, flush to the left of its slot rather than stretched
+    // to fill it or floating in the middle.
     let b = gtk::Box::builder()
         .width_request(34)
         .height_request(34)
-        .halign(gtk::Align::Center)
+        .halign(gtk::Align::Start)
         .valign(gtk::Align::Center)
         .build();
     b.add_css_class("od-tile");
