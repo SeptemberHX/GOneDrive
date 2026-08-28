@@ -404,10 +404,17 @@ impl App {
     ) -> Result<(std::path::PathBuf, u64, bool)> {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let browsing = is_browsing_reader(reader);
+        // For a consumer, only the very first head-read is served as a range.
+        // Coming back for offset > 0 is the signature of sequential reading —
+        // `cat`, `cp`, a hashing tool — and serving那 32 KiB at a time turns a
+        // 2 MB file into sixty-odd cloud round-trips, observed live. One read
+        // past the head escalates to full hydration.
         let partial = allow_partial
             && length > 0
             && (browsing
-                || (length <= Self::PARTIAL_HYDRATION_CEILING && offset + length < size));
+                || (offset == 0
+                    && length <= Self::PARTIAL_HYDRATION_CEILING
+                    && length < size));
 
         if partial {
             let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
@@ -807,7 +814,15 @@ impl App {
                 _ = tokio::time::sleep(interval) => {}
                 _ = self.wake.notified() => {
                     // A local change or an explicit request: resume the tight
-                    // cadence rather than staying backed off.
+                    // cadence rather than staying backed off. The extra beat
+                    // matters: a pass's own writes (deletes landing, downloads
+                    // renaming into place) re-arm the wake, and without it the
+                    // loop tail-chases itself at full speed until the queue
+                    // drains — a delta request every 700ms, observed live.
+                    tokio::time::sleep(Duration::from_millis(
+                        self.config.local_debounce_ms,
+                    ))
+                    .await;
                     interval = base;
                 }
             }

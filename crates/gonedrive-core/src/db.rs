@@ -604,6 +604,35 @@ impl Store {
         })
     }
 
+    /// Whether the nearest explicit retention choice on this item's chain is
+    /// an exclusion.
+    ///
+    /// This is a different question from "is content wanted": an account whose
+    /// *default* is online-only still expects a local deletion to mean delete
+    /// — the default never expressed an opinion about this item. Only a choice
+    /// the user actually made ("don't keep this folder here") turns a missing
+    /// local file into something other than a deletion.
+    pub fn explicitly_excluded(&self, id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let found: Option<String> = conn
+                .query_row(
+                    "WITH RECURSIVE chain(id, parent_id, pin_state, depth) AS (
+                         SELECT id, parent_id, pin_state, 0 FROM items WHERE id = ?1
+                         UNION ALL
+                         SELECT i.id, i.parent_id, i.pin_state, chain.depth + 1
+                           FROM items i JOIN chain ON i.id = chain.parent_id
+                     )
+                     SELECT pin_state FROM chain
+                      WHERE pin_state <> 'inherit'
+                      ORDER BY depth LIMIT 1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(found.as_deref() == Some("unpinned"))
+        })
+    }
+
     /// Every file in a subtree. Used when a newly pinned folder has to have its
     /// already-enumerated contents queued for download.
     pub fn files_in_subtree(&self, id: &str) -> Result<Vec<ItemRecord>> {

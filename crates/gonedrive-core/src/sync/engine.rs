@@ -138,6 +138,9 @@ pub struct Engine {
     account_id: String,
     events: broadcast::Sender<SyncEvent>,
     hostname: String,
+    /// Names already reported as unsyncable, so a file that cannot be renamed
+    /// is mentioned once rather than on every pass forever.
+    reported_skips: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Directories whose timestamp has to be re-applied at the end of the pass.
     ///
     /// It cannot be done as each one is written, because mtime updates cascade:
@@ -162,6 +165,7 @@ impl Engine {
             account_id,
             events,
             hostname: hostname(),
+            reported_skips: std::sync::Mutex::new(std::collections::HashSet::new()),
             dir_stamps: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -651,7 +655,18 @@ impl Engine {
         }
 
         let by_inode = self.store.items_by_inode(&self.account_id)?;
-        let mut stack = vec![(root_id, account.root_local_path.clone())];
+        // `None` marks a directory that has no remote record yet — freshly
+        // created locally. It is still walked: the far end of a rename often
+        // lands inside exactly such a directory, and skipping it is how a
+        // move used to decay into a remote delete plus a re-upload.
+        let mut stack: Vec<(Option<String>, PathBuf)> =
+            vec![(Some(root_id), account.root_local_path.clone())];
+        // Decisions that need the *whole* walk before they are safe:
+        // a rename that crosses directories shows up as "new file here" in one
+        // directory and "record missing" in another, and acting on either half
+        // early turns a move into a remote delete plus a full re-upload.
+        let mut appeared: Vec<(std::path::PathBuf, LocalStat)> = Vec::new();
+        let mut vanished: Vec<ItemRecord> = Vec::new();
 
         while let Some((parent_id, dir)) = stack.pop() {
             let entries = match read_dir(&dir) {
@@ -661,12 +676,15 @@ impl Engine {
                     continue;
                 }
             };
-            let known: HashMap<String, ItemRecord> = self
-                .store
-                .children(&self.account_id, &parent_id)?
-                .into_iter()
-                .map(|item| (crate::names::fold_case(&item.name), item))
-                .collect();
+            let known: HashMap<String, ItemRecord> = match &parent_id {
+                Some(parent_id) => self
+                    .store
+                    .children(&self.account_id, parent_id)?
+                    .into_iter()
+                    .map(|item| (crate::names::fold_case(&item.name), item))
+                    .collect(),
+                None => HashMap::new(),
+            };
 
             for (name, stat) in &entries {
                 let record = known.get(&crate::names::fold_case(name));
@@ -678,11 +696,12 @@ impl Engine {
                 // upload, so they only recurse (below) and refresh marks.
                 let content_is_ours = record.is_none_or(|r| {
                     !matches!(r.state, ItemState::Dehydrated | ItemState::Hydrating)
-                });
+                }) && (stat.is_dir
+                    || Placeholder::state(&dir.join(name)) != PlaceholderState::Dehydrated);
                 if !content_is_ours {
                     if let Some(record) = record {
                         if stat.is_dir {
-                            stack.push((record.id.clone(), dir.join(name)));
+                            stack.push((Some(record.id.clone()), dir.join(name)));
                         }
                     }
                     continue;
@@ -690,37 +709,23 @@ impl Engine {
 
                 match decide_local(name, record, Some(stat)) {
                     LocalAction::CreateRemoteFolder => {
+                        // A parent that is itself new has no id to record yet;
+                        // the runner resolves it from the path once the parent
+                        // exists — the queue preserves creation order.
                         self.store.enqueue(
                             &self.account_id,
                             OpKind::CreateRemoteFolder,
-                            Some(&parent_id),
+                            parent_id.as_deref(),
                             Some(&dir.join(name)),
                             None,
                         )?;
+                        stack.push((None, dir.join(name)));
                     }
                     LocalAction::UploadNew => {
-                        // Before treating it as new, check whether it is simply
-                        // a file we already know that the user moved here.
-                        match by_inode.get(&stat.ino) {
-                            Some(moved) if self.has_moved(&account, moved, &dir, name)? => {
-                                self.store.enqueue(
-                                    &self.account_id,
-                                    OpKind::MoveRemote,
-                                    Some(&moved.id),
-                                    Some(&dir.join(name)),
-                                    Some(&parent_id.clone()),
-                                )?;
-                            }
-                            _ => {
-                                self.store.enqueue(
-                                    &self.account_id,
-                                    OpKind::Upload,
-                                    None,
-                                    Some(&dir.join(name)),
-                                    Some(&parent_id.clone()),
-                                )?;
-                            }
-                        }
+                        // Deferred: whether this is truly new or the far end
+                        // of a rename is only knowable once the whole tree has
+                        // been walked and the vanished records collected.
+                        appeared.push((dir.join(name), *stat));
                     }
                     LocalAction::UploadModified => {
                         let id = record.map(|r| r.id.clone());
@@ -729,7 +734,7 @@ impl Engine {
                             OpKind::Upload,
                             id.as_deref(),
                             Some(&dir.join(name)),
-                            Some(&parent_id.clone()),
+                            parent_id.as_deref(),
                         )?;
                         if let Some(id) = &id {
                             self.store.set_item_state(id, ItemState::DirtyLocal)?;
@@ -737,10 +742,17 @@ impl Engine {
                     }
                     LocalAction::Skip(reason) => {
                         summary.skipped += 1;
-                        self.emit(SyncEvent::Skipped {
-                            name: name.clone(),
-                            reason: format!("{reason:?}"),
-                        });
+                        let fresh = self
+                            .reported_skips
+                            .lock()
+                            .map(|mut seen| seen.insert(name.clone()))
+                            .unwrap_or(true);
+                        if fresh {
+                            self.emit(SyncEvent::Skipped {
+                                name: name.clone(),
+                                reason: format!("{reason:?}"),
+                            });
+                        }
                     }
                     LocalAction::Nothing | LocalAction::DeleteRemote => {}
                 }
@@ -765,7 +777,7 @@ impl Engine {
                         {
                             self.mark_dir(&record.id)?;
                         }
-                        stack.push((record.id.clone(), dir.join(name)));
+                        stack.push((Some(record.id.clone()), dir.join(name)));
                     }
                 }
             }
@@ -775,6 +787,9 @@ impl Engine {
                 .iter()
                 .map(|(name, _)| crate::names::fold_case(name))
                 .collect();
+            let Some(_parent_id) = parent_id else {
+                continue; // a new directory has no records to have lost
+            };
             for (folded, record) in &known {
                 if on_disk.contains(folded) {
                     continue;
@@ -785,21 +800,71 @@ impl Engine {
                 if record.local_ino.is_none() {
                     continue;
                 }
-                // Neither is an item the user excluded: it is *supposed* to be
-                // absent locally. Reading that as a delete would propagate to
-                // the service and destroy everything the user chose not to
-                // sync, which is the exact opposite of what they asked for.
-                if !self.wants_content(Some(record), &parent_id)? {
+                // Distinguish two kinds of "not wanted here". An *explicit*
+                // exclusion ("don't keep this folder on this device") makes
+                // local absence expected — deleting remotely would destroy
+                // what the user chose not to sync. But an account-level
+                // online-only *default* never expressed an opinion about this
+                // item: it was on disk because the user put or fetched it
+                // there, and its disappearance is the user deleting it. The
+                // first guard here once ate every local deletion under the
+                // default policy, silently.
+                if self.store.explicitly_excluded(&record.id)? {
                     continue;
                 }
-                self.store.enqueue(
-                    &self.account_id,
-                    OpKind::DeleteRemote,
-                    Some(&record.id),
-                    None,
-                    None,
-                )?;
+                vanished.push(record.clone());
             }
+        }
+
+        // Pair the two halves of every rename before anything destructive:
+        // a vanished record whose inode reappeared elsewhere is one PATCH,
+        // not a remote delete plus a re-upload that forfeits the server-side
+        // version history.
+        let mut moved_ids = std::collections::HashSet::new();
+        for (path, stat) in &appeared {
+            // Parents are deliberately not recorded here: the runner resolves
+            // them from the path, because a destination directory created in
+            // this same pass has no remote id until its own queued creation
+            // has run.
+            let known = by_inode.get(&stat.ino).filter(|record| {
+                vanished.iter().any(|v| v.id == record.id)
+                    || self
+                        .has_moved(&account, record, path.parent().unwrap_or(path), "")
+                        .unwrap_or(false)
+            });
+            match known {
+                Some(record) => {
+                    moved_ids.insert(record.id.clone());
+                    self.store.enqueue(
+                        &self.account_id,
+                        OpKind::MoveRemote,
+                        Some(&record.id),
+                        Some(path),
+                        None,
+                    )?;
+                }
+                None => {
+                    self.store.enqueue(
+                        &self.account_id,
+                        OpKind::Upload,
+                        None,
+                        Some(path),
+                        None,
+                    )?;
+                }
+            }
+        }
+        for record in vanished {
+            if moved_ids.contains(&record.id) {
+                continue;
+            }
+            self.store.enqueue(
+                &self.account_id,
+                OpKind::DeleteRemote,
+                Some(&record.id),
+                None,
+                None,
+            )?;
         }
         Ok(())
     }
@@ -1257,6 +1322,21 @@ impl Engine {
             repaired += 1;
             tracing::info!(path = %path.display(), ?state, "repaired a stale hydrating record");
         }
+        // A record claiming "locally modified" for a file whose own marks say
+        // dehydrated is lying about ownership — freeing a file that was dirty
+        // at the time leaves exactly this. Left alone, the scanner re-queues
+        // an upload of it every single pass, forever, and the upload guard
+        // refuses it every single pass, forever.
+        for record in self.store.items_in_state(&self.account_id, ItemState::DirtyLocal)? {
+            let Some(path) = self.store.local_path(&account, &record.id)? else {
+                continue;
+            };
+            if Placeholder::state(&path) == PlaceholderState::Dehydrated {
+                self.store.set_item_state(&record.id, ItemState::Dehydrated)?;
+                repaired += 1;
+                tracing::info!(path = %path.display(), "repaired a dirty record over a placeholder");
+            }
+        }
         Ok(repaired)
     }
 
@@ -1609,8 +1689,12 @@ impl Engine {
         )
         .await?;
 
+        // `Inherit`, never `Pinned`: stamping uploads as always-keep silently
+        // converts everything the user ever created into pinned content. The
+        // live symptom was a deleted folder resurrecting on every delta pass —
+        // "pinned" told the applier its local absence was a hole to re-fill.
         let mut record =
-            record_from_remote(&self.account_id, &item, ItemState::Synced, PinState::Pinned);
+            record_from_remote(&self.account_id, &item, ItemState::Synced, PinState::Inherit);
         record.parent_id = Some(parent_id);
         self.store.upsert_item(&record)?;
         if let Some(local) = stat_of(&path) {
@@ -1630,14 +1714,17 @@ impl Engine {
     }
 
     async fn run_create_folder(&self, op: &PendingOp, summary: &mut SyncSummary) -> Result<()> {
-        let parent_id = op
-            .item_id
-            .as_deref()
-            .ok_or_else(|| Error::other("folder creation without a parent id"))?;
         let path = op
             .local_path
             .clone()
             .ok_or_else(|| Error::other("folder creation without a local path"))?;
+        // Queued without a parent id when the parent was itself new; by now
+        // the queue has created it, so the path resolves.
+        let parent_id = match op.item_id.as_deref() {
+            Some(id) => id.to_string(),
+            None => self.parent_id_for(&self.account()?, &path)?,
+        };
+        let parent_id = parent_id.as_str();
         let name = path
             .file_name()
             .ok_or_else(|| Error::other("folder path has no name"))?
@@ -1646,7 +1733,7 @@ impl Engine {
 
         let item = self.graph.create_folder(parent_id, &name).await?;
         let mut record =
-            record_from_remote(&self.account_id, &item, ItemState::Synced, PinState::Pinned);
+            record_from_remote(&self.account_id, &item, ItemState::Synced, PinState::Inherit);
         record.parent_id = Some(parent_id.to_string());
         self.store.upsert_item(&record)?;
         if let Some(local) = stat_of(&path) {
@@ -1682,17 +1769,29 @@ impl Engine {
             .local_path
             .clone()
             .ok_or_else(|| Error::other("move operation without a local path"))?;
-        let new_parent = op.payload.as_deref();
+        // The parent is resolved from the path at run time, not from the
+        // payload captured at queue time: when the destination directory was
+        // created in the same pass, its remote id did not exist yet when this
+        // operation was queued.
+        let new_parent = self.parent_id_for(&self.account()?, &path)?;
         let new_name = path.file_name().map(|n| n.to_string_lossy().into_owned());
 
         let item = self
             .graph
-            .move_item(item_id, new_parent, new_name.as_deref())
+            .move_item(item_id, Some(&new_parent), new_name.as_deref())
             .await?;
         let mut record =
-            record_from_remote(&self.account_id, &item, ItemState::Synced, PinState::Pinned);
-        record.parent_id = new_parent.map(str::to_string).or(record.parent_id);
+            record_from_remote(&self.account_id, &item, ItemState::Synced, PinState::Inherit);
+        record.parent_id = Some(new_parent);
         self.store.upsert_item(&record)?;
+        if let Some(local) = stat_of(&path) {
+            self.store.set_local_stat(
+                &record.id,
+                OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
+                Some(local.size),
+                Some(local.ino),
+            )?;
+        }
         summary.uploaded += 1;
         Ok(())
     }
