@@ -18,5 +18,5 @@
 - **首次发现**：2026-08-28（探索发现）
 - **现象**：xattr 与 `items.state` 可分歧；`repair_states` 是唯一对账者，Nautilus 直接读 xattr、守护进程读 DB，崩溃恢复窗口内两者可显示不同状态。更危险的是失同步会让 dehydrate 的 `state==Dehydrated` 捷径跳过护栏而打真实字节。
 - **根因**：占位符状态双权威（xattr 权威用于恢复，DB 用于决策），无内容级交叉校验。
-- **修复**：Phase 1.6——dehydrate 的 Dehydrated 捷径也过哈希门禁；`repair_states` 降级前校验文件确非满内容。（进行中）
-- **回归测试**：待补（Phase 1.6）。
+- **修复（已完成，随 DL-004）**：dehydrate 护栏改为内容哈希驱动的 `Engine::local_content_unsynced`——**不再信任 DB 的 Dehydrated 状态**：满分配文件必须哈希匹配已录内容才放行，故 xattr/DB 失同步（DB 说 Dehydrated 但磁盘满内容且未上传）不再能绕过护栏打真实字节。主条目见 [data-loss.md](data-loss.md) DL-004。
+- **回归测试**：`freeing_space_refuses_an_in_place_edit_that_kept_size_and_mtime`（同一门禁覆盖失同步机制）。

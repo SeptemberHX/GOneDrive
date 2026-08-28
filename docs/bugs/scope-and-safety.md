@@ -18,7 +18,7 @@
 - **首次发现**：2026-08-28（探索发现，测试缺口）
 - **现象**：`service.rs::relative()` 拒绝越出同步根的路径、拒绝整盘 dehydrate，但无测试守护，回归风险高。
 - **根因**：安全护栏存在但零测试。
-- **修复**：Phase 3 补 `service.rs` 的单测（越根路径拒绝、整盘 dehydrate `AccessDenied`）。
-- **回归测试**：待补（Phase 3）。
+- **修复**：将 `relative()` 的纯逻辑抽为 `confine_to_root`（`crates/gonedrived/src/service.rs`）并补单测——越根路径（含共享前缀的兄弟目录 `OneDrive-evil`、无关绝对路径、父目录）判 `Outside`；同步根自身（含结尾斜杠）判 `WholeRoot`。
+- **回归测试**：`crates/gonedrived/src/service.rs::a_path_outside_the_root_is_refused`、`::the_sync_root_itself_is_refused_so_one_click_cannot_sweep_the_drive`、`::a_path_inside_the_root_is_confined_to_a_relative_one`。
 
 <!-- 关联 data-loss 的 DL-001 批量删除阀也是作用域安全的一部分，主条目见 data-loss.md。 -->
