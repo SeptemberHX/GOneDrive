@@ -1405,9 +1405,12 @@ impl Engine {
                     std::fs::create_dir_all(&path)?;
                 }
                 // Badge the folder so the file manager shows online/local on
-                // directories, not only files. Aggregate refined below once
-                // materialisation knows which subtrees hold content.
-                let _ = Placeholder::mark_dir(&path, PlaceholderState::Dehydrated, &folder.id);
+                // directories, not only files. Unconditional so a tree
+                // materialised by an earlier version — its folders unbadged —
+                // gets marked on the next run. The aggregate is refined below.
+                if Placeholder::state(&path) == PlaceholderState::Unmanaged {
+                    let _ = Placeholder::mark_dir(&path, PlaceholderState::Dehydrated, &folder.id);
+                }
             }
         }
 
