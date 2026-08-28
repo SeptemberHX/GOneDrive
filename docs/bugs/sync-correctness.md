@@ -27,6 +27,13 @@
 - **修复**：Phase 3——`fold_case` 单测 + 集成场景。
 - **回归测试**：待补（Phase 3）。
 
+## SC-005 · 上传断点续传路径无集成测试（"未证明即隐患"）
+
+- **首次发现**：2026-08-28（探索发现，测试缺口）
+- **现象**：多分片断点续传（`transfer.rs` `resume_or_create` + `nextExpectedRanges`）此前只有 DB 持久化单测，没有端到端集成测试；断点/重试失败会导致截断或重复上传。
+- **修复**：补两条 wiremock 集成测试——多分片上传完整走通、以及**从已提交偏移续传而非重启**（`createUploadSession` 断言 `expect(0)` 证明未重开会话）。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_large_upload_completes_in_multiple_chunks`、`::an_interrupted_upload_resumes_from_its_committed_offset`。
+
 ## SC-004 · 上传无 If-Match → 拉取与推送间他端改动被静默覆盖
 
 - **首次发现**：2026-08-28（探索发现）

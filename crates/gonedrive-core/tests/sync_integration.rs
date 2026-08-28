@@ -15,7 +15,7 @@ use gonedrive_core::graph::GraphClient;
 use gonedrive_core::sync::engine::{Engine, SyncSummary};
 use gonedrive_core::TokenSource;
 use serde_json::{json, Value};
-use wiremock::matchers::{header_exists, method, path, path_regex, query_param};
+use wiremock::matchers::{header, header_exists, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ACCOUNT: &str = "acct";
@@ -1565,6 +1565,103 @@ async fn an_upload_that_would_overwrite_a_newer_remote_becomes_a_conflict() {
         .collect();
     assert_eq!(copies.len(), 1, "our local edit must be preserved: {copies:?}");
     assert_eq!(h.read(&copies[0]), "my local edit");
+}
+
+/// The DriveItem a completed chunk upload returns.
+fn uploaded_big_item() -> Value {
+    json!({
+        "id": "NEW", "name": "big.bin", "size": 400_000,
+        "cTag": "cu", "eTag": "eu",
+        "file": {"mimeType": "application/octet-stream"},
+        "parentReference": {"driveId": "drive1", "id": ROOT},
+        "fileSystemInfo": {"lastModifiedDateTime": "2026-08-28T00:00:00Z"}
+    })
+}
+
+async fn chunked_upload_harness() -> Harness {
+    let config = Config {
+        upload_session_threshold: 1000,
+        upload_chunk_size: 327_680, // 320 KiB
+        ..Config::default()
+    };
+    let h = Harness::with_config(config).await;
+    h.mock_delta(None, vec![root_item()], "v1").await;
+    h.sync().await;
+    std::fs::write(h.path("big.bin"), vec![7u8; 400_000]).unwrap();
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    h
+}
+
+#[tokio::test]
+async fn a_large_upload_completes_in_multiple_chunks() {
+    let h = chunked_upload_harness().await;
+    let upload_url = format!("{}/session-a", h.server.uri());
+    Mock::given(method("POST"))
+        .and(path_regex(r"createUploadSession$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"uploadUrl": upload_url.clone(), "expirationDateTime": "2030-01-01T00:00:00Z"}),
+        ))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/session-a"))
+        .and(header("Content-Range", "bytes 0-327679/400000"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(
+            json!({"uploadUrl": upload_url, "nextExpectedRanges": ["327680-399999"]}),
+        ))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/session-a"))
+        .and(header("Content-Range", "bytes 327680-399999/400000"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(uploaded_big_item()))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.uploaded, 1, "the chunked upload should complete");
+    assert!(h.store.item("NEW").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn an_interrupted_upload_resumes_from_its_committed_offset() {
+    // A previous attempt got the first chunk in before dying, leaving a
+    // persisted session. The next pass must resume from there — send only the
+    // tail — not restart the whole upload.
+    let h = chunked_upload_harness().await;
+    let file = h.path("big.bin");
+    let upload_url = format!("{}/resume-here", h.server.uri());
+    h.store
+        .save_upload_session(&gonedrive_core::db::UploadSessionRecord {
+            key: file.to_string_lossy().into_owned(),
+            account_id: ACCOUNT.into(),
+            upload_url: upload_url.clone(),
+            expires_at: None,
+            committed_offset: 327_680,
+            total_size: 400_000,
+        })
+        .unwrap();
+
+    // Restarting would create a new session; a resume must not. expect(0)
+    // fails the test on drop if it is ever called.
+    Mock::given(method("POST"))
+        .and(path_regex(r"createUploadSession$"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&h.server)
+        .await;
+    // Only the tail remains.
+    Mock::given(method("PUT"))
+        .and(path("/resume-here"))
+        .and(header("Content-Range", "bytes 327680-399999/400000"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(uploaded_big_item()))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.uploaded, 1, "the upload should resume from its offset and complete");
+    assert!(h.store.item("NEW").unwrap().is_some());
 }
 
 #[tokio::test]
