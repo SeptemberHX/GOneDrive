@@ -20,16 +20,24 @@ RestartSec=10
 StartLimitBurst=5
 StartLimitIntervalSec=300
 
-# It only ever needs the user's own files and the network.
+# Hardening — seccomp/capability class only, deliberately NOT mount-namespace
+# class. The daemon connects to the privileged helper's root-owned socket at
+# /run/gonedrive/hsm.sock; in a *user* manager systemd implements every
+# mount-namespace protection (ProtectSystem, ProtectHome, PrivateTmp,
+# ProtectKernelTunables, ProtectControlGroups, …) via a user namespace, inside
+# which that root-owned socket is remapped to an unmapped uid and connect()
+# fails with EACCES — files-on-demand then silently goes dark. So we keep the
+# protections that need no mount namespace and drop the ones that do; a user
+# daemon already has full access to the user's own data, which is the thing
+# actually worth guarding, so ProtectSystem buys little here anyway.
 NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-write
-ProtectKernelTunables=true
-ProtectControlGroups=true
-RestrictNamespaces=true
+CapabilityBoundingSet=
 RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
 MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
