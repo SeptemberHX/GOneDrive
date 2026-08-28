@@ -649,6 +649,27 @@ impl Store {
         })
     }
 
+    /// Whether the nearest explicit choice on this item's chain is "pinned".
+    pub fn explicitly_pinned(&self, id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let found: Option<String> = conn
+                .query_row(
+                    "WITH RECURSIVE chain(id, parent_id, pin_state, depth) AS (
+                         SELECT id, parent_id, pin_state, 0 FROM items WHERE id = ?1
+                         UNION ALL
+                         SELECT i.id, i.parent_id, i.pin_state, chain.depth + 1
+                           FROM items i JOIN chain ON i.id = chain.parent_id
+                     )
+                     SELECT pin_state FROM chain
+                      WHERE pin_state <> 'inherit' ORDER BY depth LIMIT 1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(found.as_deref() == Some("pinned"))
+        })
+    }
+
     /// Every file in a subtree. Used when a newly pinned folder has to have its
     /// already-enumerated contents queued for download.
     pub fn files_in_subtree(&self, id: &str) -> Result<Vec<ItemRecord>> {

@@ -676,7 +676,23 @@ impl Engine {
 
     /// Choose whether a path's content is kept on this device.
     pub fn set_pin(&self, relative: &Path, pin: PinState) -> Result<PinOutcome> {
-        self.selection().set_pin(relative, pin)
+        let outcome = self.selection().set_pin(relative, pin)?;
+        // A pin/unpin changes what a folder should show: pinned turns it into a
+        // "always keep" badge outright, unpinning may drop it back to cloud.
+        // Recompute the target folder and let the change ripple up.
+        if let Ok(account) = self.account() {
+            if let Some(root_id) = account.root_item_id.clone() {
+                if let Ok(Some(target)) =
+                    self.store.item_at_path(&self.account_id, &root_id, relative)
+                {
+                    if target.is_folder {
+                        let _ = self.recompute_folder_mark(&account, &target.id);
+                    }
+                    let _ = self.refresh_folder_ancestors(&account, &target.id);
+                }
+            }
+        }
+        Ok(outcome)
     }
 
     fn selection(&self) -> Selection {
@@ -1001,6 +1017,8 @@ impl Engine {
             )?;
         }
         self.store.set_item_state(&item_id, ItemState::Synced)?;
+        let account = self.account()?;
+        let _ = self.refresh_folder_ancestors(&account, &item_id);
         Ok(offset)
     }
 
@@ -1180,7 +1198,7 @@ impl Engine {
         }
         self.store.set_item_state(&item_id, ItemState::Synced)?;
         let account = self.account()?;
-        self.mark_ancestors_local(&account, &item_id)?;
+        self.refresh_folder_ancestors(&account, &item_id)?;
         Ok(())
     }
 
@@ -1240,6 +1258,7 @@ impl Engine {
             transfer::set_mtime(path, mtime)?;
         }
         self.store.set_item_state(&item_id, ItemState::Dehydrated)?;
+        let _ = self.refresh_folder_ancestors(&account, &item_id);
         Ok(freed)
     }
 
@@ -1449,13 +1468,11 @@ impl Engine {
             }
         }
 
-        // Any folder that already holds downloaded content is marked local, up
-        // the whole chain — a parent of a downloaded file is "available" too.
-        for record in self.store.items_in_state(&self.account_id, ItemState::Synced)? {
-            if record.is_folder || record.local_ino.is_none() {
-                continue;
-            }
-            self.mark_ancestors_local(&account, &record.id)?;
+        // Compute folder badges bottom-up: a folder is a check only if every
+        // child is local. `folders` is shallowest-first, so reversing gives
+        // deepest-first — each folder is decided after its subfolders are.
+        for folder in folders.iter().rev() {
+            let _ = self.recompute_folder_mark(&account, &folder.id);
         }
 
         // Directory timestamps last: creating children moved them off the
@@ -1475,24 +1492,71 @@ impl Engine {
         Ok(watch)
     }
 
-    /// Badge every ancestor directory of an item as holding local content.
+    /// Recompute a folder's badge from its direct children and return whether
+    /// it changed.
     ///
-    /// Stops climbing at the first directory already marked local: if it is,
-    /// everything above it already is too, so a hydration never walks the
-    /// whole chain to the root more than once.
-    fn mark_ancestors_local(&self, account: &Account, item_id: &str) -> Result<()> {
+    /// The rule the user expects, and Windows uses: a folder is "available on
+    /// this device" (a check) only when *everything* inside is here — every
+    /// file downloaded, every subfolder itself fully local — or when it was
+    /// explicitly kept. A folder with some content still in the cloud shows the
+    /// cloud, because opening it may still need the network. "Any one file is
+    /// local" is not enough.
+    fn recompute_folder_mark(&self, account: &Account, folder_id: &str) -> Result<bool> {
+        let Some(path) = self.store.local_path(account, folder_id)? else {
+            return Ok(false);
+        };
+        if !path.is_dir() {
+            return Ok(false);
+        }
+        // An explicit "always keep on this device" wins outright.
+        if self.store.explicitly_pinned(folder_id)? {
+            let changed = Placeholder::state(&path) != PlaceholderState::Hydrated;
+            let _ = Placeholder::mark_dir(&path, PlaceholderState::Hydrated, folder_id);
+            let _ = Placeholder::set_pin(&path, "pinned");
+            return Ok(changed);
+        }
+
+        let mut all_local = true;
+        for child in self.store.children(&self.account_id, folder_id)? {
+            let local = if child.is_folder {
+                // A subfolder counts as local only if it, too, is fully local.
+                self.store
+                    .local_path(account, &child.id)?
+                    .map(|p| Placeholder::state(&p) == PlaceholderState::Hydrated)
+                    .unwrap_or(false)
+            } else {
+                child.state == ItemState::Synced && child.local_ino.is_some()
+            };
+            if !local {
+                all_local = false;
+                break;
+            }
+        }
+
+        let target = if all_local {
+            PlaceholderState::Hydrated
+        } else {
+            PlaceholderState::Dehydrated
+        };
+        let changed = Placeholder::state(&path) != target;
+        if changed {
+            let _ = Placeholder::mark_dir(&path, target, folder_id);
+        }
+        Ok(changed)
+    }
+
+    /// Recompute the badges of an item's ancestor folders after its state
+    /// changed, stopping as soon as one is unchanged — nothing above a folder
+    /// whose own badge did not move can have moved either.
+    fn refresh_folder_ancestors(&self, account: &Account, item_id: &str) -> Result<()> {
         let mut current = self.store.item(item_id)?.and_then(|i| i.parent_id);
         while let Some(id) = current {
             let Some(folder) = self.store.item(&id)? else { break };
             if !folder.is_folder {
                 break;
             }
-            let Some(path) = self.store.local_path(account, &id)? else { break };
-            if path.is_dir() {
-                if Placeholder::state(&path) == PlaceholderState::Hydrated {
-                    break;
-                }
-                let _ = Placeholder::mark_dir(&path, PlaceholderState::Hydrated, &id);
+            if !self.recompute_folder_mark(account, &id)? {
+                break;
             }
             current = folder.parent_id;
         }

@@ -2031,3 +2031,101 @@ async fn a_remote_change_to_a_placeholder_refreshes_it_silently() {
         .collect();
     assert!(copies.is_empty(), "a placeholder change must not conflict-copy");
 }
+
+#[tokio::test]
+async fn a_folder_is_a_check_only_when_everything_in_it_is_local() {
+    // The user's correction: a folder shows the check only if it was kept, or
+    // if every file inside is downloaded — not merely because one file is.
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "混合"),
+            file("F1", "D1", "a.txt", "c1", 5, "2026-08-20T10:00:00Z"),
+            file("F2", "D1", "b.txt", "c1", 5, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"aaaaa").await;
+    h.mock_download("F2", b"bbbbb").await;
+    h.sync().await;
+
+    // Materialise so the folder gets a mark, then free everything: cloud.
+    h.engine.materialize_all(|_, _| true).unwrap();
+    h.engine.free_space(Path::new("混合")).unwrap();
+    assert_eq!(
+        Placeholder::state(&h.path("混合")),
+        PlaceholderState::Dehydrated,
+        "an all-online folder is cloud"
+    );
+
+    // Hydrate just one of the two files — folder must STAY cloud, because the
+    // other is still online. This is the exact case the old logic got wrong.
+    h.server.reset().await;
+    h.mock_download("F1", b"aaaaa").await;
+    h.engine.hydrate(&h.path("混合/a.txt")).await.unwrap();
+    assert_eq!(
+        Placeholder::state(&h.path("混合")),
+        PlaceholderState::Dehydrated,
+        "one local file out of two must not make the folder a check"
+    );
+
+    // Hydrate the second — now everything is local, folder becomes a check.
+    h.server.reset().await;
+    h.mock_download("F2", b"bbbbb").await;
+    h.engine.hydrate(&h.path("混合/b.txt")).await.unwrap();
+    assert_eq!(
+        Placeholder::state(&h.path("混合")),
+        PlaceholderState::Hydrated,
+        "all files local => folder is a check"
+    );
+
+    // Free one again — back to cloud.
+    h.engine.free_space(Path::new("混合/a.txt")).unwrap();
+    assert_eq!(
+        Placeholder::state(&h.path("混合")),
+        PlaceholderState::Dehydrated
+    );
+}
+
+#[tokio::test]
+async fn an_explicitly_pinned_folder_is_a_check_even_while_online() {
+    // "Always keep on this device" shows the check immediately, before its
+    // contents have finished downloading.
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "留存"),
+            file("F1", "D1", "big.bin", "c1", 9_000_000, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.sync().await;
+    h.engine.materialize_all(|_, _| true).unwrap();
+    assert_eq!(
+        Placeholder::state(&h.path("留存")),
+        PlaceholderState::Dehydrated
+    );
+
+    // Pin it (no download mock needed to observe the badge).
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    static BIG: &[u8] = &[0u8; 9_000_000];
+    h.mock_download("F1", BIG).await;
+    h.engine.set_pin(Path::new("留存"), PinState::Pinned).unwrap();
+
+    assert_eq!(
+        Placeholder::state(&h.path("留存")),
+        PlaceholderState::Hydrated,
+        "a pinned folder is a check right away"
+    );
+}
