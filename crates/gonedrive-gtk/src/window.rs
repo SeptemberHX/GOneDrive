@@ -94,7 +94,15 @@ impl Ui {
              switch:checked{background-color:#0F80D8;}\
              .od-primary{background-color:#0F80D8;color:#ffffff;}\
              .od-primary:hover{background-color:#2a90e0;}\
-             .od-primary:active{background-color:#0a63b4;}",
+             .od-primary:active{background-color:#0a63b4;}\
+             .od-tile{border-radius:9px;}\
+             .od-tile>image{color:#ffffff;}\
+             .od-tile-blue{background:linear-gradient(160deg,#1E88D8,#0A63B4);}\
+             .od-tile-green{background:linear-gradient(160deg,#2e7d51,#245f40);}\
+             .od-tile-grey{background:linear-gradient(160deg,#4a4a4d,#37373a);}\
+             .od-tile-folder{background:linear-gradient(160deg,#3a6ea8,#2b5486);}\
+             .od-tile-red{background:linear-gradient(160deg,#a33a2b,#7e2b20);}\
+             .od-tile-amber{background:linear-gradient(160deg,#9a7b2b,#6f5520);}",
         );
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
@@ -837,21 +845,22 @@ impl Ui {
                 format!("{path}/{}", entry.name)
             };
 
-            // Local vs. online-only state, shown up front so the user can see
-            // at a glance what is taking up space.
-            let state = if entry.selected {
-                if entry.explicit {
-                    "● 本机"
-                } else {
-                    "● 本机 · 随上级"
-                }
+            // Local vs. online-only state, shown up front with a coloured dot
+            // so the user can see at a glance what is taking up space. The
+            // subtitle is our own string, so the markup is safe.
+            let (dot, word, extra) = if entry.selected {
+                (
+                    "<span foreground='#5bd98a'>●</span>",
+                    "本机",
+                    if entry.explicit { "" } else { " · 随上级" },
+                )
             } else {
-                "☁ 仅在线"
+                ("<span foreground='#4aa3e8'>☁</span>", "仅在线", "")
             };
             let size = if entry.is_folder {
-                format!("{state} · {} 项 · {}", entry.files, human(entry.bytes))
+                format!("{dot} {word}{extra} · {} 项 · {}", entry.files, human(entry.bytes))
             } else {
-                format!("{state} · {}", human(entry.bytes))
+                format!("{dot} {word}{extra} · {}", human(entry.bytes))
             };
 
             let row = adw::ActionRow::builder()
@@ -860,11 +869,10 @@ impl Ui {
                 .subtitle(&size)
                 .activatable(entry.is_folder)
                 .build();
-            row.add_prefix(&gtk::Image::from_icon_name(if entry.is_folder {
-                "folder-symbolic"
-            } else {
-                "text-x-generic-symbolic"
-            }));
+            row.add_prefix(&tile(
+                if entry.is_folder { "folder-symbolic" } else { "text-x-generic-symbolic" },
+                if entry.is_folder { "od-tile-folder" } else { "od-tile-grey" },
+            ));
 
             // A navigate chevron for folders, then the keep switch. Files get an
             // empty chevron-width spacer instead, so every switch lines up in
@@ -933,6 +941,27 @@ impl Ui {
     }
 }
 
+/// A coloured rounded tile with a white symbolic icon — the list-row leading
+/// graphic from the design, replacing a bare symbolic prefix.
+fn tile(icon: &str, variant: &str) -> gtk::Box {
+    let image = gtk::Image::from_icon_name(icon);
+    image.set_pixel_size(18);
+    image.set_hexpand(true);
+    image.set_vexpand(true);
+    // A fixed 34×34 square, centred in the prefix slot rather than stretched
+    // to fill it.
+    let b = gtk::Box::builder()
+        .width_request(34)
+        .height_request(34)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    b.add_css_class("od-tile");
+    b.add_css_class(variant);
+    b.append(&image);
+    b
+}
+
 /// A button child: a symbolic icon above nothing — icon + label in a row.
 fn action_content(icon: &str, label: &str) -> gtk::Box {
     let b = gtk::Box::builder()
@@ -954,14 +983,15 @@ fn run_app_action(widget: &impl IsA<gtk::Widget>, name: &str) {
     }
 }
 
-/// One row of the activity / peek lists.
+/// One row of the activity / peek lists — a coloured directional tile, the
+/// name, and what happened with when and how big.
 fn activity_row(item: &Activity) -> adw::ActionRow {
-    let (icon, verb) = match item.kind.as_str() {
-        "downloaded" => ("folder-download-symbolic", "已下载"),
-        "uploaded" => ("send-to-symbolic", "已上传"),
-        "deleted" => ("user-trash-symbolic", "已删除"),
-        "conflict" => ("dialog-warning-symbolic", "冲突已保留两份"),
-        _ => ("dialog-error-symbolic", "失败"),
+    let (icon, variant, verb) = match item.kind.as_str() {
+        "downloaded" => ("go-down-symbolic", "od-tile-blue", "已下载"),
+        "uploaded" => ("go-up-symbolic", "od-tile-green", "已上传"),
+        "deleted" => ("user-trash-symbolic", "od-tile-grey", "已删除"),
+        "conflict" => ("dialog-warning-symbolic", "od-tile-amber", "冲突已保留两份"),
+        _ => ("dialog-error-symbolic", "od-tile-red", "失败"),
     };
     let subtitle = if item.detail.is_empty() {
         format!("{verb} · {}", relative_time(item.when))
@@ -974,7 +1004,7 @@ fn activity_row(item: &Activity) -> adw::ActionRow {
         .subtitle(&subtitle)
         .subtitle_lines(1)
         .build();
-    row.add_prefix(&gtk::Image::from_icon_name(icon));
+    row.add_prefix(&tile(icon, variant));
     row
 }
 
