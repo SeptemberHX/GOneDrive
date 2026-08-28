@@ -562,6 +562,17 @@ impl App {
         Ok(())
     }
 
+    /// Put a placeholder's mtime back after a partial range fill moved it.
+    pub async fn restore_mtime(&self, path: &std::path::Path) -> Result<()> {
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        for engine in engines {
+            if engine.restore_mtime(path).is_ok() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Fill a placeholder directly (FetchNow, the CLI, the context menu).
     ///
     /// The file may be under a kernel watch, and the daemon's writes are not

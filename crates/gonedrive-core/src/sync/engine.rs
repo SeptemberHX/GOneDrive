@@ -392,12 +392,18 @@ impl Engine {
                 let changed = existing.ctag.as_deref() != remote.ctag.as_deref()
                     || existing.size != remote.size.unwrap_or(0);
                 if changed {
+                    // Fall back to the known record time if the delta page
+                    // omitted fileSystemInfo, so a refresh never stamps the
+                    // placeholder with "now".
+                    let mtime = remote
+                        .effective_mtime()
+                        .or_else(|| existing.remote_mtime);
                     let _ = Placeholder::create(
                         &path,
                         remote.size.unwrap_or(0),
                         &remote.id,
                         remote.ctag.as_deref(),
-                        remote.effective_mtime(),
+                        mtime,
                     );
                     tracing::debug!(name = %name, "refreshed placeholder from a remote change");
                 }
@@ -1167,6 +1173,38 @@ impl Engine {
         Ok(Some(staged))
     }
 
+    /// Restore a placeholder's modification time to the record's after a
+    /// partial range fill.
+    ///
+    /// A range fill pwrites content into the sparse file, and that write moves
+    /// the mtime to the wall clock — so merely browsing a folder, or a
+    /// thumbnailer sniffing a file's head, would leave every touched file
+    /// stamped "now" instead of its real remote time. The file is still a
+    /// placeholder (`full` fills finalise through `finish_hydration`, which
+    /// already restores the time), so only the timestamp is corrected here.
+    pub fn restore_mtime(&self, path: &Path) -> Result<()> {
+        let Some(item_id) = Placeholder::item_id(path) else {
+            return Ok(());
+        };
+        let Some(record) = self.store.item(&item_id)? else {
+            return Ok(());
+        };
+        if let Some(mtime) = record.remote_mtime {
+            // Only when it actually drifted: a browsing sniff that filled
+            // nothing reports the same completion, and opening every sniffed
+            // file for writing would make folder browsing crawl. A stat is
+            // cheap and does not fault the placeholder.
+            use std::os::unix::fs::MetadataExt;
+            let drifted = std::fs::metadata(path)
+                .map(|m| (m.mtime() - mtime.unix_timestamp()).abs() > 2)
+                .unwrap_or(false);
+            if drifted {
+                transfer::set_mtime(path, mtime)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Record that a placeholder the helper just filled is now complete.
     pub fn finish_hydration(&self, path: &Path) -> Result<()> {
         self.emit(SyncEvent::HydrationFinished {
@@ -1445,7 +1483,60 @@ impl Engine {
             };
             // Already present — downloaded, or a placeholder from a prior run.
             if path.exists() {
+                // A file whose xattr claims it is downloaded while the content
+                // is still a hole is a mislabelled placeholder from an earlier
+                // bug: rebuild it as a proper placeholder with the right time,
+                // otherwise it never reads on demand and shows a wrong stamp.
+                if Placeholder::state(&path) == PlaceholderState::Hydrated {
+                    use std::os::unix::fs::MetadataExt;
+                    let hollow = std::fs::metadata(&path)
+                        .map(|m| m.len() > 4096 && m.blocks() * 512 * 4 < m.len())
+                        .unwrap_or(false);
+                    if hollow {
+                        if Placeholder::create(
+                            &path,
+                            file.size,
+                            &file.id,
+                            file.ctag.as_deref(),
+                            file.remote_mtime,
+                        )
+                        .is_ok()
+                        {
+                            let _ = self.store.set_item_state(&file.id, ItemState::Dehydrated);
+                            watch.push(path);
+                        }
+                        continue;
+                    }
+                }
                 if Placeholder::state(&path) == PlaceholderState::Dehydrated {
+                    // Self-heal a placeholder whose timestamp or size drifted
+                    // from the record — a straggler created at a moment the
+                    // remote time was not yet known keeps the materialisation
+                    // time until corrected here, and re-materialise otherwise
+                    // skips it forever.
+                    if let Some(mtime) = file.remote_mtime {
+                        use std::os::unix::fs::MetadataExt;
+                        let stale = std::fs::metadata(&path)
+                            .map(|m| {
+                                (m.mtime() - mtime.unix_timestamp()).abs() > 2
+                                    || m.len() != file.size
+                            })
+                            .unwrap_or(false);
+                        if stale {
+                            if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) != file.size {
+                                // Size changed too: rebuild the placeholder.
+                                let _ = Placeholder::create(
+                                    &path,
+                                    file.size,
+                                    &file.id,
+                                    file.ctag.as_deref(),
+                                    Some(mtime),
+                                );
+                            } else {
+                                let _ = transfer::set_mtime(&path, mtime);
+                            }
+                        }
+                    }
                     watch.push(path);
                 }
                 continue;

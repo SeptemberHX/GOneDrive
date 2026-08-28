@@ -261,11 +261,16 @@ async fn handle(
         }
         Event::Filled { ok, path, full, .. } => {
             let path = PathBuf::from(path);
-            // A range fill completes nothing: the file stays a placeholder
-            // and must keep reading as one.
             if ok && full {
                 if let Err(e) = app.finish_hydration(&path).await {
                     tracing::warn!(path = %path.display(), error = %e, "could not finalise");
+                }
+            } else if ok {
+                // A range fill completes nothing — the file stays a placeholder
+                // — but the pwrite moved its mtime to now. Put the record's time
+                // back so browsing or a thumbnail never restamps a file.
+                if let Err(e) = app.restore_mtime(&path).await {
+                    tracing::debug!(path = %path.display(), error = %e, "could not restore mtime");
                 }
             }
         }

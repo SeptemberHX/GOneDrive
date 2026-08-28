@@ -332,6 +332,32 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_fill_moves_the_mtime_and_restoring_puts_it_back() {
+        // The bug the user hit: browsing a folder or a thumbnailer sniffing a
+        // file's head fills a range, and that write stamps the file "now". The
+        // remote time must be restorable while the file stays a placeholder.
+        use crate::sync::transfer;
+        use std::os::unix::fs::MetadataExt;
+        use time::OffsetDateTime;
+
+        let dir = tmp();
+        let path = dir.path().join("doc.bin");
+        let remote = OffsetDateTime::from_unix_timestamp(1_600_000_000).unwrap();
+
+        Placeholder::create(&path, 1024 * 1024, "ITEM1", Some("c1"), Some(remote)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().mtime(), 1_600_000_000);
+
+        // A reader asks for the head — a range fill lands and bumps the time.
+        Placeholder::fill(&path, 0, b"HELLO").unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().mtime(), 1_600_000_000);
+
+        // Restoring returns the remote time; the file is still a placeholder.
+        transfer::set_mtime(&path, remote).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().mtime(), 1_600_000_000);
+        assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
+    }
+
+    #[test]
     fn dehydrating_frees_the_blocks_and_keeps_the_file() {
         let dir = tmp();
         let path = dir.path().join("big.bin");
