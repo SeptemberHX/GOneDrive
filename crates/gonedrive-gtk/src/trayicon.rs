@@ -18,18 +18,18 @@ const CLOUD: &str = r##"
     <stop offset="0" stop-color="#35B8EC"/><stop offset="1" stop-color="#0264C0"/>
   </linearGradient></defs>
   <g fill="url(#od)">
-    <ellipse cx="24" cy="31.5" rx="16" ry="9.5"/>
-    <circle cx="14.5" cy="27" r="7.8"/>
-    <circle cx="24" cy="20.5" r="10"/>
-    <circle cx="33.5" cy="26" r="8.4"/>
+    <ellipse cx="24" cy="33" rx="19" ry="11"/>
+    <circle cx="12" cy="27" r="9.5"/>
+    <circle cx="24" cy="18" r="12"/>
+    <circle cx="35" cy="26" r="10"/>
   </g>"##;
 
 /// A badge is a white-ringed coloured disc at the bottom-right with a white
-/// glyph. `glyph` is drawn centred on (36.5, 36.5).
+/// glyph. `glyph` is drawn centred on (37, 37).
 fn badge(colour: &str, glyph: &str) -> String {
     format!(
-        r##"<g><circle cx="36.5" cy="36.5" r="11" fill="#ffffff"/>
-           <circle cx="36.5" cy="36.5" r="9.2" fill="{colour}"/>{glyph}</g>"##
+        r##"<g><circle cx="37" cy="37" r="11.5" fill="#ffffff"/>
+           <circle cx="37" cy="37" r="9.6" fill="{colour}"/>{glyph}</g>"##
     )
 }
 
@@ -38,24 +38,24 @@ fn overlay(category: &str) -> String {
     match category {
         "sync" => badge(
             "#0F7BDB",
-            r##"<path d="M31.7 36.5a4.8 4.8 0 1 1 1.5 3.5" fill="none" stroke="#fff"
-                 stroke-width="2.1" stroke-linecap="round"/>
-               <path d="M30.6 32.8l1.3 3.9 3.8-1.3z" fill="#fff"/>"##,
+            r##"<path d="M32.2 37a4.8 4.8 0 1 1 1.5 3.5" fill="none" stroke="#fff"
+                 stroke-width="2.2" stroke-linecap="round"/>
+               <path d="M31.1 33.3l1.3 3.9 3.8-1.3z" fill="#fff"/>"##,
         ),
         "paused" => badge(
             "#2C6F9B",
-            r##"<rect x="32.7" y="31.8" width="2.7" height="9.4" rx="1.2" fill="#fff"/>
-               <rect x="37.6" y="31.8" width="2.7" height="9.4" rx="1.2" fill="#fff"/>"##,
+            r##"<rect x="33.2" y="32.3" width="2.8" height="9.6" rx="1.2" fill="#fff"/>
+               <rect x="38.1" y="32.3" width="2.8" height="9.6" rx="1.2" fill="#fff"/>"##,
         ),
         "offline" => badge(
             "#9AA0A6",
-            r##"<line x1="31.6" y1="41.4" x2="41.4" y2="31.6" stroke="#fff"
-                 stroke-width="2.6" stroke-linecap="round"/>"##,
+            r##"<line x1="32.1" y1="41.9" x2="41.9" y2="32.1" stroke="#fff"
+                 stroke-width="2.7" stroke-linecap="round"/>"##,
         ),
         "error" => badge(
             "#E8590C",
-            r##"<rect x="35.2" y="30.7" width="2.6" height="7.2" rx="1.3" fill="#fff"/>
-               <circle cx="36.5" cy="41" r="1.7" fill="#fff"/>"##,
+            r##"<rect x="35.7" y="31.2" width="2.6" height="7.4" rx="1.3" fill="#fff"/>
+               <circle cx="37" cy="41.5" r="1.7" fill="#fff"/>"##,
         ),
         _ => String::new(),
     }
@@ -115,7 +115,9 @@ pub const CATEGORIES: &[&str] = &["idle", "sync", "paused", "offline", "error"];
 pub fn render_all() -> std::collections::HashMap<&'static str, Vec<ksni::Icon>> {
     let mut map = std::collections::HashMap::new();
     for &category in CATEGORIES {
-        let icons: Vec<ksni::Icon> = [22, 32, 44]
+        // A spread of sizes, up to 64 px, so a HiDPI panel picks a crisp large
+        // icon rather than scaling up a small one.
+        let icons: Vec<ksni::Icon> = [24, 32, 48, 64]
             .into_iter()
             .filter_map(|size| render(category, size))
             .collect();
