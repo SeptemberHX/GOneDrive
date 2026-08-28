@@ -270,6 +270,30 @@ nautilus -q                        # 重启文件管理器
 - **内核 ≥ 6.14 + CAP_SYS_ADMIN**（fanotify 预读钩子）；FUSE 兜底与 libcloudproviders 侧栏在路线图上
 - 托盘依赖桌面的 StatusNotifierWatcher；它缺席时 30 秒周期自愈重试
 
+## 读日志，代替人肉排查
+
+守护进程的日志把每一件外部可见的事都写成一行可 grep 的记录——出问题先看日志，而不是重演操作：
+
+```bash
+journalctl --user -u gonedrived -f      # 用户服务方式运行时
+journalctl -u gonedrive-hsm -f          # 特权 helper（含读者进程名）
+```
+
+| 日志行 | 含义 |
+|---|---|
+| `FreeUpSpace requested path=…` / `… done files=N freed=N` | 谁的哪次释放、动了多少 —— 右键误伤直接对账 |
+| `SetPinState requested … / done queued_files=…` | 每次选择/取消选择及其代价 |
+| `on-demand read path=… reader=nautilus length=16384` | **哪个进程**在触发按需下载、要了哪个范围 |
+| `staged range … bytes=16384` / `hydrated range` | 部分回填：只取了嗅探窗口，文件仍是占位 |
+| `staging content size=…` / `hydrated` | 全量回填 |
+| `refusing a background reader` | 索引器/缩略图器被拒，未产生流量 |
+| `refusing to upload a placeholder` | 上传守卫拦下了空洞文件 |
+| `sync pass finished downloaded=… uploaded=…` | 每轮同步的完整账目 |
+| `repaired a stale hydrating record` | 崩溃残留被自动纠正 |
+
+四起真实事故（误伤兄弟文件、整盘释放、进文件夹触发下载、暂存文件残留）都已固化为
+`data/nautilus/tests/test_dispatch.py` —— 用真守护进程、真总线、真文件回放右键链路。
+
 ## 已知的开发环境怪癖
 
 `GONEDRIVE_SNAPSHOT` 离屏渲染对"文件夹"页偶发返回空节点（其余页正常）；页面本身在真实屏幕上工作正常，数据层有 D-Bus 级验证。

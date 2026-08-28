@@ -282,6 +282,21 @@ impl App {
                                 continue;
                             }
                             SyncEvent::Finished(summary) => {
+                                // One line per pass with every counter: the
+                                // log alone should answer "what did that sync
+                                // just do", without anyone reproducing it.
+                                if summary != Default::default() {
+                                    tracing::info!(
+                                        downloaded = summary.downloaded,
+                                        uploaded = summary.uploaded,
+                                        deleted_local = summary.deleted_local,
+                                        deleted_remote = summary.deleted_remote,
+                                        conflicts = summary.conflicts,
+                                        skipped = summary.skipped,
+                                        queued = summary.still_queued,
+                                        "sync pass finished"
+                                    );
+                                }
                                 current.state = "idle".into();
                                 current.pending = summary.still_queued;
                                 current.current_item.clear();

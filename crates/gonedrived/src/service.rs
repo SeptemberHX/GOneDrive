@@ -131,10 +131,18 @@ impl DaemonService {
         tracing::info!(%path, %pin, "SetPinState requested");
         let relative = self.relative(path).await?;
         let pin = gonedrive_core::db::PinState::parse(pin);
-        self.app
+        let outcome = self
+            .app
             .set_pin(&relative, pin)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        tracing::info!(
+            path = %relative.display(),
+            queued_files = outcome.files,
+            queued_bytes = outcome.bytes,
+            cancelled = outcome.cancelled,
+            "SetPinState done"
+        );
         self.app.wake.notify_one();
         Ok(())
     }
@@ -147,6 +155,13 @@ impl DaemonService {
             .free_space(&relative)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        tracing::info!(
+            path = %relative.display(),
+            files = outcome.files,
+            freed = outcome.freed,
+            kept = outcome.skipped.len(),
+            "FreeUpSpace done"
+        );
         Ok(outcome.freed)
     }
 
