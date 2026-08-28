@@ -88,7 +88,7 @@ impl Monitor {
         // A flat "downloading" title on the left: a glyph plus a live count.
         let glyph = gtk::Image::from_icon_name("folder-download-symbolic");
         glyph.add_css_class("dim-label");
-        let title = gtk::Label::new(Some("下载中"));
+        let title = gtk::Label::new(Some("OneDrive 下载中"));
         title.add_css_class("heading");
         let title_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -216,8 +216,8 @@ impl Monitor {
         let count = rows.len();
         drop(rows);
         self.title.set_text(&match count {
-            0 | 1 => "下载中".to_string(),
-            n => format!("{n} 个文件下载中"),
+            0 | 1 => "OneDrive 下载中".to_string(),
+            n => format!("OneDrive · {n} 个文件下载中"),
         });
         self.window.present();
     }
