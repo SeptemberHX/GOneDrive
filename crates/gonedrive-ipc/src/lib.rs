@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
 
+pub mod reader_policy;
+
 pub const SERVICE_NAME: &str = "org.gonedrive.Daemon";
 pub const OBJECT_PATH: &str = "/org/gonedrive/Daemon";
 pub const INTERFACE: &str = "org.gonedrive.Daemon1";

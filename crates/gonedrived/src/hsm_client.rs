@@ -17,35 +17,7 @@ use tokio::sync::Mutex;
 
 use crate::app::App;
 
-/// Readers whose blocked reads must not pull content down.
-///
-/// The helper carries the same list, but this copy is the one that matters
-/// operationally: it lives in the unprivileged daemon, so extending it when a
-/// new background scanner shows up in the logs is a rebuild and a restart —
-/// no root, no helper swap. Matched as a prefix of `comm` (kernel-truncated
-/// to 15 characters).
-const BACKGROUND_READERS: &[&str] = &[
-    "localsearch",
-    "tracker-miner",
-    "tracker-extract",
-    "tracker-store",
-    "baloo_file",
-    "thumbnailer",
-    "tumblerd",
-    "gsd-housekeep",
-    "updatedb",
-    "plocate",
-    "mlocate",
-    "clamd",
-    "freshclam",
-];
-
-fn background_reader(comm: &str) -> Option<&'static str> {
-    BACKGROUND_READERS
-        .iter()
-        .find(|prefix| comm.starts_with(*prefix))
-        .copied()
-}
+use gonedrive_ipc::reader_policy::is_background_reader as background_reader;
 
 /// A live connection to the privileged helper.
 pub struct HsmClient {

@@ -11,6 +11,7 @@ use gonedrive_core::db::Store;
 use gonedrive_core::graph::GraphClient;
 use gonedrive_core::sync::engine::{Direction, Engine, SyncEvent};
 use gonedrive_core::{Authenticator, Error, TokenStore};
+use gonedrive_ipc::reader_policy::{is_browsing_reader, is_bulk_copier};
 use gonedrive_ipc::{AccountInfo, Activity, Hydration, SyncStatus};
 use tokio::sync::{broadcast, Notify, RwLock};
 
@@ -946,41 +947,6 @@ async fn record_activity(
 /// previews — rather than to use them. Their reads are always served as
 /// ranges and never change a file's state: browsing must have no side
 /// effects, at any file size.
-/// Tools that copy or archive a whole file and skip its holes rather than
-/// reading them — so they must be given the entire file before they look.
-fn is_bulk_copier(comm: &str) -> bool {
-    const COPIERS: &[&str] = &[
-        "cp", "mv", "install", "rsync", "tar", "dd", "cpio", "rclone",
-        "7z", "7za", "zip", "gzip", "bsdtar", "pax", "cksum",
-    ];
-    // Exact match, not prefix: "cpuinfo"-style false hits would eagerly
-    // download whole files for no reason.
-    COPIERS.contains(&comm)
-}
-
-fn is_browsing_reader(comm: &str) -> bool {
-    // Anything that reads a file to *describe* it — the file manager itself,
-    // its preview pane, and every thumbnailer. A thumbnail of an online-only
-    // file simply does not render until the file is opened for real, exactly
-    // as on Windows; it must never pull the whole image down. `comm` is
-    // kernel-truncated to 15 characters, so these are prefixes.
-    const BROWSERS: &[&str] = &[
-        "nautilus",
-        "sushi",              // GNOME's preview (spacebar)
-        "glycin",             // GNOME's image loader/thumbnailer sandbox
-        "gdk-pixbuf-thum",
-        "gnome-thumbnail",
-        "gst-video-thumb",
-        "gst-audio-thumb",
-        "heif-thumbnaile",
-        "papers-thumbnai",
-        "totem-video-thu",
-        "ffmpegthumbnail",
-        "evince-thumbnai",
-    ];
-    BROWSERS.iter().any(|prefix| comm.starts_with(prefix))
-}
-
 /// Bring up the one progress window, if it is not already up.
 ///
 /// The GApplication id is unique, so even a rare double-spawn folds into one

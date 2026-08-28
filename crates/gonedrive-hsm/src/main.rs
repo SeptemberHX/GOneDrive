@@ -34,31 +34,10 @@ use gonedrive_ipc::hsm::{Event, Request, SOCKET_PATH};
 
 use crate::fanotify::{Fanotify, PreContentEvent};
 
-/// Processes whose reads must never pull a file down from the cloud.
-///
-/// A placeholder is indistinguishable from an ordinary file, so a desktop
-/// indexer walking the home directory would quietly download the user's entire
-/// drive — which is the precise opposite of what files-on-demand is for. These
-/// get a denial, which they treat as an unreadable file and skip.
-///
-/// Matched against `/proc/<pid>/comm`, which the kernel truncates to 15
-/// characters, so the patterns are prefixes.
-const BACKGROUND_READERS: &[&str] = &[
-    "localsearch",      // GNOME's file indexer (formerly tracker-miner-fs)
-    "tracker-miner",
-    "tracker-extract",
-    "tracker-store",
-    "baloo_file",       // KDE's indexer
-    "baloo_file_ext",
-    "thumbnailer",      // gnome-desktop / tumbler thumbnail generation
-    "tumblerd",
-    "gsd-housekeep",    // GNOME's disk-usage sweep
-    "updatedb",         // locate(1) database builders
-    "plocate",
-    "mlocate",
-    "clamd",            // on-access antivirus
-    "freshclam",
-];
+// Process classification (background indexers, bulk copiers, browsers) is
+// shared with the daemon through `gonedrive_ipc::reader_policy`, so the two
+// sides of the trust boundary cannot drift apart.
+use gonedrive_ipc::reader_policy::{is_background_reader, is_bulk_copier};
 
 /// How long a blocked reader waits before we give up and fail its read.
 /// Long enough for a large file over a slow link, short enough that a wedged
@@ -577,23 +556,10 @@ fn fill_from(source: &Path, target: &std::os::unix::io::OwnedFd, offset: u64) ->
 }
 
 
-/// Whole-file copiers that skip holes; they must get the file before they look.
-fn is_bulk_copier(comm: &str) -> bool {
-    const COPIERS: &[&str] = &[
-        "cp", "mv", "install", "rsync", "tar", "dd", "cpio", "rclone", "7z",
-        "7za", "zip", "gzip", "bsdtar", "pax", "cksum",
-    ];
-    COPIERS.contains(&comm)
-}
-
 /// Name the process if it is one that should never trigger a download.
 fn background_reader(pid: i32) -> Option<&'static str> {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    let comm = comm.trim();
-    BACKGROUND_READERS
-        .iter()
-        .find(|prefix| comm.starts_with(*prefix))
-        .copied()
+    is_background_reader(comm.trim())
 }
 
 /// Fail everything still waiting, so no reader is left blocked.
@@ -631,7 +597,7 @@ mod tests {
         // an indexer walking the home directory would download the whole drive.
         for name in ["localsearch-3", "tracker-miner-f", "baloo_file", "tumblerd"] {
             assert!(
-                BACKGROUND_READERS.iter().any(|p| name.starts_with(p)),
+                gonedrive_ipc::reader_policy::BACKGROUND_READERS.iter().any(|p| name.starts_with(p)),
                 "{name} should be refused"
             );
         }
@@ -641,7 +607,7 @@ mod tests {
     fn ordinary_applications_are_not_refused() {
         for name in ["gedit", "libreoffice", "cat", "firefox", "nautilus"] {
             assert!(
-                !BACKGROUND_READERS.iter().any(|p| name.starts_with(p)),
+                !gonedrive_ipc::reader_policy::BACKGROUND_READERS.iter().any(|p| name.starts_with(p)),
                 "{name} must still be able to open its files"
             );
         }
