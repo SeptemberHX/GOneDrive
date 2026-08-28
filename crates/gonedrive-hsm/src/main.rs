@@ -423,6 +423,28 @@ fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
         return;
     }
 
+    // An open event: let the daemon decide whether this opener needs the whole
+    // file up front (a sparse-aware copier does, because it will SEEK over the
+    // holes without ever reading). Most openers are allowed straight through
+    // and their reads are handled progressively by pre-content events.
+    // An open by anything other than a sparse-aware copier is allowed here,
+    // without a daemon round-trip: its reads are what drive hydration. Only a
+    // copier — which will SEEK over the holes and never read — needs the whole
+    // file fetched first, and only that case goes to the daemon. This keeps
+    // opening a folder of placeholders fast: one cheap allow per file.
+    if event.is_open {
+        let comm = std::fs::read_to_string(format!("/proc/{}/comm", event.pid))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if !is_bulk_copier(&comm) {
+            if let Err(e) = shared.fan.respond(fd, true) {
+                tracing::error!(error = %e, "could not answer an open");
+            }
+            return;
+        }
+        tracing::info!(reader = %comm, path = ?event.path, "copier open; hydrating whole file");
+    }
+
     let (allow, full) = match hydrate(&shared, &event) {
         Ok(result) => result,
         Err(e) => {
@@ -469,6 +491,7 @@ fn hydrate(shared: &Arc<Shared>, event: &PreContentEvent) -> Result<(bool, bool)
         // file rather than guessing at a window.
         length: event.length,
         reader: reader.clone(),
+        is_open: event.is_open,
     };
     if let Err(e) = shared.send(&request) {
         shared.pending.lock().unwrap().remove(&id);
@@ -553,6 +576,15 @@ fn fill_from(source: &Path, target: &std::os::unix::io::OwnedFd, offset: u64) ->
     Ok(total)
 }
 
+
+/// Whole-file copiers that skip holes; they must get the file before they look.
+fn is_bulk_copier(comm: &str) -> bool {
+    const COPIERS: &[&str] = &[
+        "cp", "mv", "install", "rsync", "tar", "dd", "cpio", "rclone", "7z",
+        "7za", "zip", "gzip", "bsdtar", "pax", "cksum",
+    ];
+    COPIERS.contains(&comm)
+}
 
 /// Name the process if it is one that should never trigger a download.
 fn background_reader(pid: i32) -> Option<&'static str> {

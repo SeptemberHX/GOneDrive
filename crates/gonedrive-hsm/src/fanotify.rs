@@ -13,6 +13,11 @@ use std::path::PathBuf;
 pub const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
 /// A read is about to happen; the listener may fill the range first.
 pub const FAN_PRE_ACCESS: u64 = 0x0010_0000;
+/// A file is being opened. Fires before the opener does anything — crucially,
+/// before a sparse-aware copier (`cp`, `tar`, `rsync`) issues SEEK_DATA and
+/// skips the placeholder's holes without ever reading. The only hook that can
+/// force such a tool to see real content is on the open itself.
+pub const FAN_OPEN_PERM: u64 = 0x0001_0000;
 
 pub const FAN_MARK_ADD: u32 = 0x0000_0001;
 pub const FAN_MARK_REMOVE: u32 = 0x0000_0002;
@@ -72,6 +77,8 @@ pub struct PreContentEvent {
     pub path: Option<PathBuf>,
     pub offset: u64,
     pub length: u64,
+    /// True for an open-permission event, false for a pre-content read.
+    pub is_open: bool,
 }
 
 pub struct Fanotify {
@@ -124,7 +131,7 @@ impl Fanotify {
             libc::fanotify_mark(
                 self.fd.as_raw_fd(),
                 flags,
-                FAN_PRE_ACCESS,
+                FAN_PRE_ACCESS | FAN_OPEN_PERM,
                 libc::AT_FDCWD,
                 c_path.as_ptr(),
             )
@@ -186,6 +193,7 @@ impl Fanotify {
                 pid: meta.pid,
                 offset,
                 length,
+                is_open: meta.mask & FAN_OPEN_PERM != 0,
             });
             cursor += event_len;
         }

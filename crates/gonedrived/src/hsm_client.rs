@@ -183,6 +183,7 @@ async fn handle(
             offset,
             length,
             reader,
+            is_open,
         } => {
             let path = PathBuf::from(path);
             // The single most useful line in this log: it names the process
@@ -226,7 +227,7 @@ async fn handle(
             let allow_partial =
                 partial_hydration.load(std::sync::atomic::Ordering::Relaxed);
             let (ok, source, offset, full) =
-                match app.stage_for(&path, offset, length, &reader, allow_partial).await {
+                match app.stage_for(&path, offset, length, &reader, is_open, allow_partial).await {
                     // Fill this window from a staged file.
                     Ok(Some((staged, offset, full))) => (
                         true,

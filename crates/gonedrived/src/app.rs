@@ -405,10 +405,25 @@ impl App {
         offset: u64,
         length: u64,
         reader: &str,
+        is_open: bool,
         allow_partial: bool,
     ) -> Result<Option<(std::path::PathBuf, u64, bool)>> {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let browsing = is_browsing_reader(reader);
+
+        if is_open {
+            // The read has not begun. A sparse-aware copier will now SEEK over
+            // the holes and copy zeros unless the file is already whole, so
+            // those tools are hydrated fully here. Everyone else is allowed
+            // through untouched and their actual reads drive hydration — this
+            // keeps a media player streaming a huge file instead of pulling it
+            // all down just to read its header.
+            if is_bulk_copier(reader) {
+                let staged = self.stage_content(path).await?;
+                return Ok(Some((staged, 0, true)));
+            }
+            return Ok(None); // allow the open; reads handle the rest
+        }
 
         if browsing {
             // Browsing must never touch the network: opening a folder makes the
@@ -904,6 +919,18 @@ async fn record_activity(
 /// previews — rather than to use them. Their reads are always served as
 /// ranges and never change a file's state: browsing must have no side
 /// effects, at any file size.
+/// Tools that copy or archive a whole file and skip its holes rather than
+/// reading them — so they must be given the entire file before they look.
+fn is_bulk_copier(comm: &str) -> bool {
+    const COPIERS: &[&str] = &[
+        "cp", "mv", "install", "rsync", "tar", "dd", "cpio", "rclone",
+        "7z", "7za", "zip", "gzip", "bsdtar", "pax", "cksum",
+    ];
+    // Exact match, not prefix: "cpuinfo"-style false hits would eagerly
+    // download whole files for no reason.
+    COPIERS.contains(&comm)
+}
+
 fn is_browsing_reader(comm: &str) -> bool {
     // Anything that reads a file to *describe* it — the file manager itself,
     // its preview pane, and every thumbnailer. A thumbnail of an online-only

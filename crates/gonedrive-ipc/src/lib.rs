@@ -254,6 +254,11 @@ pub mod hsm {
             /// "what keeps downloading my files", written into the daemon log.
             #[serde(default)]
             reader: String,
+            /// True for an open event: the read has not started yet. A
+            /// sparse-aware copier issues no read at all, so its only chance to
+            /// get real content is to hydrate fully here, on the open.
+            #[serde(default)]
+            is_open: bool,
         },
         /// The content was written and the reader released. The daemon
         /// finalises its own bookkeeping on seeing this — but only for a
