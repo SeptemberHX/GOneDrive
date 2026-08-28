@@ -14,6 +14,34 @@ pub struct DaemonService {
     app: Arc<App>,
 }
 
+/// Why a caller's path was refused by [`confine_to_root`].
+#[derive(Debug, PartialEq)]
+enum ConfineError {
+    /// The path is not inside the sync root at all.
+    Outside,
+    /// The path *is* the sync root: a single-shot call that would act on the
+    /// whole drive, which these entry points deliberately refuse.
+    WholeRoot,
+}
+
+/// Confine a caller-supplied absolute path to the sync root, returning it
+/// relative to the root. Refuses anything outside the root, and refuses the
+/// root itself so a one-click menu action can never sweep the entire drive.
+///
+/// Pure, so the safety guard can be tested without a running daemon.
+fn confine_to_root(
+    root: &std::path::Path,
+    path: &str,
+) -> std::result::Result<std::path::PathBuf, ConfineError> {
+    let relative = std::path::Path::new(path)
+        .strip_prefix(root)
+        .map_err(|_| ConfineError::Outside)?;
+    if relative.as_os_str().is_empty() {
+        return Err(ConfineError::WholeRoot);
+    }
+    Ok(relative.to_path_buf())
+}
+
 impl DaemonService {
     /// Turn an absolute path from a file manager into one relative to the sync
     /// root, refusing anything outside it.
@@ -28,25 +56,21 @@ impl DaemonService {
             .map(|a| std::path::PathBuf::from(&a.root_path))
             .ok_or_else(|| zbus::fdo::Error::Failed("no account is signed in".into()))?;
 
-        let relative = std::path::Path::new(path)
-            .strip_prefix(&root)
-            .map(|p| p.to_path_buf())
-            .map_err(|_| {
+        confine_to_root(&root, path).map_err(|e| match e {
+            ConfineError::Outside => {
                 zbus::fdo::Error::InvalidArgs(format!("{path} is outside {}", root.display()))
-            })?;
-
-        // The sync root itself is off limits to these single-shot calls. The
-        // audit log has a real entry where one context-menu click asked to
-        // dehydrate the entire drive — an operation that big gets a place
-        // where its scope is unmistakable (the panel's folder page, entry by
-        // entry), not a menu item next to "open".
-        if relative.as_os_str().is_empty() {
-            return Err(zbus::fdo::Error::AccessDenied(
-                "refusing to act on the whole sync folder at once;                  choose folders individually in the GOnedrive panel"
+            }
+            // The sync root itself is off limits to these single-shot calls.
+            // The audit log has a real entry where one context-menu click asked
+            // to dehydrate the entire drive — an operation that big gets a place
+            // where its scope is unmistakable (the panel's folder page, entry by
+            // entry), not a menu item next to "open".
+            ConfineError::WholeRoot => zbus::fdo::Error::AccessDenied(
+                "refusing to act on the whole sync folder at once; \
+                 choose folders individually in the GOnedrive panel"
                     .into(),
-            ));
-        }
-        Ok(relative)
+            ),
+        })
     }
 }
 
@@ -327,4 +351,36 @@ pub async fn serve(app: Arc<App>) -> Result<zbus::Connection> {
     });
 
     Ok(connection)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{confine_to_root, ConfineError};
+    use std::path::{Path, PathBuf};
+
+    const ROOT: &str = "/home/u/OneDrive";
+
+    #[test]
+    fn a_path_inside_the_root_is_confined_to_a_relative_one() {
+        assert_eq!(
+            confine_to_root(Path::new(ROOT), "/home/u/OneDrive/Docs/a.txt"),
+            Ok(PathBuf::from("Docs/a.txt"))
+        );
+    }
+
+    #[test]
+    fn a_path_outside_the_root_is_refused() {
+        // The classic escape: a sibling that shares a name prefix, and an
+        // absolute path elsewhere entirely.
+        assert_eq!(confine_to_root(Path::new(ROOT), "/home/u/OneDrive-evil/x"), Err(ConfineError::Outside));
+        assert_eq!(confine_to_root(Path::new(ROOT), "/etc/passwd"), Err(ConfineError::Outside));
+        assert_eq!(confine_to_root(Path::new(ROOT), "/home/u"), Err(ConfineError::Outside));
+    }
+
+    #[test]
+    fn the_sync_root_itself_is_refused_so_one_click_cannot_sweep_the_drive() {
+        assert_eq!(confine_to_root(Path::new(ROOT), ROOT), Err(ConfineError::WholeRoot));
+        // A trailing slash is still the root.
+        assert_eq!(confine_to_root(Path::new(ROOT), "/home/u/OneDrive/"), Err(ConfineError::WholeRoot));
+    }
 }
