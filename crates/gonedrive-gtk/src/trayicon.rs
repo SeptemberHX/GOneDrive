@@ -14,14 +14,15 @@ use gtk::glib;
 /// The cloud itself — a base ellipse and three bumps in one fill so the union
 /// is seamless, under a top-lit OneDrive-blue gradient.
 const CLOUD: &str = r##"
-  <defs><linearGradient id="od" x1="0" y1="0" x2="0" y2="1">
-    <stop offset="0" stop-color="#35B8EC"/><stop offset="1" stop-color="#0264C0"/>
-  </linearGradient></defs>
-  <g fill="url(#od)">
-    <ellipse cx="24" cy="33" rx="19" ry="11"/>
-    <circle cx="12" cy="27" r="9.5"/>
-    <circle cx="24" cy="18" r="12"/>
-    <circle cx="35" cy="26" r="10"/>
+  <g fill="#28A8EA">
+    <ellipse cx="31" cy="32" rx="17" ry="12"/>
+    <circle cx="37" cy="24" r="11"/>
+    <circle cx="24" cy="18.5" r="12.5"/>
+  </g>
+  <g fill="#0A78CE">
+    <ellipse cx="15" cy="35" rx="14.5" ry="10"/>
+    <circle cx="9" cy="30" r="9"/>
+    <circle cx="19" cy="27" r="10"/>
   </g>"##;
 
 /// A badge is a white-ringed coloured disc at the bottom-right with a white

@@ -7,12 +7,21 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ICONS="$HOME/.local/share/icons/hicolor/scalable/emblems"
+APPS="$HOME/.local/share/icons/hicolor/scalable/apps"
 EXTENSIONS="$HOME/.local/share/nautilus-python/extensions"
 AUTOSTART="$HOME/.config/autostart"
 
-install -d "$ICONS" "$EXTENSIONS" "$AUTOSTART"
+install -d "$ICONS" "$APPS" "$EXTENSIONS" "$AUTOSTART"
 install -m644 data/icons/hicolor/scalable/emblems/*.svg "$ICONS/"
 install -m644 data/nautilus/gonedrive.py "$EXTENSIONS/"
+
+# The OneDrive cloud, and the sync folder set to wear it in the file manager.
+install -m644 data/icons/onedrive.svg "$APPS/gonedrive.svg"
+SYNC_ROOT="${GONEDRIVE_SYNC_ROOT:-$HOME/OneDrive}"
+if [ -d "$SYNC_ROOT" ]; then
+    gio set "$SYNC_ROOT" metadata::custom-icon "file://$APPS/gonedrive.svg" 2>/dev/null \
+        && echo "  folder icon -> $SYNC_ROOT"
+fi
 
 # Start the tray front-end on login. It is a persistent status-notifier item,
 # not a window — without an autostart entry there is simply no tray until the
