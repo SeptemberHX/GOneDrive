@@ -347,6 +347,10 @@ fn spawn_progress(app: &std::sync::Arc<App>) -> tokio::task::JoinHandle<()> {
                     println!("\r  conflict: {original} kept locally as {copy}");
                     continue;
                 }
+                DaemonEvent::SafetyStop { reason } => {
+                    println!("\r  SAFETY STOP: {reason}");
+                    continue;
+                }
                 _ => continue,
             }
             use std::io::Write;

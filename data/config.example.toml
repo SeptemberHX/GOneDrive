@@ -49,3 +49,10 @@ auto_free_below_bytes = 0
 # Transfer ceilings in bytes per second; 0 = unlimited.
 download_limit_bytes_per_sec = 0
 upload_limit_bytes_per_sec = 0
+
+# 批量删除安全阀：一次扫描若判定删除的项数超过 mass_delete_min，且占全账户
+# 比例超过 mass_delete_fraction，则视为疑似误删（卸载的挂载点、错误的 bind、
+# 误 rm），扣留全部删除并请用户确认，绝不直接在服务端删除。
+# mass_delete_fraction = 1.0 关闭比例判定。
+mass_delete_fraction = 0.5
+mass_delete_min = 10

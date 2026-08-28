@@ -101,6 +101,14 @@ pub enum SyncEvent {
         name: String,
         error: String,
     },
+    /// A destructive step was refused because it looked like data loss rather
+    /// than an intended change — the sync root on a different filesystem than
+    /// recorded (an unmounted mountpoint), or a scan about to delete an
+    /// alarming fraction of the account. Nothing was deleted; the user is
+    /// asked to confirm.
+    SafetyStop {
+        reason: String,
+    },
     Finished(SyncSummary),
 }
 
@@ -129,6 +137,10 @@ pub struct SyncSummary {
     pub enumerated: u64,
     pub failed: u64,
     pub still_queued: u64,
+    /// Remote deletions the safety valve held back this pass because they
+    /// looked like an accidental mass loss. Non-zero means a `SafetyStop` was
+    /// emitted and the deletions did not happen.
+    pub refused_deletions: u64,
 }
 
 pub struct Engine {
@@ -727,6 +739,34 @@ impl Engine {
             return Ok(());
         }
 
+        // The sync root must be the same filesystem it was last time. If it is
+        // not, the most likely cause is that it is not mounted and we are
+        // looking at an empty mountpoint — every record would read as "deleted
+        // locally" and the account would be wiped server-side. Record the
+        // device the first time; refuse to scan (and so refuse to delete)
+        // whenever it has changed.
+        {
+            use std::os::unix::fs::MetadataExt;
+            let current_dev = std::fs::metadata(&account.root_local_path).map(|m| m.dev()).ok();
+            match (account.root_dev, current_dev) {
+                (Some(recorded), Some(now)) if recorded != now => {
+                    let reason = format!(
+                        "sync root {} is on a different filesystem than recorded \
+                         (was dev {recorded}, now {now}) — refusing to scan so an \
+                         unmounted root cannot delete the account",
+                        account.root_local_path.display()
+                    );
+                    tracing::error!(%reason, "safety stop");
+                    self.emit(SyncEvent::SafetyStop { reason });
+                    return Ok(());
+                }
+                (None, Some(now)) => {
+                    self.store.set_root_dev(&self.account_id, now)?;
+                }
+                _ => {}
+            }
+        }
+
         let by_inode = self.store.items_by_inode(&self.account_id)?;
         // `None` marks a directory that has no remote record yet — freshly
         // created locally. It is still walked: the far end of a rename often
@@ -927,6 +967,33 @@ impl Engine {
                 }
             }
         }
+        // Mass-deletion safety valve. Deleting a large fraction of the account
+        // in one pass is far more likely to be an accident we should not
+        // propagate — a mount that dropped without changing the device number,
+        // a bind gone wrong, an `rm -rf` the user regrets — than a deliberate
+        // change. Hold every deletion this pass and ask the user to confirm,
+        // rather than execute an irreversible remote wipe.
+        let doomed = vanished
+            .iter()
+            .filter(|r| !moved_ids.contains(&r.id))
+            .count() as u64;
+        if doomed > self.config.mass_delete_min {
+            let total = self.store.item_count(&self.account_id)?.max(1);
+            let fraction = doomed as f64 / total as f64;
+            if fraction > self.config.mass_delete_fraction {
+                let reason = format!(
+                    "a single scan would delete {doomed} of {total} items \
+                     ({:.0}%) — holding the deletions for confirmation instead \
+                     of propagating what looks like an accidental mass loss",
+                    fraction * 100.0
+                );
+                tracing::error!(%reason, "safety stop");
+                self.emit(SyncEvent::SafetyStop { reason });
+                summary.refused_deletions += doomed;
+                return Ok(());
+            }
+        }
+
         for record in vanished {
             if moved_ids.contains(&record.id) {
                 continue;

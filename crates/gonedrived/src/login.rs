@@ -76,6 +76,7 @@ impl Login {
             enum_link: None,
             quota_total: quota.and_then(|q| q.total),
             quota_used: quota.and_then(|q| q.used),
+            root_dev: None,
         })?;
 
         store.upsert_item(&ItemRecord::root(&account_id, &root.id))?;

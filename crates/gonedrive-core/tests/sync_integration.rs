@@ -66,6 +66,7 @@ impl Harness {
                 enum_link: None,
                 quota_total: None,
                 quota_used: None,
+                root_dev: None,
             })
             .unwrap();
         store.upsert_item(&ItemRecord::root(ACCOUNT, ROOT)).unwrap();
@@ -98,6 +99,7 @@ impl Harness {
                 enum_link: None,
                 quota_total: None,
                 quota_used: None,
+                root_dev: None,
             })
             .unwrap();
 
@@ -525,6 +527,68 @@ async fn a_pending_download_is_not_mistaken_for_a_local_delete() {
     let summary = h.sync().await;
     assert!(!h.path("a.txt").exists());
     assert_eq!(summary.deleted_remote, 0, "must not have deleted anything remotely");
+    assert!(h.store.item("F1").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_scan_that_would_wipe_the_account_holds_the_deletions() {
+    // The catastrophe this guards: the whole tree vanishing at once — an
+    // unmounted-but-present root, a bad bind, an `rm -rf` — reads as "every
+    // file was deleted" and would delete the entire account server-side. A
+    // deletion that large is held for confirmation, never executed on sight.
+    let h = Harness::new().await;
+    let items: Vec<Value> = (0..12)
+        .map(|i| {
+            file(&format!("F{i}"), ROOT, &format!("f{i}.txt"), "c1", 5, "2026-08-20T10:00:00Z")
+        })
+        .collect();
+    h.mock_delta(None, items, "v1").await;
+    for i in 0..12 {
+        h.mock_download(&format!("F{i}"), b"hello").await;
+    }
+    h.sync().await;
+
+    // Everything disappears in one pass.
+    for i in 0..12 {
+        std::fs::remove_file(h.path(&format!("f{i}.txt"))).unwrap();
+    }
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    // Deliberately no DELETE mock: a working guard enqueues no deletion at all.
+    let summary = h.sync().await;
+    assert_eq!(summary.deleted_remote, 0, "a mass vanish must not delete remotely");
+    assert!(summary.refused_deletions >= 12, "the deletions should be held, not run");
+    for i in 0..12 {
+        assert!(
+            h.store.item(&format!("F{i}")).unwrap().is_some(),
+            "every record must survive a held mass deletion"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_sync_root_on_a_different_device_refuses_to_scan() {
+    // An unmounted mountpoint still *exists* as an empty directory on a
+    // different filesystem. The device number is the tell: if it changed since
+    // the last scan, refuse — deleting to match an empty tree would wipe the
+    // account.
+    use std::os::unix::fs::MetadataExt;
+    let h = Harness::new().await;
+    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
+        .await;
+    h.mock_download("F1", b"hello").await;
+    h.sync().await; // records the real device
+
+    // Simulate the root becoming a different filesystem.
+    let real_dev = std::fs::metadata(&h.root).unwrap().dev();
+    h.store.set_root_dev(ACCOUNT, real_dev ^ 1).unwrap();
+    std::fs::remove_file(h.path("a.txt")).unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    let summary = h.sync().await;
+    assert_eq!(summary.deleted_remote, 0, "a device mismatch must never delete");
     assert!(h.store.item("F1").unwrap().is_some());
 }
 

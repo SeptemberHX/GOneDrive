@@ -21,7 +21,7 @@ use time::OffsetDateTime;
 use crate::error::{Error, Result};
 use crate::names::fold_case;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// What we know about a file relative to the service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +158,11 @@ pub struct Account {
     pub enum_link: Option<String>,
     pub quota_total: Option<u64>,
     pub quota_used: Option<u64>,
+    /// `st_dev` of the sync root the last time it was scanned. `None` until the
+    /// first scan records it. A later mismatch means the root is no longer the
+    /// same filesystem — the guard against deleting a whole account because its
+    /// mount vanished.
+    pub root_dev: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +322,14 @@ impl Store {
                     tracing::info!(scrubbed, "cleared pin flags an old upload path set wrongly");
                 }
             }
+            if version < 4 {
+                // The device the sync root lived on when we last scanned it.
+                // A mismatch means the root is not the filesystem it was — most
+                // likely unmounted, leaving an empty mountpoint — and a scan
+                // that trusted the empty tree would delete the whole account
+                // server-side. Recorded on first scan, checked on every scan.
+                conn.execute_batch("ALTER TABLE accounts ADD COLUMN root_dev INTEGER")?;
+            }
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             Ok(())
         })
@@ -360,7 +373,7 @@ impl Store {
             Ok(conn
                 .query_row(
                     "SELECT id, drive_id, root_item_id, display_name, address, root_local_path,
-                            delta_link, quota_total, quota_used, enum_link
+                            delta_link, quota_total, quota_used, enum_link, root_dev
                        FROM accounts WHERE id = ?1",
                     params![id],
                     row_to_account,
@@ -373,7 +386,7 @@ impl Store {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, drive_id, root_item_id, display_name, address, root_local_path,
-                        delta_link, quota_total, quota_used, enum_link
+                        delta_link, quota_total, quota_used, enum_link, root_dev
                    FROM accounts ORDER BY id",
             )?;
             let rows = stmt.query_map([], row_to_account)?;
@@ -389,6 +402,31 @@ impl Store {
                 params![account_id, link],
             )?;
             Ok(())
+        })
+    }
+
+    /// Record the device the sync root lives on, so a later scan can tell that
+    /// the root has become a different filesystem (an unmounted mountpoint).
+    pub fn set_root_dev(&self, account_id: &str, dev: u64) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE accounts SET root_dev = ?2 WHERE id = ?1",
+                params![account_id, dev as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// How many items the account has on record — the denominator for the
+    /// mass-deletion safety valve.
+    pub fn item_count(&self, account_id: &str) -> Result<u64> {
+        self.with_conn(|conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM items WHERE account_id = ?1",
+                params![account_id],
+                |r| r.get(0),
+            )?;
+            Ok(n as u64)
         })
     }
 
@@ -1147,6 +1185,7 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
         enum_link: row.get(9)?,
         quota_total: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
         quota_used: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+        root_dev: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
     })
 }
 
@@ -1251,6 +1290,7 @@ mod tests {
             enum_link: None,
             quota_total: Some(1024),
             quota_used: Some(10),
+            root_dev: None,
         };
         store.upsert_account(&account).unwrap();
 

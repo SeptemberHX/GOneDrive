@@ -25,6 +25,9 @@ pub enum DaemonEvent {
     LoginFailed(String),
     Conflict { original: String, copy: String },
     ItemFailed { name: String, error: String },
+    /// A destructive step was refused as likely accidental data loss (an
+    /// unmounted sync root, or an alarming mass deletion). Nothing was deleted.
+    SafetyStop { reason: String },
     HydrationStarted(Hydration),
     HydrationProgress(Hydration),
     HydrationFinished { path: String, ok: bool },
@@ -232,6 +235,19 @@ impl App {
                                 record_activity(&activity, "failed", name.clone(), error.clone())
                                     .await;
                                 let _ = sender.send(DaemonEvent::ItemFailed { name, error });
+                            }
+                            SyncEvent::SafetyStop { reason } => {
+                                current.state = "paused".into();
+                                current.last_error = reason.clone();
+                                record_activity(
+                                    &activity,
+                                    "safety-stop",
+                                    reason.clone(),
+                                    String::new(),
+                                )
+                                .await;
+                                let _ = sender.send(DaemonEvent::SafetyStop { reason });
+                                continue;
                             }
                             SyncEvent::HydrationStarted { path, name, size } => {
                                 let hydration = Hydration {

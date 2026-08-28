@@ -102,6 +102,17 @@ pub struct Config {
     /// lot of someone's bandwidth to get there. Enumerate first, let the user
     /// choose, then transfer.
     pub download_new: DownloadPolicy,
+
+    /// Mass-deletion safety valve. A single scan that would delete more than
+    /// `mass_delete_min` items *and* more than this fraction of everything on
+    /// record is treated as accidental data loss (a vanished mount, a bad
+    /// bind, an `rm -rf` the user did not mean to propagate): the deletions are
+    /// held and the user is asked to confirm rather than executed. `1.0`
+    /// disables the fraction test.
+    pub mass_delete_fraction: f64,
+    /// The floor below which the fraction test never trips, so deleting a few
+    /// files out of a small drive is never second-guessed.
+    pub mass_delete_min: u64,
 }
 
 /// Whether newly discovered files are downloaded without being asked for.
@@ -145,6 +156,8 @@ impl Default for Config {
             upload_limit_bytes_per_sec: 0,
             on_demand: false,
             download_new: DownloadPolicy::Never,
+            mass_delete_fraction: 0.5,
+            mass_delete_min: 10,
         }
     }
 }

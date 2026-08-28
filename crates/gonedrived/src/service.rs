@@ -239,6 +239,11 @@ impl DaemonService {
     async fn item_failed(emitter: &SignalEmitter<'_>, name: &str, error: &str)
         -> zbus::Result<()>;
 
+    /// A destructive step was refused as likely accidental data loss. Nothing
+    /// was deleted; the user should look and confirm.
+    #[zbus(signal)]
+    async fn safety_stop(emitter: &SignalEmitter<'_>, reason: &str) -> zbus::Result<()>;
+
     #[zbus(signal)]
     async fn hydration_started(
         emitter: &SignalEmitter<'_>,
@@ -296,6 +301,9 @@ pub async fn serve(app: Arc<App>) -> Result<zbus::Connection> {
                         }
                         DaemonEvent::ItemFailed { name, error } => {
                             DaemonService::item_failed(&emitter, &name, &error).await
+                        }
+                        DaemonEvent::SafetyStop { reason } => {
+                            DaemonService::safety_stop(&emitter, &reason).await
                         }
                         DaemonEvent::HydrationStarted(hydration) => {
                             DaemonService::hydration_started(&emitter, hydration).await
