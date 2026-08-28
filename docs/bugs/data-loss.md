@@ -35,4 +35,12 @@
 - **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::freeing_space_refuses_an_in_place_edit_that_kept_size_and_mtime`（已验证：无哈希门禁时 RED，有则 GREEN）；`hash.rs` 三个单测。
 - **待续**：下载覆盖路径（`plan.rs:181` `Download{overwrite:true}`）与 `materialize_all` 空洞重建（DL-003）复用同一 `local_content_unsynced` 门禁，随后提交。
 
-<!-- 后续：DL-003 materialize 清零、DL-005 If-Match 丢失更新、DL-007 冲突副本碰撞。 -->
+## DL-003 · materialize 空洞重建把用户的稀疏文件清零
+
+- **首次发现**：2026-08-28
+- **现象**：`materialize_all` 对 xattr=Hydrated 且 `blocks*512*4 < len`（分配 <25% 视为空洞）的文件直接 `Placeholder::create` 截断清零。真实稀疏文件（VM 镜像、预分配数据库、稀疏日志）满足此条件，会被误清零，且从未上传。
+- **根因**：`crates/gonedrive-core/src/sync/engine.rs::materialize_all` 的空洞重建分支仅凭稀疏度判据，无任何上传安全检查（不看 ItemState、不比哈希）。
+- **修复**：重建前增加 `safe_to_rebuild` 门禁——仅当"记录的内容哈希 xattr 存在**且**与当前文件哈希相等"（即确为我们写入的、已在服务端的字节）才重建；否则（哈希不符=用户编辑过，或无记录哈希）保持原样，绝不清零。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::materialize_never_zeroes_a_sparse_file_the_user_edited`（已验证：无门禁 RED，有门禁 GREEN）。
+
+<!-- 后续：DL-005 If-Match 丢失更新、DL-007 冲突副本碰撞、以及下载覆盖路径门禁。 -->

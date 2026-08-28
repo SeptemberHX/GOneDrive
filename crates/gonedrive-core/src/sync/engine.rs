@@ -1611,7 +1611,17 @@ impl Engine {
                     let hollow = std::fs::metadata(&path)
                         .map(|m| m.len() > 4096 && m.blocks() * 512 * 4 < m.len())
                         .unwrap_or(false);
-                    if hollow {
+                    // Rebuilding truncates and zeroes the file. Only do it when
+                    // the bytes really are the ones we recorded — otherwise this
+                    // is a genuinely sparse file the user edited (a VM image, a
+                    // preallocated database), and a rebuild would destroy the
+                    // edit. If we never recorded a hash, leave it untouched
+                    // rather than risk it.
+                    let safe_to_rebuild = Placeholder::content_hash(&path)
+                        .zip(crate::hash::quick_xor_file(&path).ok())
+                        .map(|(recorded, current)| recorded == current)
+                        .unwrap_or(false);
+                    if hollow && safe_to_rebuild {
                         if Placeholder::create(
                             &path,
                             file.size,

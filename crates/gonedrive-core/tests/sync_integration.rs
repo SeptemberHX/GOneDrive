@@ -1459,6 +1459,38 @@ async fn freeing_space_refuses_an_in_place_edit_that_kept_size_and_mtime() {
 }
 
 #[tokio::test]
+async fn materialize_never_zeroes_a_sparse_file_the_user_edited() {
+    // The materialize hollow-rebuild turns a "downloaded" file that is actually
+    // a hole back into a placeholder. A genuinely sparse file the user edited
+    // in place (a VM image, a preallocated database) looks hollow too — it must
+    // not be truncated to holes, destroying the edit.
+    use std::io::{Seek, SeekFrom, Write};
+    let content: &[u8] = b"12345678";
+    let h = harness_with_a_downloaded_file(content).await;
+    let path = h.path("Docs/big.bin");
+
+    // Replace it with a large, genuinely-sparse file of the user's own: big
+    // apparent size, little allocated, real bytes at each end — content that
+    // differs from what we recorded on download.
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
+        f.set_len(1_000_000).unwrap();
+        f.write_all(b"USER SPARSE DATA").unwrap();
+        f.seek(SeekFrom::Start(999_990)).unwrap();
+        f.write_all(b"TAIL").unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+
+    h.engine.materialize_all(|_, _| true).unwrap();
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a sparse edited file must survive materialize, never be rebuilt to holes"
+    );
+}
+
+#[tokio::test]
 async fn placeholders_can_be_created_for_files_never_downloaded() {
     use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
 
