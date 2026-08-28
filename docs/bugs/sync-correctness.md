@@ -24,8 +24,8 @@
 
 - **首次发现**：2026-08-28（探索发现）
 - **现象**：OneDrive 大小写不敏感、Linux 敏感；仅大小写不同的两个远端项落同一目录时的行为无测试，属潜在覆盖/损坏风险。`names.rs::fold_case` 零测试。
-- **修复**：Phase 3——`fold_case` 单测 + 集成场景。
-- **回归测试**：待补（Phase 3）。
+- **修复**：Phase 3——补 `fold_case` 单测（大小写折叠一致、幂等,含 Turkish İ）+ 集成回归：本地存在仅大小写不同的两个文件时,双方本地内容均不丢失。当前行为已本地安全,测试作为防回归护栏。
+- **回归测试**：`crates/gonedrive-core/src/names.rs::fold_case_matches_names_that_differ_only_in_case`、`::fold_case_is_idempotent`;`crates/gonedrive-core/tests/sync_integration.rs::a_local_file_differing_only_in_case_loses_no_data`。
 
 ## SC-005 · 上传断点续传路径无集成测试（"未证明即隐患"）
 

@@ -175,6 +175,24 @@ mod tests {
     }
 
     #[test]
+    fn fold_case_matches_names_that_differ_only_in_case() {
+        // The whole point: OneDrive is case-insensitive, ext4 is not, so two
+        // names the service treats as one must fold to one key.
+        assert_eq!(fold_case("Report.TXT"), fold_case("report.txt"));
+        assert_eq!(fold_case("MixedCase"), fold_case("mixedcase"));
+        assert_eq!(fold_case("照片"), fold_case("照片")); // non-cased scripts unchanged
+        // Distinct names must not collide.
+        assert_ne!(fold_case("report.txt"), fold_case("report2.txt"));
+    }
+
+    #[test]
+    fn fold_case_is_idempotent() {
+        for name in ["Report.TXT", "straße", "İstanbul", "照片 2024.JPG"] {
+            assert_eq!(fold_case(&fold_case(name)), fold_case(name), "not idempotent: {name}");
+        }
+    }
+
+    #[test]
     fn free_path_dodges_existing_conflict_copies() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("report 的冲突副本.docx");

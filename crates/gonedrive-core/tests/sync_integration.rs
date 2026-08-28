@@ -1567,6 +1567,34 @@ async fn an_upload_that_would_overwrite_a_newer_remote_becomes_a_conflict() {
     assert_eq!(h.read(&copies[0]), "my local edit");
 }
 
+#[tokio::test]
+async fn a_local_file_differing_only_in_case_loses_no_data() {
+    // OneDrive is case-insensitive, ext4 is not: the user can have both
+    // Report.txt and report.txt on disk while the service can hold only one.
+    // Whatever we do to reconcile that, neither file's bytes may be destroyed.
+    let h = Harness::new().await;
+    h.mock_delta(None, vec![file("F1", ROOT, "Report.txt", "c1", 8, "2026-08-20T10:00:00Z")], "v1")
+        .await;
+    h.mock_download("F1", b"REMOTE!!").await;
+    h.sync().await;
+    assert_eq!(h.read("Report.txt"), "REMOTE!!");
+
+    // A genuinely different file that folds to the same name.
+    std::fs::write(h.path("report.txt"), b"my local file").unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    mock_upload(&h.server, "F2", "report.txt").await;
+
+    let _ = h.sync().await;
+
+    // Neither file's content may be silently lost.
+    assert!(h.path("Report.txt").exists(), "the synced file must survive");
+    assert_eq!(h.read("Report.txt"), "REMOTE!!", "the synced file must not be clobbered");
+    assert!(h.path("report.txt").exists(), "the new local file must survive");
+    assert_eq!(h.read("report.txt"), "my local file");
+}
+
 /// The DriveItem a completed chunk upload returns.
 fn uploaded_big_item() -> Value {
     json!({
