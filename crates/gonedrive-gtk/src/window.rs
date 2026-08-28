@@ -944,17 +944,23 @@ impl Ui {
 /// A coloured rounded tile with a white symbolic icon — the list-row leading
 /// graphic from the design, replacing a bare symbolic prefix.
 fn tile(icon: &str, variant: &str) -> gtk::Box {
+    // Let the icon expand to centre itself inside the square...
     let image = gtk::Image::from_icon_name(icon);
     image.set_pixel_size(18);
+    image.set_halign(gtk::Align::Center);
+    image.set_valign(gtk::Align::Center);
     image.set_hexpand(true);
     image.set_vexpand(true);
-    // A fixed 34×34 square, flush to the left of its slot rather than stretched
-    // to fill it or floating in the middle.
+    // ...but pin the square to 34×34, flush left, and explicitly refuse to
+    // expand, so the child's expand does not propagate up and shove the row's
+    // title away to the right.
     let b = gtk::Box::builder()
         .width_request(34)
         .height_request(34)
         .halign(gtk::Align::Start)
         .valign(gtk::Align::Center)
+        .hexpand(false)
+        .vexpand(false)
         .build();
     b.add_css_class("od-tile");
     b.add_css_class(variant);
