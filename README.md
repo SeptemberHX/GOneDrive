@@ -217,7 +217,10 @@ gonedrived fetch 文档/报告.docx    # 手动回填
 
 - 关闭窗口 = 隐藏到后台继续同步；托盘图标（StatusNotifierItem）单击唤出面板，右键菜单含暂停/立即同步/打开文件夹/退出。
 - 托盘依赖桌面的 StatusNotifierWatcher（GNOME 需 AppIndicator 扩展）。watcher 不在时每 30 秒自动重试注册，不影响其他功能。
-- 双击打开未下载的文件时，会弹出小progress窗口显示各文件进度、可取消；由守护进程按需拉起，全部完成后自动消失。后台索引器/缩略图进程的读取被特权 helper 直接拒绝，不触发下载也不弹窗。
+- 双击打开未下载的文件时，会弹出小进度窗口显示各文件进度、可取消；由守护进程按需拉起，全部完成后自动消失。
+- **部分回填**：文件管理器嗅探文件类型只读头部 16 KB —— 就只从云端取这 16 KB 填入窗口，文件保持占位、监视保留、零 UI 打扰；只有真正读过窗口之外的进程才触发全量下载。"进文件夹"因此不等于"下载文件夹"。老 helper 经 Features 握手自动降级为全量，绝不会错把范围当整文件。
+- 后台索引器（tracker/baloo/updatedb 等）的读取被直接拒绝，既不下载也不弹窗；拒绝名单同时存在于守护进程侧（改名单无需 root）与 helper 侧（兜底）。
+- helper 升级/重启时守护进程自动重连并重新注册全部占位文件。
 
 调试辅助：`GONEDRIVE_SNAPSHOT=/path.png`（离屏渲染当前窗口后退出）、`GONEDRIVE_PAGE=activity|settings`（预选页）、`GONEDRIVE_NO_TRAY=1`。
 

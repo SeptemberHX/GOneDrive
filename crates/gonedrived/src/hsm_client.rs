@@ -50,6 +50,7 @@ fn background_reader(comm: &str) -> Option<&'static str> {
 /// A live connection to the privileged helper.
 pub struct HsmClient {
     writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    closed: Arc<tokio::sync::Notify>,
 }
 
 impl HsmClient {
@@ -74,8 +75,10 @@ impl HsmClient {
         // the watch, and declaring the file complete — so nothing optional is
         // used until the helper says it understands it.
         let partial_hydration = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed = Arc::new(tokio::sync::Notify::new());
         let client = Self {
             writer: writer.clone(),
+            closed: closed.clone(),
         };
         client.send(&Request::Ping).await?;
         client.send(&Request::Features).await?;
@@ -98,10 +101,12 @@ impl HsmClient {
                     Ok(Some(_)) => continue,
                     Ok(None) => {
                         tracing::warn!("the files-on-demand helper closed the connection");
+                        closed.notify_waiters();
                         return;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "helper connection failed");
+                        closed.notify_waiters();
                         return;
                     }
                 }
@@ -109,6 +114,11 @@ impl HsmClient {
         });
 
         Ok(client)
+    }
+
+    /// Resolves when the helper connection has died.
+    pub async fn closed(&self) {
+        self.closed.notified().await;
     }
 
     pub fn default_socket() -> PathBuf {

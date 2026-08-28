@@ -128,34 +128,11 @@ async fn run() -> Result<()> {
         tracing::warn!("no accounts are signed in; run `gonedrived login` first");
     }
 
-    // Files on demand needs the privileged helper. Its absence is reported
-    // rather than fatal: selective sync still works without it, and saying so
-    // beats placeholders that silently read as zeroes.
-    match hsm_client::HsmClient::connect(app.clone(), &hsm_client::HsmClient::default_socket())
-        .await
-    {
-        Ok(client) => {
-            let client = std::sync::Arc::new(client);
-            match client.watch_all(&app).await {
-                Ok(n) => tracing::info!(placeholders = n, "files on demand is active"),
-                Err(e) => tracing::warn!(error = %e, "could not register placeholders"),
-            }
-            app.set_hsm(Some(client)).await;
-        }
-        Err(e) => {
-            // Not fatal — selective sync still works — but any placeholder
-            // already on disk now reads as zeroes, so say so loudly.
-            tracing::warn!("files on demand is OFF: {e}");
-            match app.dehydrated_paths().await {
-                Ok(paths) if !paths.is_empty() => tracing::error!(
-                    count = paths.len(),
-                    "there are placeholders on disk that nothing will fill; \
-                     reading one returns empty data until the helper is running"
-                ),
-                _ => {}
-            }
-        }
-    }
+    // Files on demand needs the privileged helper. The connection is
+    // supervised for the daemon's whole life: the helper restarts on
+    // upgrades, and a daemon left orphaned means placeholders that read as
+    // zeroes and free-space actions that fail — both learned the hard way.
+    tokio::spawn(hsm_supervisor(app.clone()));
 
     let connection = service::serve(app.clone()).await?;
     tracing::info!(
@@ -188,6 +165,47 @@ async fn run() -> Result<()> {
     app.clone().run(shutdown_signal()).await;
     drop(connection);
     Ok(())
+}
+
+/// Keep the daemon attached to the files-on-demand helper.
+async fn hsm_supervisor(app: std::sync::Arc<App>) {
+    let socket = hsm_client::HsmClient::default_socket();
+    let mut reported_off = false;
+    loop {
+        match hsm_client::HsmClient::connect(app.clone(), &socket).await {
+            Ok(client) => {
+                reported_off = false;
+                let client = std::sync::Arc::new(client);
+                match client.watch_all(&app).await {
+                    Ok(n) => tracing::info!(placeholders = n, "files on demand is active"),
+                    Err(e) => tracing::warn!(error = %e, "could not register placeholders"),
+                }
+                app.set_hsm(Some(client.clone())).await;
+
+                client.closed().await;
+                app.set_hsm(None).await;
+                tracing::warn!("files on demand lost the helper; reconnecting");
+            }
+            Err(e) => {
+                // Reported once, not every five seconds, and loudly the first
+                // time: placeholders on disk read as zeroes until this works.
+                if !reported_off {
+                    reported_off = true;
+                    tracing::warn!("files on demand is OFF: {e:#}");
+                    if let Ok(paths) = app.dehydrated_paths().await {
+                        if !paths.is_empty() {
+                            tracing::error!(
+                                count = paths.len(),
+                                "placeholders on disk have nothing to fill them \
+                                 until the helper is running"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
 /// Resolve when the process is asked to stop.

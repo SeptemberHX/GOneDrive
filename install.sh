@@ -14,7 +14,8 @@ if [ "${1:-}" = "--user" ]; then
     install -Dm644 data/gonedrived.service "$HOME/.config/systemd/user/gonedrived.service"
     ./install-desktop-integration.sh
     systemctl --user daemon-reload
-    systemctl --user enable --now gonedrived.service
+    systemctl --user enable gonedrived.service
+    systemctl --user restart gonedrived.service
     echo
     echo "User setup done. Sign in with: gonedrived login"
     echo "Then restart the service:      systemctl --user restart gonedrived"
@@ -33,7 +34,10 @@ install -Dm644 data/gonedrive-hsm.service /etc/systemd/system/gonedrive-hsm.serv
 install -Dm644 data/org.gonedrive.Gonedrive.desktop /usr/local/share/applications/org.gonedrive.Gonedrive.desktop
 
 systemctl daemon-reload
-systemctl enable --now gonedrive-hsm.service
+systemctl enable gonedrive-hsm.service
+# `enable --now` starts a stopped service but leaves a RUNNING one on its old
+# binary — an upgrade that silently doesn't upgrade. Restart is unconditional.
+systemctl restart gonedrive-hsm.service
 systemctl --no-pager --lines 0 status gonedrive-hsm.service | head -3
 
 echo
