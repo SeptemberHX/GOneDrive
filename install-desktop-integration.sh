@@ -15,7 +15,9 @@ install -d "$ICONS" "$APPS" "$EXTENSIONS" "$AUTOSTART"
 install -m644 data/icons/hicolor/scalable/emblems/*.svg "$ICONS/"
 install -m644 data/nautilus/gonedrive.py "$EXTENSIONS/"
 
-# The OneDrive cloud, and the sync folder set to wear it in the file manager.
+# The application icon (OneDrive cloud + GNOME foot) and the plain cloud used
+# for the sync folder in the file manager.
+install -m644 data/icons/gonedrive-app.svg "$APPS/org.gonedrive.Gonedrive.svg"
 install -m644 data/icons/onedrive.svg "$APPS/gonedrive.svg"
 SYNC_ROOT="${GONEDRIVE_SYNC_ROOT:-$HOME/OneDrive}"
 if [ -d "$SYNC_ROOT" ]; then

@@ -266,7 +266,7 @@ fn register_actions(
     about.connect_activate(move |_, _| {
         adw::AboutDialog::builder()
             .application_name("GOnedrive")
-            .application_icon("folder-remote-symbolic")
+            .application_icon("org.gonedrive.Gonedrive")
             .version(env!("CARGO_PKG_VERSION"))
             .developer_name("GOnedrive")
             .comments("Linux 上的 OneDrive 客户端：双向同步，按需下载。")
