@@ -1441,6 +1441,68 @@ async fn hydrating_a_placeholder_restores_the_exact_bytes() {
 }
 
 #[tokio::test]
+async fn a_cloud_edit_to_a_hydrated_on_demand_file_re_downloads_in_place() {
+    use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
+
+    // Regression (sync-correctness / hydration): a file the user opened —
+    // hydrated — in a folder they never pinned, then edited in the cloud. The
+    // old code demoted it to Dehydrated but, because the materialised file
+    // already existed, never punched it: the STALE bytes stayed readable and
+    // nothing ever fetched the new ones — a silent cloud edit the user never
+    // saw (observed live on 待购清单.xlsx). Chosen behaviour: once hydrated,
+    // stay hydrated and follow the cloud in place.
+    let h = Harness::with_config(Config {
+        client_id: "test".into(),
+        download_new: DownloadPolicy::Never,
+        on_demand: true,
+        ..Config::default()
+    })
+    .await;
+    h.mock_delta(
+        None,
+        vec![
+            folder("D1", ROOT, "Docs"),
+            file("F1", "D1", "note.txt", "c1", 3, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.sync().await;
+    let path = h.path("Docs/note.txt");
+    assert_eq!(
+        Placeholder::state(&path),
+        PlaceholderState::Dehydrated,
+        "an unpinned file starts life as a placeholder on disk"
+    );
+
+    // The user opens it: it hydrates individually, the folder still unpinned.
+    h.server.reset().await;
+    h.mock_download("F1", b"old").await;
+    assert_eq!(h.engine.hydrate(&path).await.unwrap(), 3);
+    assert_eq!(h.read("Docs/note.txt"), "old");
+    assert!(Occupancy::read(&path).unwrap().allocated >= 3, "now materialised");
+
+    // Now it changes in the cloud.
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![file("F1", "D1", "note.txt", "c2", 5, "2026-08-21T10:00:00Z")],
+        "v2",
+    )
+    .await;
+    h.mock_download("F1", b"newer").await;
+
+    let summary = h.sync().await;
+
+    // It followed the cloud in place — not dropped to a placeholder holding
+    // the stale "old" bytes.
+    assert_eq!(summary.downloaded, 1, "the hydrated file re-downloads");
+    assert_eq!(h.read("Docs/note.txt"), "newer");
+    assert_eq!(h.store.item("F1").unwrap().unwrap().state, ItemState::Synced);
+    assert_eq!(Placeholder::state(&path), PlaceholderState::Hydrated);
+}
+
+#[tokio::test]
 async fn a_hydrated_file_is_not_re_uploaded_by_the_next_scan() {
     // The failure this guards against: hydration writes to the file, and if
     // that leaves it looking modified, the next scan uploads the copy we just

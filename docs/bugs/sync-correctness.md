@@ -43,6 +43,14 @@
 - **回归测试**：`crates/gonedrive-core/src/sync/plan.rs::stale_content_under_a_matching_ctag_is_still_fetched`（无修复时走 Skip=RED，有修复走 `Download{overwrite:true}`=GREEN）。
 - **后续硬化（待做）**：`apply_remote` 被动分支（RestampMtime / Skip-UpToDate）应沿用 `known.state` 而非默认 `Synced`,让合法的 `DirtyRemote`/`DirtyLocal` 不被重枚举覆盖;根因层面可让记录的 ctag 在内容真正落地前不推进。
 
+## SC-007 · 已 hydrate 的按需文件在云端变化时被降级但不打洞 → 旧字节永久可读
+
+- **首次发现**：2026-08-28（真机复现，与 SC-006 同一文件 `待购清单.xlsx` 的深层因）
+- **现象**：用户曾打开（hydrate）过、但所在文件夹未被 pin 的文件，在云端改动后，本地一直读到旧内容且访问也不触发下载。
+- **根因**：`apply_remote` 的 `Download` 分支只看 `wants_content`（pin 选择）。未选中时走 else：`state=Dehydrated` + 「`on_demand && !path.exists()` 才建占位符」。对一个**已实体化**的文件，`path.exists()` 为真 → 只把 DB 状态改成 dehydrated、**不真正打洞**，留下完整旧字节；HSM 见字节已在也不会触发 hydration，遂永久卡旧内容。
+- **修复**：Download 分支新增 `materialised` 判断——用 `Occupancy`（`allocated >= apparent_size`，而非会被应用剥掉的 state xattr）判断盘上是否有真实内容；**已实体化即视为该下载**，走 `DirtyRemote` 原地重下、保持 hydrated（用户选定行为：已下载文件跟随云端自动更新，贴合 Windows 客户端）。else 分支去掉 `!path.exists()` 守卫，让未实体化的既有占位符也能刷新到新版本（materialised 守卫已保证不会截断真实内容）。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_cloud_edit_to_a_hydrated_on_demand_file_re_downloads_in_place`（已验证：无修复时 RED——文件被降级、读到旧字节；有修复 GREEN——原地重下为新内容）。
+
 ## SC-004 · 上传无 If-Match → 拉取与推送间他端改动被静默覆盖
 
 - **首次发现**：2026-08-28（探索发现）

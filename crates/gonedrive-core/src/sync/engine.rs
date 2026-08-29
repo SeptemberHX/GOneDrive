@@ -477,11 +477,27 @@ impl Engine {
                 }
             }
             RemoteAction::Download { .. } => {
-                // An item the user has not asked for is recorded but not
-                // fetched. A drive is routinely larger than the disk under it,
-                // so enumerating everything and downloading nothing is the only
-                // safe thing to do before the user has chosen.
-                if self.wants_content(known.as_ref(), parent_id)? {
+                // A file the user has already materialised locally stays
+                // materialised: once its real bytes are on disk, a cloud change
+                // re-downloads in place rather than dropping back to a
+                // placeholder. The old behaviour demoted it to Dehydrated but —
+                // because a materialised file already exists — never punched
+                // it, leaving the *stale* bytes readable with no event ever
+                // fetching the new ones (a cloud edit the user silently never
+                // saw). Occupancy, not the state xattr, is the robust test: an
+                // app that rewrites a file (LibreOffice's save-and-rename)
+                // strips our xattrs, but full allocation still means real
+                // content lives here.
+                //
+                // An item the user has *not* materialised and not asked for is
+                // recorded but not fetched: a drive is routinely larger than
+                // the disk under it, so enumerating everything and downloading
+                // nothing is the only safe thing to do before the user chooses.
+                let materialised = local.as_ref().is_some_and(|l| !l.is_dir)
+                    && crate::hydrate::Occupancy::read(&path)
+                        .map(|o| o.apparent_size > 0 && o.allocated >= o.apparent_size)
+                        .unwrap_or(false);
+                if materialised || self.wants_content(known.as_ref(), parent_id)? {
                     state = ItemState::DirtyRemote;
                     self.store.enqueue(
                         &self.account_id,
@@ -495,8 +511,11 @@ impl Engine {
                     summary.not_downloaded += 1;
                     // In on-demand mode a newly-seen file becomes a placeholder
                     // right away, so it shows up in the file manager without
-                    // waiting for a full re-materialisation.
-                    if self.config.on_demand && !path.exists() {
+                    // waiting for a full re-materialisation. Reached only when
+                    // the file is not materialised, so `create` (which
+                    // truncates) can refresh an existing placeholder to the new
+                    // remote version without ever discarding real content.
+                    if self.config.on_demand {
                         if let Err(e) = Placeholder::create(
                             &path,
                             remote.size.unwrap_or(0),
