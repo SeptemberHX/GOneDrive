@@ -59,6 +59,11 @@ pub enum Error {
     #[error("secret service: {0}")]
     Keyring(String),
 
+    /// The credentials still exist, but Secret Service requires the user to
+    /// unlock the collection before they can be read or updated.
+    #[error("credential keyring is locked: {0}")]
+    KeyringLocked(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -72,6 +77,9 @@ impl Error {
     pub fn is_transient(&self) -> bool {
         match self {
             Error::Throttled(_) => true,
+            // Nothing is wrong with the saved credential. Once the user
+            // unlocks the login keyring, the exact same operation can run.
+            Error::KeyringLocked(_) => true,
             // `is_body` is the one that matters on a flaky link: a connection
             // dropped or reset *while streaming a response body* (a train
             // entering a tunnel mid-download) surfaces here, not as a connect
@@ -126,6 +134,7 @@ mod tests {
         // A genuine local problem is not a network hiccup: do not retry forever.
         assert!(!Error::Io(io::Error::from(io::ErrorKind::PermissionDenied)).is_transient());
         assert!(!Error::other("bad name").is_transient());
+        assert!(Error::KeyringLocked("login collection".into()).is_transient());
     }
 }
 

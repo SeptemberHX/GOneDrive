@@ -66,7 +66,8 @@ pub struct FolderEntry {
 /// What the daemon is doing right now.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct SyncStatus {
-    /// One of `idle`, `syncing`, `paused`, `offline`, `signed_out`, `error`.
+    /// One of `idle`, `syncing`, `paused`, `offline`, `keyring_locked`,
+    /// `signed_out`, or `error`.
     pub state: String,
     /// Operations still queued.
     pub pending: u64,

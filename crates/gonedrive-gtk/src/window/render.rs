@@ -151,6 +151,7 @@ impl Ui {
             "uploading" => ("正在上传", "emblem-synchronizing-symbolic"),
             "paused" => ("已暂停", "media-playback-pause-symbolic"),
             "offline" => ("离线，稍后重试", "network-offline-symbolic"),
+            "keyring_locked" => ("请解锁钥匙环", "dialog-password-symbolic"),
             "signed_out" => ("需要重新登录", "dialog-warning-symbolic"),
             "error" => ("同步出错", "dialog-error-symbolic"),
             _ if status.pending > 0 => return self.apply_pending(status),

@@ -32,7 +32,16 @@ impl TokenStore {
         HashMap::from([("application", APP_ATTR), ("account", account_id)])
     }
 
+    async fn unlock(&self, operation: &str) -> Result<()> {
+        self.keyring
+            .unlock()
+            .await
+            .map_err(|error| keyring_error(operation, error))
+    }
+
     pub async fn save(&self, account_id: &str, refresh_token: &str) -> Result<()> {
+        self.unlock("unlocking the keyring before storing credentials")
+            .await?;
         self.keyring
             .create_item(
                 &format!("GOnedrive refresh token ({account_id})"),
@@ -43,33 +52,61 @@ impl TokenStore {
                 true,
             )
             .await
-            .map_err(|e| Error::Keyring(format!("storing the refresh token failed: {e}")))
+            .map_err(|error| keyring_error("storing the refresh token failed", error))
     }
 
     pub async fn load(&self, account_id: &str) -> Result<Option<String>> {
+        self.unlock("unlocking the keyring before reading credentials")
+            .await?;
         let items = self
             .keyring
             .search_items(&Self::attributes(account_id))
             .await
-            .map_err(|e| Error::Keyring(format!("searching the keyring failed: {e}")))?;
+            .map_err(|error| keyring_error("searching the keyring failed", error))?;
 
         let Some(item) = items.first() else {
             return Ok(None);
         };
+        if item
+            .is_locked()
+            .await
+            .map_err(|error| keyring_error("checking the credential lock failed", error))?
+        {
+            item.unlock()
+                .await
+                .map_err(|error| keyring_error("unlocking the stored credential failed", error))?;
+        }
         let secret = item
             .secret()
             .await
-            .map_err(|e| Error::Keyring(format!("reading the refresh token failed: {e}")))?;
+            .map_err(|error| keyring_error("reading the refresh token failed", error))?;
         let token = String::from_utf8(secret.to_vec())
             .map_err(|_| Error::Keyring("the stored refresh token is not valid UTF-8".into()))?;
         Ok(Some(token))
     }
 
     pub async fn delete(&self, account_id: &str) -> Result<()> {
+        self.unlock("unlocking the keyring before deleting credentials")
+            .await?;
         self.keyring
             .delete(&Self::attributes(account_id))
             .await
-            .map_err(|e| Error::Keyring(format!("deleting the refresh token failed: {e}")))
+            .map_err(|error| keyring_error("deleting the refresh token failed", error))
+    }
+}
+
+fn keyring_error(operation: &str, error: oo7::Error) -> Error {
+    let message = format!("{operation}: {error}");
+    if matches!(
+        error,
+        oo7::Error::DBus(
+            oo7::dbus::Error::Service(oo7::dbus::ServiceError::IsLocked(_))
+                | oo7::dbus::Error::Dismissed
+        )
+    ) {
+        Error::KeyringLocked(message)
+    } else {
+        Error::Keyring(message)
     }
 }
 
@@ -201,5 +238,33 @@ impl TokenSource {
 impl From<Arc<Authenticator>> for TokenSource {
     fn from(auth: Arc<Authenticator>) -> Self {
         TokenSource::Interactive(auth)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locked_and_dismissed_prompts_are_not_mistaken_for_missing_credentials() {
+        let locked = oo7::Error::DBus(oo7::dbus::Error::Service(
+            oo7::dbus::ServiceError::IsLocked("locked".into()),
+        ));
+        let dismissed = oo7::Error::DBus(oo7::dbus::Error::Dismissed);
+
+        assert!(matches!(
+            keyring_error("reading", locked),
+            Error::KeyringLocked(_)
+        ));
+        assert!(matches!(
+            keyring_error("reading", dismissed),
+            Error::KeyringLocked(_)
+        ));
+    }
+
+    #[test]
+    fn unrelated_keyring_failures_remain_diagnostic_errors() {
+        let error = oo7::Error::DBus(oo7::dbus::Error::NotFound("login".into()));
+        assert!(matches!(keyring_error("reading", error), Error::Keyring(_)));
     }
 }

@@ -130,6 +130,10 @@ impl Engine {
                 match self.run_op(&op, summary, deadline).await {
                     Ok(()) => self.store.complete_op(op.id)?,
                     Err(Error::Cancelled) if deadline.is_some() => return Ok(()),
+                    // Credentials are shared account state, not a bad file.
+                    // Leave the operation untouched and let the coordinator
+                    // expose the actionable account status to the user.
+                    Err(e) if is_account_credential_error(&e) => return Err(e),
                     Err(e) => self.record_failure(&op, e, summary)?,
                 }
             }
@@ -746,4 +750,31 @@ fn name_for_path(path: &Path) -> String {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned()
+}
+
+fn is_account_credential_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::AuthRequired(_) | Error::Keyring(_) | Error::KeyringLocked(_)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_account_credential_error;
+    use crate::Error;
+
+    #[test]
+    fn credential_failures_escape_the_file_retry_queue() {
+        assert!(is_account_credential_error(&Error::AuthRequired(
+            "expired".into()
+        )));
+        assert!(is_account_credential_error(&Error::Keyring(
+            "service unavailable".into()
+        )));
+        assert!(is_account_credential_error(&Error::KeyringLocked(
+            "login collection".into()
+        )));
+        assert!(!is_account_credential_error(&Error::other("bad name")));
+    }
 }

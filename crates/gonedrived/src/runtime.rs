@@ -13,9 +13,12 @@ pub(crate) async fn run() -> Result<()> {
     let config = load_config()?;
     let app = App::new(config).await?;
 
+    let has_configured_account = !app.store.accounts()?.is_empty();
     let accounts = app.load_accounts().await?;
-    if accounts == 0 {
+    if !has_configured_account {
         tracing::warn!("no accounts are signed in; run `gonedrived login` first");
+    } else if accounts == 0 {
+        tracing::warn!("the configured account is waiting for credentials to become available");
     }
 
     // Files on demand needs the privileged helper. The connection is
@@ -51,7 +54,7 @@ pub(crate) async fn run() -> Result<()> {
 
     // Keep the watcher alive for the daemon's lifetime; dropping it stops the
     // watch and the client silently falls back to poll-only.
-    let (_watcher, local_changes) = if accounts > 0 {
+    let (_watcher, local_changes) = if has_configured_account {
         watcher::check_watch_limit(&app.config.sync_root);
         match LocalWatcher::start(
             &app.config.sync_root,

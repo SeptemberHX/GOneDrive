@@ -14,6 +14,7 @@
 #   the app + folder icons, the emblems, the .desktop and a silent autostart,
 #   and the Nautilus extension.
 set -euo pipefail
+umask 022
 cd "$(dirname "$0")"
 
 : "${GONEDRIVE_CLIENT_ID:?set GONEDRIVE_CLIENT_ID to your Entra application (client) id}"
@@ -21,6 +22,7 @@ cd "$(dirname "$0")"
 VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
 ARCH=$(dpkg --print-architecture)
 STAGE=$(mktemp -d)
+chmod 0755 "$STAGE"
 trap 'rm -rf "$STAGE"' EXIT
 
 echo ">> Building release binaries (GOnedrive $VERSION, $ARCH)…"
@@ -70,7 +72,7 @@ Maintainer: GOnedrive <noreply@example.com>
 Installed-Size: $INSTALLED_KB
 Section: net
 Priority: optional
-Depends: libc6, libgtk-4-1, libadwaita-1-0, python3, python3-gi
+Depends: libc6, libgtk-4-1 (>= 4.18), libadwaita-1-0 (>= 1.7), python3, python3-gi
 Recommends: python3-nautilus, gnome-shell-extension-appindicator
 Description: OneDrive client for Linux with files-on-demand
  GOnedrive syncs Microsoft OneDrive two ways and supports files-on-demand:

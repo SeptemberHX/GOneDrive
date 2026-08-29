@@ -24,6 +24,8 @@ use gonedrive_ipc::{AccountInfo, Hydration, SyncRequestResult, SyncStatus};
 /// signature of content sniffing, and even when it is not, filling just the
 /// window is always correct — the watch stays armed for the rest.
 const PARTIAL_HYDRATION_CEILING: u64 = 256 * 1024;
+const KEYRING_LOCKED_MESSAGE: &str =
+    "系统钥匙环已锁定。请先解锁登录钥匙环，然后点击“立即同步”重试；已保存的登录凭据仍然保留。";
 
 /// What to do for a blocked read, decided purely from the request — no I/O, so
 /// the browsing/copier/consumer policy can be tested on its own.
@@ -81,6 +83,15 @@ fn decide_stage(
         }
     } else {
         StagePlan::Full
+    }
+}
+
+fn core_error_status(error: &Error) -> (&'static str, String) {
+    match error {
+        Error::AuthRequired(message) => ("signed_out", message.clone()),
+        Error::KeyringLocked(_) => ("keyring_locked", KEYRING_LOCKED_MESSAGE.into()),
+        error if error.is_transient() => ("offline", error.to_string()),
+        error => ("error", error.to_string()),
     }
 }
 use tokio::sync::{broadcast, Mutex, Notify, OwnedMutexGuard, RwLock};
@@ -244,11 +255,28 @@ impl App {
                 Ok(()) => loaded += 1,
                 Err(e) => {
                     tracing::error!(account = %account.id, error = %e, "could not sign in");
-                    self.set_state("signed_out", Some(e.to_string())).await;
+                    self.report_anyhow_error(&e).await;
                 }
             }
         }
         Ok(loaded)
+    }
+
+    /// Retry accounts that exist in the database but could not be attached at
+    /// startup, most commonly because the login keyring was locked. Called by
+    /// an explicit SyncNow after the user has unlocked it.
+    pub(super) async fn attach_missing_accounts(&self) -> Result<usize> {
+        let active: std::collections::HashSet<_> =
+            self.engines.read().await.keys().cloned().collect();
+        let mut attached = 0;
+        for account in self.store.accounts()? {
+            if active.contains(&account.id) {
+                continue;
+            }
+            self.attach_account(&account.id).await?;
+            attached += 1;
+        }
+        Ok(attached)
     }
 
     /// Build and register the engine for one account.
@@ -519,6 +547,22 @@ impl App {
         self.emit(DaemonEvent::Status(snapshot));
     }
 
+    async fn report_core_error(&self, error: &Error) -> String {
+        let (state, message) = core_error_status(error);
+        self.set_state(state, Some(message.clone())).await;
+        message
+    }
+
+    async fn report_anyhow_error(&self, error: &anyhow::Error) -> String {
+        if let Some(error) = error.downcast_ref::<Error>() {
+            self.report_core_error(error).await
+        } else {
+            let message = error.to_string();
+            self.set_state("error", Some(message.clone())).await;
+            message
+        }
+    }
+
     /// Pause or resume syncing.
     ///
     /// The flag and the reported state are updated together: a UI that pauses
@@ -578,7 +622,7 @@ impl App {
         for engine in engines {
             if let Err(e) = engine.transfer_only().await {
                 tracing::error!(error = %e, "transfer pass failed");
-                self.set_state("error", Some(e.to_string())).await;
+                self.report_core_error(&e).await;
             }
         }
         Ok(())
@@ -598,17 +642,9 @@ impl App {
                         || summary.deleted_remote > 0
                         || summary.still_queued > 0;
                 }
-                Err(Error::AuthRequired(message)) => {
-                    tracing::error!(%message, "sign-in required");
-                    self.set_state("signed_out", Some(message)).await;
-                }
-                Err(e) if e.is_transient() => {
-                    tracing::warn!(error = %e, "sync pass failed; will retry");
-                    self.set_state("offline", Some(e.to_string())).await;
-                }
                 Err(e) => {
-                    tracing::error!(error = %e, "sync pass failed");
-                    self.set_state("error", Some(e.to_string())).await;
+                    tracing::warn!(error = %e, "sync pass failed");
+                    self.report_core_error(&e).await;
                 }
             }
         }

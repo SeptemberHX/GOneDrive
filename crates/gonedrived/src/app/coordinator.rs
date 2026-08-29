@@ -96,12 +96,7 @@ impl App {
                 }
                 Err(error) => {
                     tracing::warn!(%error, scope = ?batch.scope, "transfer slice failed");
-                    let state = if error.is_transient() {
-                        "offline"
-                    } else {
-                        "error"
-                    };
-                    self.set_state(state, Some(error.to_string())).await;
+                    self.report_core_error(&error).await;
                 }
             }
         }
@@ -333,30 +328,32 @@ impl App {
             // for a successful fresh delta, preserving the pull-before-upload
             // invariant; If-Match remains the final race guard at Graph.
             if force_remote || Instant::now() >= next_remote {
-                let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
                 let mut changes = 0u64;
                 let mut queued = 0u64;
                 let mut failure = None;
-                for engine in &engines {
-                    match engine.sync_remote().await {
-                        Ok(summary) => {
-                            changes = changes.saturating_add(summary.enumerated);
-                            queued = queued.saturating_add(summary.still_queued);
-                        }
-                        Err(Error::AuthRequired(message)) => {
-                            self.set_state("signed_out", Some(message.clone())).await;
-                            failure = Some(message);
-                            break;
-                        }
-                        Err(error) if error.is_transient() => {
-                            self.set_state("offline", Some(error.to_string())).await;
-                            failure = Some(error.to_string());
-                            break;
-                        }
-                        Err(error) => {
-                            self.set_state("error", Some(error.to_string())).await;
-                            failure = Some(error.to_string());
-                            break;
+
+                // Startup can leave a configured account unattached when the
+                // keyring is locked. Do not prompt on every timer tick; retry
+                // only after an explicit wake (SyncNow or a local change).
+                if force_remote {
+                    if let Err(error) = self.attach_missing_accounts().await {
+                        tracing::warn!(%error, "could not restore configured account");
+                        failure = Some(self.report_anyhow_error(&error).await);
+                    }
+                }
+
+                let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+                if failure.is_none() {
+                    for engine in &engines {
+                        match engine.sync_remote().await {
+                            Ok(summary) => {
+                                changes = changes.saturating_add(summary.enumerated);
+                                queued = queued.saturating_add(summary.still_queued);
+                            }
+                            Err(error) => {
+                                failure = Some(self.report_core_error(&error).await);
+                                break;
+                            }
                         }
                     }
                 }

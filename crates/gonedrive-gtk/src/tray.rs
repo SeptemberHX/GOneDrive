@@ -52,7 +52,7 @@ impl GonedriveTray {
             "syncing" | "enumerating" | "downloading" | "uploading" => "sync",
             "paused" => "paused",
             "offline" => "offline",
-            "signed_out" | "error" => "error",
+            "keyring_locked" | "signed_out" | "error" => "error",
             _ => "idle",
         }
     }
@@ -89,6 +89,7 @@ impl GonedriveTray {
             },
             "paused" => "已暂停".into(),
             "offline" => "离线，稍后重试".into(),
+            "keyring_locked" => "请解锁钥匙环".into(),
             "signed_out" => "需要重新登录".into(),
             "error" => "同步出错".into(),
             _ if self.status.pending > 0 => format!("等待处理 {} 项", self.status.pending),
@@ -119,6 +120,7 @@ impl Tray for GonedriveTray {
             }
             "paused" => "media-playback-pause-symbolic".into(),
             "offline" => "network-offline-symbolic".into(),
+            "keyring_locked" => "dialog-password-symbolic".into(),
             "signed_out" | "error" => "dialog-warning-symbolic".into(),
             _ => "folder-remote-symbolic".into(),
         }

@@ -1,13 +1,24 @@
-
 use std::sync::Arc;
 use std::time::Duration;
 
 use gonedrive_core::sync::engine::QueueScope;
 
 use super::{
-    decide_stage, is_browsing_reader, outbound_scope, phase_state, sync_barrier_ready, PathLocks,
-    StagePlan, PARTIAL_HYDRATION_CEILING,
+    core_error_status, decide_stage, is_browsing_reader, outbound_scope, phase_state,
+    sync_barrier_ready, PathLocks, StagePlan, KEYRING_LOCKED_MESSAGE, PARTIAL_HYDRATION_CEILING,
 };
+
+#[test]
+fn a_locked_keyring_is_not_reported_as_an_expired_login() {
+    let (state, message) = core_error_status(&gonedrive_core::Error::KeyringLocked(
+        "prompt dismissed".into(),
+    ));
+    assert_eq!(state, "keyring_locked");
+    assert_eq!(message, KEYRING_LOCKED_MESSAGE);
+
+    let (state, _) = core_error_status(&gonedrive_core::Error::AuthRequired("revoked".into()));
+    assert_eq!(state, "signed_out");
+}
 
 #[test]
 fn remote_deletes_wait_for_a_successful_complete_local_verification() {

@@ -147,7 +147,7 @@ async fn sync_via_daemon(proxy: &gonedrive_ipc::DaemonProxy<'static>) -> Result<
                 println!("Done.");
                 return Ok(());
             }
-            "signed_out" | "error" => {
+            "keyring_locked" | "signed_out" | "error" => {
                 anyhow::bail!("the daemon reports: {}", status.last_error)
             }
             "paused" => anyhow::bail!("the daemon paused for safety: {}", status.last_error),
