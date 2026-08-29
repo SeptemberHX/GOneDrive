@@ -36,7 +36,11 @@ impl Default for QuickXorHash {
 
 impl QuickXorHash {
     pub fn new() -> Self {
-        Self { data: [0; CELLS], length_so_far: 0, shift_so_far: 0 }
+        Self {
+            data: [0; CELLS],
+            length_so_far: 0,
+            shift_so_far: 0,
+        }
     }
 
     pub fn update(&mut self, array: &[u8]) {
@@ -60,7 +64,11 @@ impl QuickXorHash {
                 }
             } else {
                 let index1 = vector_array_index;
-                let index2 = if is_last_cell { 0 } else { vector_array_index + 1 };
+                let index2 = if is_last_cell {
+                    0
+                } else {
+                    vector_array_index + 1
+                };
                 let low = (bits_in_vector_cell - vector_offset) as u32;
 
                 let mut xored_byte: u8 = 0;
@@ -75,13 +83,16 @@ impl QuickXorHash {
 
             vector_offset += SHIFT;
             while vector_offset >= bits_in_vector_cell {
-                vector_array_index = if is_last_cell { 0 } else { vector_array_index + 1 };
+                vector_array_index = if is_last_cell {
+                    0
+                } else {
+                    vector_array_index + 1
+                };
                 vector_offset -= bits_in_vector_cell;
             }
         }
 
-        self.shift_so_far =
-            (self.shift_so_far + SHIFT * (cb_size % WIDTH_IN_BITS)) % WIDTH_IN_BITS;
+        self.shift_so_far = (self.shift_so_far + SHIFT * (cb_size % WIDTH_IN_BITS)) % WIDTH_IN_BITS;
         self.length_so_far += cb_size as u64;
     }
 
@@ -90,7 +101,11 @@ impl QuickXorHash {
         let mut rgb = [0u8; 20];
         for (i, cell) in self.data.iter().enumerate() {
             let bytes = cell.to_le_bytes();
-            let to_copy = if i == CELLS - 1 { BITS_IN_LAST_CELL / 8 } else { 8 };
+            let to_copy = if i == CELLS - 1 {
+                BITS_IN_LAST_CELL / 8
+            } else {
+                8
+            };
             rgb[i * 8..i * 8 + to_copy].copy_from_slice(&bytes[..to_copy]);
         }
         // XOR the little-endian length into the tail, as the reference does.

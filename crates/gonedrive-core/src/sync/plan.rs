@@ -56,7 +56,9 @@ pub enum RemoteAction {
     CreateDirectory,
     /// Fetch content. `overwrite` distinguishes a new file from a replacement,
     /// which matters only for logging and progress reporting.
-    Download { overwrite: bool },
+    Download {
+        overwrite: bool,
+    },
     /// Content is unchanged; only the timestamp needs re-stamping.
     RestampMtime,
     /// The item is gone remotely and untouched locally.
@@ -212,7 +214,11 @@ pub fn decide_remote(
 ///
 /// `name` is the entry's own file name, validated here because this is the
 /// last point before it would enter the upload queue.
-pub fn decide_local(name: &str, known: Option<&ItemRecord>, local: Option<&LocalStat>) -> LocalAction {
+pub fn decide_local(
+    name: &str,
+    known: Option<&ItemRecord>,
+    local: Option<&LocalStat>,
+) -> LocalAction {
     if let Err(reason) = validate_name(name) {
         return LocalAction::Skip(SkipReason::InvalidName(reason));
     }
@@ -267,10 +273,7 @@ pub fn order_parents_first(items: Vec<DriveItem>) -> Vec<DriveItem> {
     order.sort_by_key(|&i| depth[i]);
 
     let mut slots: Vec<Option<DriveItem>> = items.into_iter().map(Some).collect();
-    order
-        .into_iter()
-        .filter_map(|i| slots[i].take())
-        .collect()
+    order.into_iter().filter_map(|i| slots[i].take()).collect()
 }
 
 fn batch_depth(
@@ -482,7 +485,10 @@ mod tests {
         // is covered by `local_only_change_is_left_to_the_upload_path`).
         let local = stat(11191, mtime);
         let known = synced_record(&remote, &local); // cTag c2, size 9603, local_size 11191
-        assert!(!local_is_modified(&known, &local), "guard: not a local edit");
+        assert!(
+            !local_is_modified(&known, &local),
+            "guard: not a local edit"
+        );
         assert_eq!(
             decide_remote(&remote, Some(&known), Some(&local)),
             RemoteAction::Download { overwrite: true }
@@ -580,7 +586,10 @@ mod tests {
     #[test]
     fn folders_are_created_and_then_left_alone() {
         let folder = remote_folder("D1", "R", "Documents");
-        assert_eq!(decide_remote(&folder, None, None), RemoteAction::CreateDirectory);
+        assert_eq!(
+            decide_remote(&folder, None, None),
+            RemoteAction::CreateDirectory
+        );
         assert_eq!(
             decide_remote(&folder, None, Some(&dir_stat())),
             RemoteAction::Skip(SkipReason::UpToDate)
@@ -632,7 +641,10 @@ mod tests {
         let local = stat(10, 1_787_000_000);
         let known = synced_record(&remote, &local);
 
-        assert_eq!(decide_local("a.txt", None, Some(&local)), LocalAction::UploadNew);
+        assert_eq!(
+            decide_local("a.txt", None, Some(&local)),
+            LocalAction::UploadNew
+        );
         assert_eq!(
             decide_local("Docs", None, Some(&dir_stat())),
             LocalAction::CreateRemoteFolder

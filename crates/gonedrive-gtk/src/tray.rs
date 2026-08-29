@@ -127,7 +127,10 @@ impl Tray for GonedriveTray {
     /// The OneDrive brand icon for the current state, at the sizes the panel
     /// might want. Empty when rendering was unavailable — `icon_name` covers it.
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        self.icons.get(self.icon_category()).cloned().unwrap_or_default()
+        self.icons
+            .get(self.icon_category())
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {

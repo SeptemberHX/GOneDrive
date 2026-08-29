@@ -273,7 +273,10 @@ impl Ui {
 
         // Bottom switcher: the GNOME pattern for a narrow window — the header
         // stays clean and the three views never truncate.
-        let switcher = adw::ViewSwitcherBar::builder().stack(&views).reveal(true).build();
+        let switcher = adw::ViewSwitcherBar::builder()
+            .stack(&views)
+            .reveal(true)
+            .build();
 
         let panel = adw::ToolbarView::new();
         panel.add_top_bar(&header);
@@ -407,7 +410,10 @@ impl Ui {
         let status_top = gtk::Box::builder().spacing(12).build();
         let status_icon = gtk::Image::from_icon_name("emblem-ok-symbolic");
         status_icon.set_pixel_size(24);
-        let spinner = adw::Spinner::builder().visible(false).width_request(24).build();
+        let spinner = adw::Spinner::builder()
+            .visible(false)
+            .width_request(24)
+            .build();
         status_top.append(&status_icon);
         status_top.append(&spinner);
         let status_text = gtk::Box::builder()
@@ -554,7 +560,12 @@ impl Ui {
     }
 
     /// The settings dialog, built once so the pause switch it owns persists.
-    fn build_settings() -> (adw::PreferencesDialog, gtk::Switch, adw::ActionRow, gtk::Button) {
+    fn build_settings() -> (
+        adw::PreferencesDialog,
+        gtk::Switch,
+        adw::ActionRow,
+        gtk::Button,
+    ) {
         let dialog = adw::PreferencesDialog::builder().title("设置").build();
         let page = adw::PreferencesPage::new();
 
@@ -696,7 +707,9 @@ impl Ui {
                 self.show_banner(&format!("登录失败：{message}"));
             }
             UiEvent::Conflict { original, copy } => {
-                self.show_banner(&format!("{original} 在两端都被修改，本地版本已保留为 {copy}"));
+                self.show_banner(&format!(
+                    "{original} 在两端都被修改，本地版本已保留为 {copy}"
+                ));
             }
             UiEvent::ItemFailed { name, error } => {
                 self.show_banner(&format!("{name} 同步失败：{error}"));
@@ -858,7 +871,11 @@ impl Ui {
                 ("<span foreground='#4aa3e8'>☁</span>", "仅在线", "")
             };
             let size = if entry.is_folder {
-                format!("{dot} {word}{extra} · {} 项 · {}", entry.files, human(entry.bytes))
+                format!(
+                    "{dot} {word}{extra} · {} 项 · {}",
+                    entry.files,
+                    human(entry.bytes)
+                )
             } else {
                 format!("{dot} {word}{extra} · {}", human(entry.bytes))
             };
@@ -1047,7 +1064,9 @@ struct HomeFields {
 
 /// "刚刚" / "5 分钟前" / "3 小时前" / "8月27日"
 fn relative_time(when: i64) -> String {
-    let now = glib::DateTime::now_utc().map(|t| t.to_unix()).unwrap_or(when);
+    let now = glib::DateTime::now_utc()
+        .map(|t| t.to_unix())
+        .unwrap_or(when);
     let elapsed = now.saturating_sub(when);
     match elapsed {
         i64::MIN..=59 => "刚刚".into(),

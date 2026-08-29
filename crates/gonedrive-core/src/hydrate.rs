@@ -210,9 +210,8 @@ impl Placeholder {
     /// device" (an online-only folder), `hydrated` means "some content is
     /// here". Mirrors what Windows shows on a folder.
     pub fn mark_dir(path: &Path, state: PlaceholderState, item_id: &str) -> Result<()> {
-        xattr::set(path, XATTR_STATE, state.as_str().as_bytes()).map_err(|e| {
-            Error::other(format!("could not mark {} ({e})", path.display()))
-        })?;
+        xattr::set(path, XATTR_STATE, state.as_str().as_bytes())
+            .map_err(|e| Error::other(format!("could not mark {} ({e})", path.display())))?;
         xattr::set(path, XATTR_ITEM_ID, item_id.as_bytes())?;
         Ok(())
     }

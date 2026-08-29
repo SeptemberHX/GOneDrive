@@ -67,14 +67,12 @@ pub struct User {
 impl User {
     /// Best available human-readable identifier for the account.
     pub fn address(&self) -> Option<&str> {
-        self.user_principal_name
-            .as_deref()
-            .or(self.mail.as_deref())
+        self.user_principal_name.as_deref().or(self.mail.as_deref())
     }
 }
 
 /// A file or folder.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DriveItem {
     pub id: String,
@@ -149,7 +147,7 @@ impl DriveItem {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParentReference {
     #[serde(default)]
@@ -161,7 +159,7 @@ pub struct ParentReference {
     pub path: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileFacet {
     #[serde(default)]
@@ -170,7 +168,7 @@ pub struct FileFacet {
     pub hashes: Option<Hashes>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hashes {
     /// OneDrive for Business and SharePoint.
@@ -183,21 +181,21 @@ pub struct Hashes {
     pub sha256_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderFacet {
     #[serde(default)]
     pub child_count: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageFacet {
     #[serde(default, rename = "type")]
     pub kind: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeletedFacet {
     #[serde(default)]
     pub state: Option<String>,
@@ -289,7 +287,10 @@ mod tests {
         assert_eq!(item.name.as_deref(), Some("report.docx"));
         assert!(!item.is_folder() && !item.is_deleted());
         assert_eq!(item.parent_id(), Some("01ROOT"));
-        assert_eq!(item.hashes().unwrap().quick_xor_hash.as_deref(), Some("AAAA"));
+        assert_eq!(
+            item.hashes().unwrap().quick_xor_hash.as_deref(),
+            Some("AAAA")
+        );
         // fileSystemInfo wins over the service timestamp.
         assert_eq!(
             item.effective_mtime().unwrap(),

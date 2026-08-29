@@ -212,11 +212,16 @@ impl Engine {
         self.emit(SyncEvent::Started);
         let mut summary = SyncSummary::default();
 
-        match self.pull_remote(&mut summary).await {
+        let remote_result = match self.store.delta_batch(&self.account_id)? {
+            Some(batch) if batch.mode == "full" => self.full_resync(&mut summary).await,
+            _ => self.pull_remote(&mut summary).await,
+        };
+        match remote_result {
             Ok(()) => {}
             Err(Error::ResyncRequired) => {
                 tracing::warn!("delta token rejected; re-enumerating the drive");
                 self.store.set_delta_link(&self.account_id, None)?;
+                self.store.abort_delta_batch(&self.account_id)?;
                 self.full_resync(&mut summary).await?;
             }
             Err(e) => {
@@ -241,51 +246,19 @@ impl Engine {
 
     async fn pull_remote(&self, summary: &mut SyncSummary) -> Result<()> {
         let account = self.account()?;
-        // An enumeration interrupted part-way resumes from where it stopped.
-        // Restarting a 130 000-item drive from scratch on every attempt means a
-        // first sync that is interrupted once never finishes at all.
-        let mut link = account
-            .enum_link
-            .clone()
-            .or_else(|| account.delta_link.clone());
-        let mut items = 0u64;
-        let mut pages = 0u64;
-
-        loop {
-            let page = self.graph.delta(link.as_deref()).await?;
-            let (upserts, deletes) = partition_delta(page.value);
-
-            items += (upserts.len() + deletes.len()) as u64;
-            pages += 1;
-
-            for item in &upserts {
-                self.apply_remote(&account, item, summary, None)?;
-            }
-            for item in &deletes {
-                self.apply_remote(&account, item, summary, None)?;
-            }
-            self.emit(SyncEvent::Enumerating { items, pages });
-
-            match (page.next_link, page.delta_link) {
-                (Some(next), _) => {
-                    // Applying a page is idempotent, so recording the
-                    // continuation after applying it is safe: a crash re-runs
-                    // at most one page.
-                    self.store.set_enum_link(&self.account_id, Some(&next))?;
-                    link = Some(next);
-                }
-                (None, delta_link) => {
-                    // The deltaLink is persisted only once the final page has
-                    // landed. Saving it mid-enumeration would tell the next run
-                    // that pages we never processed had already been handled.
-                    self.store
-                        .set_delta_link(&self.account_id, delta_link.as_deref())?;
-                    self.store.set_enum_link(&self.account_id, None)?;
-                    summary.enumerated = items;
-                    return Ok(());
-                }
-            }
+        let initial_link = account.enum_link.clone().or(account.delta_link.clone());
+        if self.store.delta_batch(&self.account_id)?.is_none() {
+            self.store
+                .begin_delta_batch(&self.account_id, "incremental", None)?;
         }
+        let batch = self
+            .collect_delta_batch("incremental", initial_link.as_deref())
+            .await?;
+        self.apply_staged_delta(&account, summary)?;
+        summary.enumerated = batch.item_count;
+        self.store
+            .finish_delta_batch(&self.account_id, batch.delta_link.as_deref())?;
+        Ok(())
     }
 
     /// Re-enumerate the whole drive after the service rejected our deltaLink.
@@ -295,33 +268,40 @@ impl Engine {
     /// exists, never what was removed.
     async fn full_resync(&self, summary: &mut SyncSummary) -> Result<()> {
         let account = self.account()?;
-        let generation = self.store.begin_resync(&self.account_id)?;
-        let mut link: Option<String> = None;
-
-        loop {
-            let page = self.graph.delta(link.as_deref()).await?;
-            let (upserts, deletes) = partition_delta(page.value);
-
-            let seen: Vec<String> = upserts.iter().map(|i| i.id.clone()).collect();
-            for item in &upserts {
-                self.apply_remote(&account, item, summary, Some(generation))?;
+        let existing = self.store.delta_batch(&self.account_id)?;
+        let (generation, initial_link) = match existing {
+            Some(batch) if batch.mode == "full" => {
+                let generation = batch
+                    .generation
+                    .ok_or_else(|| Error::other("full delta batch has no generation"))?;
+                (generation, account.enum_link.clone())
             }
-            self.store.mark_seen(&seen, generation)?;
-            for item in &deletes {
-                self.apply_remote(&account, item, summary, Some(generation))?;
+            Some(_) => {
+                self.store.abort_delta_batch(&self.account_id)?;
+                let generation = self.store.begin_resync(&self.account_id)?;
+                self.store
+                    .begin_delta_batch(&self.account_id, "full", Some(generation))?;
+                (generation, None)
             }
-
-            if let Some(next) = page.next_link {
-                link = Some(next);
-                continue;
+            None => {
+                let generation = self.store.begin_resync(&self.account_id)?;
+                self.store
+                    .begin_delta_batch(&self.account_id, "full", Some(generation))?;
+                (generation, None)
             }
-            self.store
-                .set_delta_link(&self.account_id, page.delta_link.as_deref())?;
-            break;
-        }
+        };
+        let batch = self
+            .collect_delta_batch("full", initial_link.as_deref())
+            .await?;
+        let seen = self.apply_staged_delta(&account, summary)?;
+        self.store.mark_seen(&seen, generation)?;
+        summary.enumerated = batch.item_count;
 
         // Sweep what the enumeration never mentioned.
-        for stale in self.store.items_missed_by_resync(&self.account_id, generation)? {
+        for stale in self
+            .store
+            .items_missed_by_resync(&self.account_id, generation)?
+        {
             let Some(path) = self.store.local_path(&account, &stale.id)? else {
                 self.store.delete_subtree(&stale.id)?;
                 continue;
@@ -349,7 +329,91 @@ impl Engine {
             }
             self.remove_local(&stale, &path, summary)?;
         }
+        self.store
+            .finish_delta_batch(&self.account_id, batch.delta_link.as_deref())?;
         Ok(())
+    }
+
+    /// Fetch pages into SQLite before touching the filesystem. This retains the
+    /// last occurrence of each item and survives a daemon restart between
+    /// pages, while still delaying deletes and child resolution until the feed
+    /// is complete.
+    async fn collect_delta_batch(
+        &self,
+        expected_mode: &str,
+        initial_link: Option<&str>,
+    ) -> Result<crate::db::DeltaBatch> {
+        loop {
+            let batch = self
+                .store
+                .delta_batch(&self.account_id)?
+                .ok_or_else(|| Error::other("delta batch disappeared"))?;
+            if batch.mode != expected_mode {
+                return Err(Error::other(format!(
+                    "cannot resume {} delta batch as {expected_mode}",
+                    batch.mode
+                )));
+            }
+            if batch.complete {
+                return Ok(batch);
+            }
+
+            let account = self.account()?;
+            let link = account.enum_link.as_deref().or(if batch.page_count == 0 {
+                initial_link
+            } else {
+                None
+            });
+            if batch.page_count > 0 && link.is_none() {
+                return Err(Error::other(
+                    "incomplete delta batch has no continuation link",
+                ));
+            }
+            let page = self.graph.delta(link).await?;
+            let payloads = page
+                .value
+                .iter()
+                .map(|item| Ok((item.id.clone(), serde_json::to_string(item)?)))
+                .collect::<Result<Vec<_>>>()?;
+            self.store.stage_delta_page(
+                &self.account_id,
+                &payloads,
+                page.next_link.as_deref(),
+                page.delta_link.as_deref(),
+            )?;
+            let current = self
+                .store
+                .delta_batch(&self.account_id)?
+                .ok_or_else(|| Error::other("delta batch disappeared after staging"))?;
+            self.emit(SyncEvent::Enumerating {
+                items: current.item_count,
+                pages: current.page_count,
+            });
+        }
+    }
+
+    /// Apply the final occurrence of every staged item in dependency order.
+    /// Returns the ids present in a full enumeration for its generation sweep.
+    fn apply_staged_delta(
+        &self,
+        account: &Account,
+        summary: &mut SyncSummary,
+    ) -> Result<Vec<String>> {
+        let items = self
+            .store
+            .staged_delta_payloads(&self.account_id)?
+            .into_iter()
+            .map(|payload| serde_json::from_str::<DriveItem>(&payload).map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        let (upserts, deletes) = partition_delta(items);
+        let seen = upserts.iter().map(|item| item.id.clone()).collect();
+        for item in &upserts {
+            self.apply_remote(account, item, summary)?;
+        }
+        for item in &deletes {
+            self.apply_remote(account, item, summary)?;
+        }
+        Ok(seen)
     }
 
     /// Apply one item from a delta page.
@@ -358,7 +422,6 @@ impl Engine {
         account: &Account,
         remote: &DriveItem,
         summary: &mut SyncSummary,
-        generation: Option<i64>,
     ) -> Result<()> {
         let known = self.store.item(&remote.id)?;
 
@@ -402,17 +465,28 @@ impl Engine {
         // The path comes from the *parent chain plus this name*, not from any
         // record we already hold, so a rename is seen at its new location.
         let Some(parent_id) = remote.parent_id() else {
-            summary.skipped += 1;
-            return Ok(());
+            return Err(Error::other(format!(
+                "remote item {} ({name}) has no parent",
+                remote.id
+            )));
         };
         let Some(parent_rel) = self.store.relative_path(parent_id)? else {
-            // Ordered batches make this rare; it still happens across page
-            // boundaries. The next pass picks it up.
-            tracing::debug!(item = %remote.id, %parent_id, "parent not known yet");
-            summary.skipped += 1;
-            return Ok(());
+            // The complete batch is topologically ordered. Advancing its
+            // deltaLink with an unresolved parent would lose this child
+            // permanently, so keep the batch for a later retry instead.
+            return Err(Error::other(format!(
+                "remote item {} ({name}) refers to unknown parent {parent_id}",
+                remote.id
+            )));
         };
         let path = account.root_local_path.join(&parent_rel).join(&name);
+        if let Some(existing) = &known {
+            if let Some(old_path) = self.store.local_path(account, &existing.id)? {
+                if old_path != path && old_path.exists() {
+                    self.move_local_for_remote(&old_path, &path, summary)?;
+                }
+            }
+        }
         let local = stat_of(&path);
 
         // A dehydrated placeholder whose remote content changed is refreshed in
@@ -433,9 +507,7 @@ impl Engine {
                     // Fall back to the known record time if the delta page
                     // omitted fileSystemInfo, so a refresh never stamps the
                     // placeholder with "now".
-                    let mtime = remote
-                        .effective_mtime()
-                        .or_else(|| existing.remote_mtime);
+                    let mtime = remote.effective_mtime().or(existing.remote_mtime);
                     let _ = Placeholder::create(
                         &path,
                         remote.size.unwrap_or(0),
@@ -446,20 +518,28 @@ impl Engine {
                     tracing::debug!(name = %name, "refreshed placeholder from a remote change");
                 }
             }
-            let mut record =
-                record_from_remote(&self.account_id, remote, ItemState::Dehydrated, PinState::Inherit);
+            let mut record = record_from_remote(
+                &self.account_id,
+                remote,
+                ItemState::Dehydrated,
+                PinState::Inherit,
+            );
             if let Some(existing) = &known {
                 record.pin_state = existing.pin_state;
             }
             self.store.upsert_item(&record)?;
-            if let Some(generation) = generation {
-                self.store.mark_seen(&[record.id.clone()], generation)?;
-            }
             return Ok(());
         }
 
         let action = decide_remote(remote, known.as_ref(), local.as_ref());
         let mut state = ItemState::Synced;
+        let local_was_modified =
+            known
+                .as_ref()
+                .zip(local.as_ref())
+                .is_some_and(|(known, local)| {
+                    !local.is_dir && crate::sync::plan::local_is_modified(known, local)
+                });
 
         match action {
             RemoteAction::CreateDirectory => {
@@ -563,6 +643,20 @@ impl Engine {
                     });
                     return Ok(());
                 }
+                // A metadata-only remote change (especially a rename) does not
+                // own local content. Keep an already-edited file dirty and
+                // upload it after applying the new name instead of advancing
+                // its local baseline and silently suppressing the edit.
+                if local_was_modified {
+                    state = ItemState::DirtyLocal;
+                    self.store.enqueue(
+                        &self.account_id,
+                        OpKind::Upload,
+                        Some(&remote.id),
+                        Some(&path),
+                        None,
+                    )?;
+                }
             }
             RemoteAction::DeleteLocal | RemoteAction::KeepLocalAndReupload => {
                 unreachable!("handled in the tombstone branch above")
@@ -589,9 +683,6 @@ impl Engine {
                     Some(local.ino),
                 )?;
             }
-        }
-        if let Some(generation) = generation {
-            self.store.mark_seen(&[record.id.clone()], generation)?;
         }
         Ok(())
     }
@@ -707,14 +798,69 @@ impl Engine {
             std::fs::remove_file(path)
         };
         match result {
-            Ok(()) => summary.deleted_local += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(()) => {
+                summary.deleted_local += 1;
+                self.store.delete_subtree(&known.id)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.store.delete_subtree(&known.id)?;
+            }
+            Err(e) if known.is_folder && e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                // Graph explicitly says a deleted folder should only be
+                // removed locally once it is empty. What remains is local-only
+                // content, so detach the remote identities and let the local
+                // scan offer the tree back instead of recursively deleting it.
+                tracing::info!(path = %path.display(), "kept non-empty remotely deleted folder");
+                self.store.delete_subtree(&known.id)?;
+            }
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "could not remove locally");
-                summary.failed += 1;
+                return Err(Error::other(format!(
+                    "could not remove {} locally: {e}",
+                    path.display()
+                )));
             }
         }
-        self.store.delete_subtree(&known.id)?;
+        Ok(())
+    }
+
+    /// Apply a remote rename/move to the existing local inode before updating
+    /// its database record. Folder descendants follow automatically because
+    /// their paths are derived from the renamed parent's id.
+    fn move_local_for_remote(
+        &self,
+        old_path: &Path,
+        new_path: &Path,
+        summary: &mut SyncSummary,
+    ) -> Result<()> {
+        if let Some(parent) = new_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        if std::fs::symlink_metadata(new_path).is_ok() {
+            let copy = self.make_conflict_copy(new_path)?;
+            if copy.is_file() {
+                self.store
+                    .enqueue(&self.account_id, OpKind::Upload, None, Some(&copy), None)?;
+            }
+            summary.conflicts += 1;
+            self.emit(SyncEvent::Conflict {
+                original: new_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                copy: copy
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            });
+        }
+
+        std::fs::rename(old_path, new_path)?;
+        self.store
+            .rebase_pending_paths(&self.account_id, old_path, new_path)?;
+        tracing::info!(from = %old_path.display(), to = %new_path.display(), "applied remote move");
         Ok(())
     }
 
@@ -749,7 +895,8 @@ impl Engine {
         if let Ok(account) = self.account() {
             if let Some(root_id) = account.root_item_id.clone() {
                 if let Ok(Some(target)) =
-                    self.store.item_at_path(&self.account_id, &root_id, relative)
+                    self.store
+                        .item_at_path(&self.account_id, &root_id, relative)
                 {
                     if target.is_folder {
                         let _ = self.recompute_folder_mark(&account, &target.id);
@@ -795,7 +942,9 @@ impl Engine {
         // whenever it has changed.
         {
             use std::os::unix::fs::MetadataExt;
-            let current_dev = std::fs::metadata(&account.root_local_path).map(|m| m.dev()).ok();
+            let current_dev = std::fs::metadata(&account.root_local_path)
+                .map(|m| m.dev())
+                .ok();
             match (account.root_dev, current_dev) {
                 (Some(recorded), Some(now)) if recorded != now => {
                     let reason = format!(
@@ -1011,22 +1160,26 @@ impl Engine {
             match known {
                 Some(record) => {
                     moved_ids.insert(record.id.clone());
-                    self.store.enqueue(
-                        &self.account_id,
-                        OpKind::MoveRemote,
-                        Some(&record.id),
-                        Some(path),
-                        None,
-                    )?;
+                    if !stat.is_dir && crate::sync::plan::local_is_modified(record, stat) {
+                        // Moving preserves the remote identity, but it does not
+                        // transfer bytes. If the file was also edited before
+                        // this scan, commit the metadata and content work
+                        // together so a crash cannot drop the upload half.
+                        self.store
+                            .enqueue_move_and_upload(&self.account_id, &record.id, path)?;
+                    } else {
+                        self.store.enqueue(
+                            &self.account_id,
+                            OpKind::MoveRemote,
+                            Some(&record.id),
+                            Some(path),
+                            None,
+                        )?;
+                    }
                 }
                 None => {
-                    self.store.enqueue(
-                        &self.account_id,
-                        OpKind::Upload,
-                        None,
-                        Some(path),
-                        None,
-                    )?;
+                    self.store
+                        .enqueue(&self.account_id, OpKind::Upload, None, Some(path), None)?;
                 }
             }
         }
@@ -1187,7 +1340,7 @@ impl Engine {
             .item(&item_id)?
             .ok_or_else(|| Error::other(format!("unknown item {item_id}")))?;
 
-        let staged = transfer::staging_sibling(path);
+        let staged = transfer::hydration_staging_sibling(path);
 
         tracing::info!(path = %path.display(), size = record.size, "staging content");
         self.store.set_item_state(&item_id, ItemState::Hydrating)?;
@@ -1209,8 +1362,14 @@ impl Engine {
         let mut last_sent = 0u64;
 
         let limit = self.config.download_limit_bytes_per_sec;
-        let result =
-            transfer::download_to_file_limited(&self.graph, &item_id, &staged, None, None, limit, &mut move |done, total| {
+        let result = transfer::download_to_file_limited(
+            &self.graph,
+            &item_id,
+            &staged,
+            None,
+            None,
+            limit,
+            &mut move |done, total| {
                 let total = total.unwrap_or(size);
                 if done == total || done.saturating_sub(last_sent) >= step {
                     last_sent = done;
@@ -1221,10 +1380,13 @@ impl Engine {
                     });
                 }
                 !cancel.load(std::sync::atomic::Ordering::Relaxed)
-            })
-            .await;
+            },
+        )
+        .await;
 
         if let Err(e) = result {
+            let _ = std::fs::remove_file(&staged);
+            let _ = std::fs::remove_file(transfer::staging_sibling(&staged));
             self.emit(SyncEvent::HydrationFinished {
                 path: path.to_path_buf(),
                 ok: false,
@@ -1242,16 +1404,11 @@ impl Engine {
     /// range is fetched, nothing else changes — no state transition, no
     /// progress events, no activity entry — and the kernel watch stays armed
     /// so a reader that continues past the window comes back for the rest.
-    pub async fn stage_range(
-        &self,
-        path: &Path,
-        offset: u64,
-        length: u64,
-    ) -> Result<PathBuf> {
+    pub async fn stage_range(&self, path: &Path, offset: u64, length: u64) -> Result<PathBuf> {
         let item_id = Placeholder::item_id(path)
             .ok_or_else(|| Error::other(format!("{} is not a placeholder", path.display())))?;
 
-        let staged = transfer::staging_sibling(path);
+        let staged = transfer::hydration_staging_sibling(path);
 
         // A range that is already real data on disk — a window some earlier
         // sniff filled — is served from the file itself. Browsing the same
@@ -1298,7 +1455,7 @@ impl Engine {
         let Some(bytes) = read_if_materialized(path, offset, length)? else {
             return Ok(None);
         };
-        let staged = transfer::staging_sibling(path);
+        let staged = transfer::hydration_staging_sibling(path);
         tokio::fs::write(&staged, &bytes).await?;
         Ok(Some(staged))
     }
@@ -1339,20 +1496,26 @@ impl Engine {
     /// server, so discarding its bytes — a dehydrate punch, a placeholder
     /// rebuild, an overwrite by a download — would lose data.
     ///
-    /// The content hash is the authority. A fully-allocated file whose current
+    /// The content hash is the authority. A file whose current
     /// quickXorHash matches the hash we recorded when we last wrote it is
     /// unchanged and safe to discard, whatever its size and mtime say; a
     /// mismatch means it has been edited since and holds bytes the server does
-    /// not have. A still-sparse file owns nothing (its bytes are holes, or
-    /// range-fill cache), so it is always safe. Only when no hash was ever
-    /// recorded does it fall back to the size+mtime heuristic.
+    /// not have. Only an explicitly dehydrated placeholder can treat sparse
+    /// extents as cloud-owned cache; ordinary sparse files are user content.
+    /// When no hash was ever recorded, fall back to the size+mtime heuristic.
     fn local_content_unsynced(&self, record: &ItemRecord, path: &Path) -> bool {
         let occ = match crate::hydrate::Occupancy::read(path) {
             Ok(o) => o,
-            Err(_) => return false,
+            // If we cannot inspect the file, we cannot prove its bytes are
+            // disposable. Every destructive caller must fail closed.
+            Err(_) => return true,
         };
-        if occ.allocated < occ.apparent_size {
-            // Still sparse: a placeholder or partial cache, not owned content.
+        if occ.allocated < occ.apparent_size
+            && Placeholder::state(path) == PlaceholderState::Dehydrated
+        {
+            // An actual placeholder or partial range cache owns no local
+            // content. A hydrated VM image or database can be sparse too and
+            // must continue through the hash check below.
             return false;
         }
         if let Some(recorded) = Placeholder::content_hash(path) {
@@ -1381,6 +1544,18 @@ impl Engine {
         let Some(record) = self.store.item(&item_id)? else {
             return Ok(());
         };
+        if record.account_id != self.account_id {
+            return Err(Error::other(format!(
+                "item {item_id} belongs to another account"
+            )));
+        }
+        let account = self.account()?;
+        if self.store.local_path(&account, &item_id)?.as_deref() != Some(path) {
+            return Err(Error::other(format!(
+                "{} is not the path of item {item_id}",
+                path.display()
+            )));
+        }
 
         Placeholder::mark_hydrated(path, &item_id, record.ctag.as_deref())?;
         let pin = self
@@ -1399,8 +1574,64 @@ impl Engine {
             )?;
         }
         self.store.set_item_state(&item_id, ItemState::Synced)?;
-        let account = self.account()?;
         self.refresh_folder_ancestors(&account, &item_id)?;
+        Ok(())
+    }
+
+    /// A staged fill failed after the record entered Hydrating. Put it back in
+    /// a retryable placeholder state and release UI state.
+    pub fn fail_hydration(&self, path: &Path) -> Result<()> {
+        let item_id = Placeholder::item_id(path)
+            .ok_or_else(|| Error::other(format!("{} is not a placeholder", path.display())))?;
+        let record = self
+            .store
+            .item(&item_id)?
+            .ok_or_else(|| Error::other(format!("unknown item {item_id}")))?;
+        if record.account_id != self.account_id {
+            return Err(Error::other(format!(
+                "item {item_id} belongs to another account"
+            )));
+        }
+        self.store.set_item_state(&item_id, ItemState::Dehydrated)?;
+        self.emit(SyncEvent::HydrationFinished {
+            path: path.to_path_buf(),
+            ok: false,
+        });
+        Ok(())
+    }
+
+    /// Hide a placeholder that fanotify could not protect. Its remote metadata
+    /// remains in the database, but no zero-readable sparse file remains on
+    /// disk and local scanning will not mistake the absence for a user delete.
+    pub fn discard_unwatched_placeholder(&self, path: &Path) -> Result<()> {
+        if Placeholder::state(path) != PlaceholderState::Dehydrated {
+            return Err(Error::other(format!(
+                "{} is not dehydrated",
+                path.display()
+            )));
+        }
+        let item_id = Placeholder::item_id(path)
+            .ok_or_else(|| Error::other(format!("{} has no item id", path.display())))?;
+        let account = self.account()?;
+        let record = self
+            .store
+            .item(&item_id)?
+            .ok_or_else(|| Error::other(format!("unknown item {item_id}")))?;
+        if record.account_id != self.account_id
+            || self.store.local_path(&account, &item_id)?.as_deref() != Some(path)
+        {
+            return Err(Error::other(format!(
+                "{} is not owned by this account",
+                path.display()
+            )));
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.store.set_local_stat(&item_id, None, None, None)?;
+        self.store.set_item_state(&item_id, ItemState::Dehydrated)?;
         Ok(())
     }
 
@@ -1754,7 +1985,6 @@ impl Engine {
         Ok(watch)
     }
 
-
     /// Reconcile database states with what the files themselves say.
     ///
     /// A crash mid-hydration leaves the record claiming `Hydrating` while the
@@ -1763,7 +1993,10 @@ impl Engine {
     pub fn repair_states(&self) -> Result<usize> {
         let account = self.account()?;
         let mut repaired = 0;
-        for record in self.store.items_in_state(&self.account_id, ItemState::Hydrating)? {
+        for record in self
+            .store
+            .items_in_state(&self.account_id, ItemState::Hydrating)?
+        {
             let Some(path) = self.store.local_path(&account, &record.id)? else {
                 continue;
             };
@@ -1781,12 +2014,16 @@ impl Engine {
         // at the time leaves exactly this. Left alone, the scanner re-queues
         // an upload of it every single pass, forever, and the upload guard
         // refuses it every single pass, forever.
-        for record in self.store.items_in_state(&self.account_id, ItemState::DirtyLocal)? {
+        for record in self
+            .store
+            .items_in_state(&self.account_id, ItemState::DirtyLocal)?
+        {
             let Some(path) = self.store.local_path(&account, &record.id)? else {
                 continue;
             };
             if Placeholder::state(&path) == PlaceholderState::Dehydrated {
-                self.store.set_item_state(&record.id, ItemState::Dehydrated)?;
+                self.store
+                    .set_item_state(&record.id, ItemState::Dehydrated)?;
                 repaired += 1;
                 tracing::info!(path = %path.display(), "repaired a dirty record over a placeholder");
             }
@@ -1801,55 +2038,10 @@ impl Engine {
     /// with unsaved local changes are protected by [`Self::dehydrate`] as on
     /// every other path.
     pub fn auto_free(&self, keep_free: u64) -> Result<FreeSpaceOutcome> {
-        let account = self.account()?;
         let mut outcome = FreeSpaceOutcome::default();
+        let (mut still_needed, candidates) = self.auto_free_plan(keep_free)?;
 
-        let Some(free) = crate::sync::selection::available_bytes(&account.root_local_path) else {
-            return Ok(outcome);
-        };
-        if free >= keep_free {
-            return Ok(outcome);
-        }
-        let mut still_needed = keep_free - free;
-        tracing::info!(
-            free_bytes = free,
-            target = keep_free,
-            "low on space; releasing unpinned files"
-        );
-
-        let default = self.config.download_new.default_pin();
-        let mut candidates = Vec::new();
-        for record in self.store.items_in_state(&self.account_id, ItemState::Synced)? {
-            if record.is_folder {
-                continue;
-            }
-            if self
-                .store
-                .effective_pin(&record.id, default)?
-                == crate::db::PinState::Pinned
-            {
-                continue;
-            }
-            let Some(path) = self.store.local_path(&account, &record.id)? else {
-                continue;
-            };
-            let Ok(occupancy) = crate::hydrate::Occupancy::read(&path) else {
-                continue;
-            };
-            if occupancy.allocated == 0 {
-                continue; // already a placeholder
-            }
-            let atime = std::fs::metadata(&path)
-                .ok()
-                .and_then(|m| m.accessed().ok())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            candidates.push((atime, occupancy.allocated, path));
-        }
-        // Oldest access first: the file nobody has opened in months goes
-        // before the one from this morning.
-        candidates.sort_by_key(|(atime, _, _)| *atime);
-
-        for (_, allocated, path) in candidates {
+        for (allocated, path) in candidates {
             if still_needed == 0 {
                 break;
             }
@@ -1864,6 +2056,68 @@ impl Engine {
             }
         }
         Ok(outcome)
+    }
+
+    /// Files that automatic pressure relief may dehydrate, in LRU order. The
+    /// daemon uses this to install fanotify marks before calling [`Self::auto_free`].
+    pub fn auto_free_candidates(&self, keep_free: u64) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .auto_free_plan(keep_free)?
+            .1
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect())
+    }
+
+    fn auto_free_plan(&self, keep_free: u64) -> Result<(u64, Vec<(u64, PathBuf)>)> {
+        let account = self.account()?;
+        let Some(free) = crate::sync::selection::available_bytes(&account.root_local_path) else {
+            return Ok((0, Vec::new()));
+        };
+        if free >= keep_free {
+            return Ok((0, Vec::new()));
+        }
+        let still_needed = keep_free - free;
+        tracing::info!(
+            free_bytes = free,
+            target = keep_free,
+            "low on space; releasing unpinned files"
+        );
+
+        let default = self.config.download_new.default_pin();
+        let mut candidates = Vec::new();
+        for record in self
+            .store
+            .items_in_state(&self.account_id, ItemState::Synced)?
+        {
+            if record.is_folder
+                || self.store.effective_pin(&record.id, default)? == crate::db::PinState::Pinned
+            {
+                continue;
+            }
+            let Some(path) = self.store.local_path(&account, &record.id)? else {
+                continue;
+            };
+            let Ok(occupancy) = crate::hydrate::Occupancy::read(&path) else {
+                continue;
+            };
+            if occupancy.allocated == 0 {
+                continue;
+            }
+            let atime = std::fs::metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.accessed().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            candidates.push((atime, occupancy.allocated, path));
+        }
+        candidates.sort_by_key(|(atime, _, _)| *atime);
+        Ok((
+            still_needed,
+            candidates
+                .into_iter()
+                .map(|(_, allocated, path)| (allocated, path))
+                .collect(),
+        ))
     }
 
     /// Every placeholder that still needs intercepting, for registering with
@@ -1964,7 +2218,12 @@ impl Engine {
         }
     }
 
-    fn record_failure(&self, op: &PendingOp, error: Error, summary: &mut SyncSummary) -> Result<()> {
+    fn record_failure(
+        &self,
+        op: &PendingOp,
+        error: Error,
+        summary: &mut SyncSummary,
+    ) -> Result<()> {
         let name = op
             .local_path
             .as_deref()
@@ -2053,13 +2312,8 @@ impl Engine {
                     .into_owned(),
             });
             summary.conflicts += 1;
-            self.store.enqueue(
-                &self.account_id,
-                OpKind::Upload,
-                None,
-                Some(&copy),
-                None,
-            )?;
+            self.store
+                .enqueue(&self.account_id, OpKind::Upload, None, Some(&copy), None)?;
         }
 
         self.store.set_item_state(item_id, ItemState::Hydrating)?;
@@ -2087,7 +2341,35 @@ impl Engine {
         )
         .await;
         Placeholder::set_syncing(&path, false);
-        result?;
+        let downloaded = result?;
+
+        // Publish placeholder metadata, then make sure nobody rewrote the new
+        // inode before we declare it synced. xattrs change ctime, so compare
+        // only the properties that identify the bytes themselves.
+        let pin = self
+            .store
+            .effective_pin(item_id, self.config.download_new.default_pin())?;
+        let _ = Placeholder::mark_hydrated(&path, item_id, record.ctag.as_deref());
+        let _ = Placeholder::set_pin(&path, pin.as_str());
+        let current_version = transfer::FileVersion::capture(&path)?;
+        if !current_version.same_content_as(downloaded.version) {
+            let copy = self.make_conflict_copy(&path)?;
+            self.store
+                .enqueue(&self.account_id, OpKind::Upload, None, Some(&copy), None)?;
+            summary.conflicts += 1;
+            self.emit(SyncEvent::Conflict {
+                original: record.name.clone(),
+                copy: copy
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            });
+            return Err(transfer::file_changed_error(
+                &path,
+                "finishing the download",
+            ));
+        }
 
         if let Some(local) = stat_of(&path) {
             self.store.set_local_stat(
@@ -2098,13 +2380,8 @@ impl Engine {
             )?;
         }
         self.store.set_item_state(item_id, ItemState::Synced)?;
-        // Mark it for the file manager: an emblem should appear as soon as the
-        // download lands, not only after the next pass.
-        let pin = self
-            .store
-            .effective_pin(item_id, self.config.download_new.default_pin())?;
-        let _ = Placeholder::mark_hydrated(&path, item_id, record.ctag.as_deref());
-        let _ = Placeholder::set_pin(&path, pin.as_str());
+        // The file manager marks were written before the stability check above,
+        // so the synced emblem and database state become visible together.
         if let Some(parent) = &record.parent_id {
             self.mark_dir(parent)?;
         }
@@ -2153,7 +2430,10 @@ impl Engine {
         };
         // Resuming keys on the item id when we have one, so a re-queued upload
         // of the same file picks the session back up.
-        let session_key = op.item_id.clone().unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let session_key = op
+            .item_id
+            .clone()
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
 
         // The etag of the version we last pulled, sent as If-Match so the
         // service refuses to overwrite a newer remote edit we have not seen.
@@ -2166,6 +2446,7 @@ impl Engine {
         let progress_name = name.clone();
         // Syncing emblem while the upload is in flight.
         Placeholder::set_syncing(&path, true);
+        let source_version = transfer::FileVersion::capture(&path)?;
         let result = transfer::upload_file(
             &self.graph,
             &self.store,
@@ -2214,24 +2495,31 @@ impl Engine {
                 if let Some(id) = op.item_id.as_deref() {
                     self.store.delete_subtree(id)?;
                 }
-                self.store.enqueue(
-                    &self.account_id,
-                    OpKind::Upload,
-                    None,
-                    Some(&copy),
-                    None,
-                )?;
+                self.store
+                    .enqueue(&self.account_id, OpKind::Upload, None, Some(&copy), None)?;
                 return Ok(());
             }
             Err(e) => return Err(e),
         };
 
+        if !transfer::FileVersion::capture(&path)?.same_content_as(source_version) {
+            return Err(transfer::file_changed_error(&path, "uploading"));
+        }
+        let content_hash = crate::hash::quick_xor_file(&path).ok();
+        if !transfer::FileVersion::capture(&path)?.same_content_as(source_version) {
+            return Err(transfer::file_changed_error(&path, "hashing after upload"));
+        }
+
         // `Inherit`, never `Pinned`: stamping uploads as always-keep silently
         // converts everything the user ever created into pinned content. The
         // live symptom was a deleted folder resurrecting on every delta pass —
         // "pinned" told the applier its local absence was a hole to re-fill.
-        let mut record =
-            record_from_remote(&self.account_id, &item, ItemState::Synced, PinState::Inherit);
+        let mut record = record_from_remote(
+            &self.account_id,
+            &item,
+            ItemState::Synced,
+            PinState::Inherit,
+        );
         record.parent_id = Some(parent_id);
         self.store.upsert_item(&record)?;
         if let Some(local) = stat_of(&path) {
@@ -2245,7 +2533,7 @@ impl Engine {
         // The bytes on disk are now the bytes on the server: record their hash
         // so a later dehydrate recognises the file as synced and safe to free,
         // and so an in-place edit after this point is caught.
-        if let Ok(hash) = crate::hash::quick_xor_file(&path) {
+        if let Some(hash) = content_hash {
             let _ = Placeholder::set_content_hash(&path, &hash);
         }
         summary.uploaded += 1;
@@ -2275,8 +2563,12 @@ impl Engine {
             .into_owned();
 
         let item = self.graph.create_folder(parent_id, &name).await?;
-        let mut record =
-            record_from_remote(&self.account_id, &item, ItemState::Synced, PinState::Inherit);
+        let mut record = record_from_remote(
+            &self.account_id,
+            &item,
+            ItemState::Synced,
+            PinState::Inherit,
+        );
         record.parent_id = Some(parent_id.to_string());
         self.store.upsert_item(&record)?;
         if let Some(local) = stat_of(&path) {
@@ -2330,8 +2622,12 @@ impl Engine {
             .graph
             .move_item(item_id, Some(&new_parent), new_name.as_deref())
             .await?;
-        let mut record =
-            record_from_remote(&self.account_id, &item, ItemState::Synced, PinState::Inherit);
+        let mut record = record_from_remote(
+            &self.account_id,
+            &item,
+            ItemState::Synced,
+            PinState::Inherit,
+        );
         record.parent_id = Some(new_parent);
         self.store.upsert_item(&record)?;
         if let Some(local) = stat_of(&path) {
@@ -2447,7 +2743,8 @@ fn read_if_materialized(path: &Path, offset: u64, length: u64) -> Result<Option<
 
     // SAFETY: valid fd; lseek with SEEK_HOLE finds the next hole at or after
     // `offset`. If that hole starts at or beyond `end`, the window is data.
-    let next_hole = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, libc::SEEK_HOLE) };
+    let next_hole =
+        unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, libc::SEEK_HOLE) };
     if next_hole < 0 || (next_hole as u64) < end {
         return Ok(None);
     }

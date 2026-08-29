@@ -66,7 +66,8 @@ impl Pkce {
         // 32 random bytes base64url-encode to 43 characters, the minimum
         // verifier length RFC 7636 allows.
         let mut raw = [0u8; 32];
-        getrandom::fill(&mut raw).map_err(|e| Error::other(format!("no secure randomness: {e}")))?;
+        getrandom::fill(&mut raw)
+            .map_err(|e| Error::other(format!("no secure randomness: {e}")))?;
         let verifier = URL_SAFE_NO_PAD.encode(raw);
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         Ok(Self {
@@ -409,7 +410,8 @@ const PAGE_SUCCESS: &str = r#"<!doctype html><meta charset="utf-8">
 div{text-align:center}h1{font-weight:600;font-size:1.4rem}p{color:#616161}</style>
 <div><h1>登录成功</h1><p>可以关闭此页面，返回 GOnedrive。</p></div>"#;
 
-const PAGE_NOT_FOUND: &str = r#"<!doctype html><meta charset="utf-8"><title>GOnedrive</title>Not found."#;
+const PAGE_NOT_FOUND: &str =
+    r#"<!doctype html><meta charset="utf-8"><title>GOnedrive</title>Not found."#;
 
 const PAGE_BAD_REQUEST: &str = r#"<!doctype html><meta charset="utf-8">
 <title>GOnedrive</title>
@@ -528,7 +530,10 @@ mod tests {
             ))
             .await;
         });
-        let err = receiver.recv("S", Duration::from_secs(5)).await.unwrap_err();
+        let err = receiver
+            .recv("S", Duration::from_secs(5))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::AuthRequired(ref m) if m.contains("User cancelled")));
     }
 }

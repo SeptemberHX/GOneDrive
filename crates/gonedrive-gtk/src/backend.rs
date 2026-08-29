@@ -28,8 +28,14 @@ pub enum UiEvent {
     LoginStarted(String),
     LoginCompleted,
     LoginFailed(String),
-    Conflict { original: String, copy: String },
-    ItemFailed { name: String, error: String },
+    Conflict {
+        original: String,
+        copy: String,
+    },
+    ItemFailed {
+        name: String,
+        error: String,
+    },
     /// The recent-activity list, on request.
     Activity(Vec<Activity>),
     /// One level of the drive, for the folder chooser.
@@ -40,7 +46,10 @@ pub enum UiEvent {
     /// Something opened a placeholder and is waiting for its content.
     HydrationStarted(Hydration),
     HydrationProgress(Hydration),
-    HydrationFinished { path: String, ok: bool },
+    HydrationFinished {
+        path: String,
+        ok: bool,
+    },
 }
 
 /// Everything the UI can ask for.
@@ -58,7 +67,10 @@ pub enum Command {
     ListFolder(String),
     /// Keep (or stop keeping) a path on this device. `keep: false` also frees
     /// the space, matching what unticking a folder means on Windows.
-    SetKeep { path: String, keep: bool },
+    SetKeep {
+        path: String,
+        keep: bool,
+    },
 }
 
 /// How long to wait before retrying a connection to the daemon.
@@ -146,10 +158,8 @@ async fn run(
                     // drop it — an extension crash, a restart — so "no tray
                     // right now" is a condition to wait out, not a verdict.
                     loop {
-                        let item = GonedriveTray::new(
-                            actions_for_tray.clone(),
-                            commands_for_item.clone(),
-                        );
+                        let item =
+                            GonedriveTray::new(actions_for_tray.clone(), commands_for_item.clone());
                         match item.start().await {
                             Ok(handle) => {
                                 tracing::info!("tray registered");
@@ -164,9 +174,7 @@ async fn run(
                                 std::future::pending::<()>().await;
                             }
                             Err(e) => {
-                                tracing::info!(
-                                    "no system tray yet ({e}); retrying in 30s"
-                                );
+                                tracing::info!("no system tray yet ({e}); retrying in 30s");
                                 tokio::time::sleep(Duration::from_secs(30)).await;
                             }
                         }
@@ -417,7 +425,10 @@ async fn handle(
                 let _ = ui.send(UiEvent::FolderListing { path, entries }).await;
                 true
             }
-            Err(e) => { eprintln!("DBG backend ListFolder err: {e}"); false }
+            Err(e) => {
+                eprintln!("DBG backend ListFolder err: {e}");
+                false
+            }
         },
         Command::SetKeep { path, keep } => {
             let ok = if keep {

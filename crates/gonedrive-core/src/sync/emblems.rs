@@ -71,7 +71,9 @@ impl Engine {
     pub(super) fn refresh_folder_ancestors(&self, account: &Account, item_id: &str) -> Result<()> {
         let mut current = self.store.item(item_id)?.and_then(|i| i.parent_id);
         while let Some(id) = current {
-            let Some(folder) = self.store.item(&id)? else { break };
+            let Some(folder) = self.store.item(&id)? else {
+                break;
+            };
             if !folder.is_folder {
                 break;
             }

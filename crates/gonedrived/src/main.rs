@@ -391,7 +391,11 @@ fn status() -> Result<()> {
         }
         println!("  Sync folder:  {}", account.root_local_path.display());
         if let (Some(used), Some(total)) = (account.quota_used, account.quota_total) {
-            println!("  Quota:        {} of {}", human_bytes(used), human_bytes(total));
+            println!(
+                "  Quota:        {} of {}",
+                human_bytes(used),
+                human_bytes(total)
+            );
         }
         if let Some(free) = available_bytes(&account.root_local_path) {
             println!("  Disk free:    {}", human_bytes(free));
@@ -414,7 +418,10 @@ fn status() -> Result<()> {
             }
         );
     }
-    println!("\nConfig: {}", gonedrive_core::config::config_file().display());
+    println!(
+        "\nConfig: {}",
+        gonedrive_core::config::config_file().display()
+    );
     Ok(())
 }
 
@@ -505,10 +512,9 @@ fn selection() -> Result<(Selection, Config, gonedrive_core::db::Account)> {
     let config = load_config()?;
     let store = Store::open(&gonedrive_core::config::state_db_path())?;
     let accounts = store.accounts()?;
-    let account = accounts
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no accounts are signed in; run `gonedrived login` first"))?;
+    let account = accounts.into_iter().next().ok_or_else(|| {
+        anyhow::anyhow!("no accounts are signed in; run `gonedrived login` first")
+    })?;
     let selection = Selection::new(
         store,
         std::sync::Arc::new(config.clone()),
@@ -609,7 +615,9 @@ async fn set_pin(path: PathBuf, pin: PinState, assume_yes: bool) -> Result<()> {
 
     if let Some(proxy) = running_daemon().await {
         let absolute = absolute_in_root(&path)?;
-        proxy.set_pin_state(&absolute.to_string_lossy(), pin.as_str()).await?;
+        proxy
+            .set_pin_state(&absolute.to_string_lossy(), pin.as_str())
+            .await?;
         if pin.wants_content() {
             println!("Pinned {}; the daemon is fetching it.", path.display());
         } else {

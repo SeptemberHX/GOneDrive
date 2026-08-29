@@ -20,5 +20,5 @@ pub mod sync;
 pub use config::{Config, DownloadPolicy};
 pub use credentials::{Authenticator, TokenSource, TokenStore};
 pub use db::Store;
-pub use graph::GraphClient;
 pub use error::{Error, NameError, Result};
+pub use graph::GraphClient;

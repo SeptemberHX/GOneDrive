@@ -15,18 +15,18 @@
 /// Indexers, thumbnail sweeps, and scanners whose blocked reads must not pull a
 /// file's content down. Matched as a prefix of `comm`.
 pub const BACKGROUND_READERS: &[&str] = &[
-    "localsearch",   // GNOME's file indexer (formerly tracker-miner-fs)
+    "localsearch", // GNOME's file indexer (formerly tracker-miner-fs)
     "tracker-miner",
     "tracker-extract",
     "tracker-store",
-    "baloo_file",    // KDE's indexer (covers baloo_file_extractor by prefix)
-    "thumbnailer",   // gnome-desktop / tumbler thumbnail generation
+    "baloo_file",  // KDE's indexer (covers baloo_file_extractor by prefix)
+    "thumbnailer", // gnome-desktop / tumbler thumbnail generation
     "tumblerd",
     "gsd-housekeep", // GNOME's disk-usage sweep
     "updatedb",      // locate(1) database builders
     "plocate",
     "mlocate",
-    "clamd",         // on-access antivirus
+    "clamd", // on-access antivirus
     "freshclam",
 ];
 
@@ -34,8 +34,8 @@ pub const BACKGROUND_READERS: &[&str] = &[
 /// over a placeholder's holes and copy zeros, so they must hydrate fully on
 /// open. Matched exactly, never as a prefix.
 pub const BULK_COPIERS: &[&str] = &[
-    "cp", "mv", "install", "rsync", "tar", "dd", "cpio", "rclone", "7z", "7za",
-    "zip", "gzip", "bsdtar", "pax", "cksum",
+    "cp", "mv", "install", "rsync", "tar", "dd", "cpio", "rclone", "7z", "7za", "zip", "gzip",
+    "bsdtar", "pax", "cksum",
 ];
 
 /// The file manager, its preview pane, and every thumbnailer — anything that
@@ -44,8 +44,8 @@ pub const BULK_COPIERS: &[&str] = &[
 /// must never pull the whole image down. Matched as a prefix of `comm`.
 pub const BROWSING_READERS: &[&str] = &[
     "nautilus",
-    "sushi",          // GNOME's preview (spacebar)
-    "glycin",         // GNOME's image loader/thumbnailer sandbox
+    "sushi",  // GNOME's preview (spacebar)
+    "glycin", // GNOME's image loader/thumbnailer sandbox
     "gdk-pixbuf-thum",
     "gnome-thumbnail",
     "gst-video-thumb",
@@ -72,7 +72,9 @@ pub fn is_bulk_copier(comm: &str) -> bool {
 
 /// Whether `comm` is a file manager or thumbnailer that must never download.
 pub fn is_browsing_reader(comm: &str) -> bool {
-    BROWSING_READERS.iter().any(|prefix| comm.starts_with(prefix))
+    BROWSING_READERS
+        .iter()
+        .any(|prefix| comm.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -91,7 +93,10 @@ mod tests {
     fn copiers_match_exactly_never_as_prefix() {
         assert!(is_bulk_copier("cp"));
         assert!(is_bulk_copier("rsync"));
-        assert!(!is_bulk_copier("cpuinfo"), "a prefix hit would download for nothing");
+        assert!(
+            !is_bulk_copier("cpuinfo"),
+            "a prefix hit would download for nothing"
+        );
         assert!(!is_bulk_copier("nautilus"));
     }
 

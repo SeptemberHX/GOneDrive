@@ -15,7 +15,9 @@ use gonedrive_core::graph::GraphClient;
 use gonedrive_core::sync::engine::{Engine, SyncSummary};
 use gonedrive_core::TokenSource;
 use serde_json::{json, Value};
-use wiremock::matchers::{header, header_exists, method, path, path_regex, query_param};
+use wiremock::matchers::{
+    body_bytes, body_partial_json, header, header_exists, method, path, path_regex, query_param,
+};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ACCOUNT: &str = "acct";
@@ -77,7 +79,14 @@ impl Harness {
         );
         let config = Arc::new(config);
         let engine = Engine::new(store.clone(), graph, config.clone(), ACCOUNT.into());
-        Self { server, store, engine, config, root, _tmp: tmp }
+        Self {
+            server,
+            store,
+            engine,
+            config,
+            root,
+            _tmp: tmp,
+        }
     }
 
     async fn with_policy(download_new: DownloadPolicy) -> Self {
@@ -239,8 +248,12 @@ async fn first_sync_builds_the_local_tree_and_stamps_timestamps() {
 #[tokio::test]
 async fn a_second_sync_with_no_changes_transfers_nothing() {
     let h = Harness::new().await;
-    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
-        .await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
     h.mock_download("F1", b"hello").await;
     h.sync().await;
 
@@ -250,15 +263,25 @@ async fn a_second_sync_with_no_changes_transfers_nothing() {
 
     // The steady state must be genuinely quiet: no download, no upload, and in
     // particular no re-upload of the file we just fetched.
-    assert_eq!(summary, SyncSummary { still_queued: 0, ..Default::default() });
+    assert_eq!(
+        summary,
+        SyncSummary {
+            still_queued: 0,
+            ..Default::default()
+        }
+    );
     assert_eq!(h.read("a.txt"), "hello");
 }
 
 #[tokio::test]
 async fn a_remote_edit_is_downloaded_over_the_local_copy() {
     let h = Harness::new().await;
-    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
-        .await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
     h.mock_download("F1", b"hello").await;
     h.sync().await;
 
@@ -277,10 +300,220 @@ async fn a_remote_edit_is_downloaded_over_the_local_copy() {
 }
 
 #[tokio::test]
+async fn a_remote_file_rename_moves_the_local_inode_without_reuploading() {
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![file(
+            "F1",
+            ROOT,
+            "before.txt",
+            "c1",
+            5,
+            "2026-08-20T10:00:00Z",
+        )],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"hello").await;
+    h.sync().await;
+    let inode = std::fs::metadata(h.path("before.txt")).unwrap();
+    use std::os::unix::fs::MetadataExt;
+
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![file(
+            "F1",
+            ROOT,
+            "after.txt",
+            "c1",
+            5,
+            "2026-08-20T10:00:00Z",
+        )],
+        "v2",
+    )
+    .await;
+
+    let summary = h.sync().await;
+    assert!(!h.path("before.txt").exists());
+    assert_eq!(h.read("after.txt"), "hello");
+    assert_eq!(
+        std::fs::metadata(h.path("after.txt")).unwrap().ino(),
+        inode.ino()
+    );
+    assert_eq!(summary.downloaded, 0);
+    assert_eq!(summary.uploaded, 0);
+}
+
+#[tokio::test]
+async fn a_remote_rename_does_not_mark_a_local_edit_as_synced() {
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![file(
+            "F1",
+            ROOT,
+            "before.txt",
+            "c1",
+            5,
+            "2026-08-20T10:00:00Z",
+        )],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"hello").await;
+    h.sync().await;
+    std::fs::write(h.path("before.txt"), b"local edit").unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![file(
+            "F1",
+            ROOT,
+            "after.txt",
+            "c1",
+            5,
+            "2026-08-20T10:00:00Z",
+        )],
+        "v2",
+    )
+    .await;
+    let uploaded = json!({
+        "id": "F1", "name": "after.txt", "size": 10,
+        "cTag": "c2", "eTag": "e2",
+        "file": {"mimeType": "text/plain"},
+        "parentReference": {"driveId": "drive1", "id": ROOT},
+        "fileSystemInfo": {"lastModifiedDateTime": "2026-08-29T10:00:00Z"}
+    });
+    Mock::given(method("PUT"))
+        .and(path("/me/drive/items/F1/content"))
+        .and(body_bytes(b"local edit"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(uploaded.clone()))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/F1"))
+        .and(body_partial_json(json!({"fileSystemInfo": {}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(uploaded))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.uploaded, 1);
+    assert!(!h.path("before.txt").exists());
+    assert_eq!(h.read("after.txt"), "local edit");
+    assert_eq!(
+        h.store.item("F1").unwrap().unwrap().ctag.as_deref(),
+        Some("c2")
+    );
+}
+
+#[tokio::test]
+async fn a_remote_folder_rename_moves_descendants_not_duplicates_them() {
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            folder("D1", ROOT, "Before"),
+            file("F1", "D1", "inside.txt", "c1", 5, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"hello").await;
+    h.sync().await;
+
+    h.server.reset().await;
+    // Graph reports only the renamed folder, not all descendants.
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![folder("D1", ROOT, "After")],
+        "v2",
+    )
+    .await;
+    let summary = h.sync().await;
+
+    assert!(!h.path("Before").exists());
+    assert_eq!(h.read("After/inside.txt"), "hello");
+    assert_eq!(summary.downloaded, 0);
+    assert_eq!(summary.uploaded, 0);
+    assert_eq!(
+        h.store.item("F1").unwrap().unwrap().parent_id.as_deref(),
+        Some("D1")
+    );
+}
+
+#[tokio::test]
+async fn a_child_on_an_earlier_delta_page_waits_for_its_parent() {
+    let h = Harness::new().await;
+    let next = format!("{}/me/drive/root/delta?page=2", h.server.uri());
+    Mock::given(method("GET"))
+        .and(path("/me/drive/root/delta"))
+        .and(query_param("$top", "1000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [file("F1", "D1", "inside.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+            "@odata.nextLink": next
+        })))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/me/drive/root/delta"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [folder("D1", ROOT, "Parent")],
+            "@odata.deltaLink": format!("{}/me/drive/root/delta?token=v1", h.server.uri())
+        })))
+        .mount(&h.server)
+        .await;
+    h.mock_download("F1", b"hello").await;
+
+    let summary = h.sync().await;
+    assert_eq!(h.read("Parent/inside.txt"), "hello");
+    assert_eq!(summary.enumerated, 2);
+    assert_eq!(summary.skipped, 0);
+}
+
+#[tokio::test]
+async fn the_last_occurrence_of_an_item_in_delta_wins() {
+    let h = Harness::new().await;
+    let next = format!("{}/me/drive/root/delta?page=2", h.server.uri());
+    Mock::given(method("GET"))
+        .and(path("/me/drive/root/delta"))
+        .and(query_param("$top", "1000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [file("F1", ROOT, "stale.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+            "@odata.nextLink": next
+        })))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/me/drive/root/delta"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [file("F1", ROOT, "final.txt", "c2", 5, "2026-08-21T10:00:00Z")],
+            "@odata.deltaLink": format!("{}/me/drive/root/delta?token=v1", h.server.uri())
+        })))
+        .mount(&h.server)
+        .await;
+    h.mock_download("F1", b"final").await;
+
+    h.sync().await;
+    assert!(!h.path("stale.txt").exists());
+    assert_eq!(h.read("final.txt"), "final");
+}
+
+#[tokio::test]
 async fn a_remote_delete_removes_an_untouched_local_file() {
     let h = Harness::new().await;
-    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
-        .await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
     h.mock_download("F1", b"hello").await;
     h.sync().await;
     assert!(h.path("a.txt").exists());
@@ -298,8 +531,12 @@ async fn a_remote_delete_removes_an_untouched_local_file() {
 #[tokio::test]
 async fn a_remote_delete_never_destroys_an_unsaved_local_edit() {
     let h = Harness::new().await;
-    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
-        .await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
     h.mock_download("F1", b"hello").await;
     h.sync().await;
 
@@ -351,9 +588,7 @@ async fn a_local_directory_is_created_remotely() {
     h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
     Mock::given(method("POST"))
         .and(path(format!("/me/drive/items/{ROOT}/children")))
-        .respond_with(
-            ResponseTemplate::new(201).set_body_json(folder("D9", ROOT, "New Folder")),
-        )
+        .respond_with(ResponseTemplate::new(201).set_body_json(folder("D9", ROOT, "New Folder")))
         .mount(&h.server)
         .await;
 
@@ -366,8 +601,12 @@ async fn a_local_directory_is_created_remotely() {
 #[tokio::test]
 async fn a_file_changed_on_both_sides_keeps_both_versions() {
     let h = Harness::new().await;
-    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
-        .await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
     h.mock_download("F1", b"hello").await;
     h.sync().await;
 
@@ -396,7 +635,11 @@ async fn a_file_changed_on_both_sides_keeps_both_versions() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.contains("的冲突副本"))
         .collect();
-    assert_eq!(copies.len(), 1, "expected exactly one conflict copy, got {copies:?}");
+    assert_eq!(
+        copies.len(),
+        1,
+        "expected exactly one conflict copy, got {copies:?}"
+    );
     assert_eq!(h.read(&copies[0]), "local version");
 }
 
@@ -487,7 +730,10 @@ async fn a_resync_sweep_keeps_a_locally_edited_file_it_would_have_deleted() {
     h.sync().await;
 
     // The edit must survive, exactly as it does down the ordinary delete path.
-    assert!(h.path("b.txt").exists(), "a locally-edited file must survive the resync sweep");
+    assert!(
+        h.path("b.txt").exists(),
+        "a locally-edited file must survive the resync sweep"
+    );
     assert_eq!(h.read("b.txt"), "EDITED LOCALLY, NOT YET UPLOADED");
 }
 
@@ -501,8 +747,12 @@ async fn throttling_is_retried_rather_than_failing_the_sync() {
         .up_to_n_times(1)
         .mount(&h.server)
         .await;
-    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
-        .await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
     h.mock_download("F1", b"hello").await;
 
     let summary = h.sync().await;
@@ -536,8 +786,12 @@ async fn a_name_onedrive_rejects_is_reported_and_never_uploaded() {
 #[tokio::test]
 async fn a_local_delete_is_propagated_remotely() {
     let h = Harness::new().await;
-    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
-        .await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
     h.mock_download("F1", b"hello").await;
     h.sync().await;
 
@@ -567,14 +821,21 @@ async fn deleting_an_online_only_file_propagates_the_delete() {
     // real case: run_download would have recorded the inode, materialize does
     // not.
     let h = Harness::metadata_only().await;
-    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
-        .await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
     h.sync().await;
 
     // Materialise it as an online-only placeholder on disk.
     h.engine.materialize_all(|_, _| true).unwrap();
     assert!(h.path("a.txt").exists());
-    assert_eq!(Placeholder::state(&h.path("a.txt")), PlaceholderState::Dehydrated);
+    assert_eq!(
+        Placeholder::state(&h.path("a.txt")),
+        PlaceholderState::Dehydrated
+    );
     assert!(
         h.store.item("F1").unwrap().unwrap().local_ino.is_none(),
         "materialise records no inode — that is the bug this guards"
@@ -600,7 +861,10 @@ async fn deleting_an_online_only_file_propagates_the_delete() {
         .await;
 
     let summary = h.sync().await;
-    assert_eq!(summary.deleted_remote, 1, "deleting an online-only file must reach the cloud");
+    assert_eq!(
+        summary.deleted_remote, 1,
+        "deleting an online-only file must reach the cloud"
+    );
     assert!(h.store.item("F1").unwrap().is_none());
 }
 
@@ -610,8 +874,12 @@ async fn a_pending_download_is_not_mistaken_for_a_local_delete() {
     // looks exactly like a file the user deleted. Deleting it remotely would
     // destroy data the user never touched.
     let h = Harness::new().await;
-    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
-        .await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
     // The download fails, so the record exists with no local file behind it.
     Mock::given(method("GET"))
         .and(path("/me/drive/items/F1/content"))
@@ -621,7 +889,10 @@ async fn a_pending_download_is_not_mistaken_for_a_local_delete() {
 
     let summary = h.sync().await;
     assert!(!h.path("a.txt").exists());
-    assert_eq!(summary.deleted_remote, 0, "must not have deleted anything remotely");
+    assert_eq!(
+        summary.deleted_remote, 0,
+        "must not have deleted anything remotely"
+    );
     assert!(h.store.item("F1").unwrap().is_some());
 }
 
@@ -634,7 +905,14 @@ async fn a_scan_that_would_wipe_the_account_holds_the_deletions() {
     let h = Harness::new().await;
     let items: Vec<Value> = (0..12)
         .map(|i| {
-            file(&format!("F{i}"), ROOT, &format!("f{i}.txt"), "c1", 5, "2026-08-20T10:00:00Z")
+            file(
+                &format!("F{i}"),
+                ROOT,
+                &format!("f{i}.txt"),
+                "c1",
+                5,
+                "2026-08-20T10:00:00Z",
+            )
         })
         .collect();
     h.mock_delta(None, items, "v1").await;
@@ -652,8 +930,14 @@ async fn a_scan_that_would_wipe_the_account_holds_the_deletions() {
     h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
     // Deliberately no DELETE mock: a working guard enqueues no deletion at all.
     let summary = h.sync().await;
-    assert_eq!(summary.deleted_remote, 0, "a mass vanish must not delete remotely");
-    assert!(summary.refused_deletions >= 12, "the deletions should be held, not run");
+    assert_eq!(
+        summary.deleted_remote, 0,
+        "a mass vanish must not delete remotely"
+    );
+    assert!(
+        summary.refused_deletions >= 12,
+        "the deletions should be held, not run"
+    );
     for i in 0..12 {
         assert!(
             h.store.item(&format!("F{i}")).unwrap().is_some(),
@@ -670,8 +954,12 @@ async fn a_sync_root_on_a_different_device_refuses_to_scan() {
     // account.
     use std::os::unix::fs::MetadataExt;
     let h = Harness::new().await;
-    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
-        .await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
     h.mock_download("F1", b"hello").await;
     h.sync().await; // records the real device
 
@@ -683,7 +971,10 @@ async fn a_sync_root_on_a_different_device_refuses_to_scan() {
     h.server.reset().await;
     h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
     let summary = h.sync().await;
-    assert_eq!(summary.deleted_remote, 0, "a device mismatch must never delete");
+    assert_eq!(
+        summary.deleted_remote, 0,
+        "a device mismatch must never delete"
+    );
     assert!(h.store.item("F1").unwrap().is_some());
 }
 
@@ -708,7 +999,6 @@ async fn mock_upload(server: &MockServer, new_id: &str, name: &str) {
         .await;
 }
 
-
 // ---------------------------------------------------------------------------
 // The shipped default: enumerate everything, download nothing.
 //
@@ -725,7 +1015,14 @@ async fn a_first_sync_downloads_nothing_by_default() {
         vec![
             folder("D1", ROOT, "Documents"),
             file("F1", "D1", "report.txt", "c1", 5, "2026-08-20T10:00:00Z"),
-            file("F2", ROOT, "big.bin", "c1", 9_000_000_000, "2026-08-20T10:00:00Z"),
+            file(
+                "F2",
+                ROOT,
+                "big.bin",
+                "c1",
+                9_000_000_000,
+                "2026-08-20T10:00:00Z",
+            ),
         ],
         "v1",
     )
@@ -775,7 +1072,10 @@ async fn pinning_a_folder_downloads_only_that_folder() {
     h.sync().await;
     assert!(!h.path("Wanted/yes.txt").exists());
 
-    let outcome = h.engine.set_pin(Path::new("Wanted"), PinState::Pinned).unwrap();
+    let outcome = h
+        .engine
+        .set_pin(Path::new("Wanted"), PinState::Pinned)
+        .unwrap();
     assert_eq!(outcome.files, 1);
     assert_eq!(outcome.bytes, 5);
 
@@ -796,14 +1096,24 @@ async fn new_files_inside_a_pinned_folder_are_downloaded_automatically() {
     // Pinning is a standing choice, not a one-off: something added to a pinned
     // folder later has to arrive without the user pinning it again.
     let h = Harness::metadata_only().await;
-    h.mock_delta(None, vec![folder("D1", ROOT, "Wanted")], "v1").await;
+    h.mock_delta(None, vec![folder("D1", ROOT, "Wanted")], "v1")
+        .await;
     h.sync().await;
-    h.engine.set_pin(Path::new("Wanted"), PinState::Pinned).unwrap();
+    h.engine
+        .set_pin(Path::new("Wanted"), PinState::Pinned)
+        .unwrap();
 
     h.server.reset().await;
     h.mock_delta(
         Some(("token", "v1")),
-        vec![file("F9", "D1", "later.txt", "c1", 5, "2026-08-21T10:00:00Z")],
+        vec![file(
+            "F9",
+            "D1",
+            "later.txt",
+            "c1",
+            5,
+            "2026-08-21T10:00:00Z",
+        )],
         "v2",
     )
     .await;
@@ -830,7 +1140,9 @@ async fn an_unpinned_subfolder_is_excluded_from_its_pinned_parent() {
     .await;
     h.sync().await;
 
-    h.engine.set_pin(Path::new("Parent"), PinState::Pinned).unwrap();
+    h.engine
+        .set_pin(Path::new("Parent"), PinState::Pinned)
+        .unwrap();
     // The nearer, explicit choice must beat the inherited one.
     h.engine
         .set_pin(Path::new("Parent/Huge"), PinState::Unpinned)
@@ -864,7 +1176,10 @@ async fn unpinning_stops_downloads_but_never_deletes_local_files() {
     h.sync().await;
     assert_eq!(h.read("Docs/a.txt"), "hello");
 
-    let outcome = h.engine.set_pin(Path::new("Docs"), PinState::Unpinned).unwrap();
+    let outcome = h
+        .engine
+        .set_pin(Path::new("Docs"), PinState::Unpinned)
+        .unwrap();
     assert_eq!(outcome.files, 0, "unpinning queues no transfers");
 
     h.server.reset().await;
@@ -953,7 +1268,8 @@ async fn re_enumerating_the_root_does_not_clear_a_pin_set_on_it() {
     // The root is re-recorded on every delta page that mentions it. Doing that
     // must not undo a user's explicit "sync everything" choice.
     let h = Harness::metadata_only().await;
-    h.mock_delta(None, vec![root_item(), folder("D1", ROOT, "Docs")], "v1").await;
+    h.mock_delta(None, vec![root_item(), folder("D1", ROOT, "Docs")], "v1")
+        .await;
     h.sync().await;
 
     h.engine.set_pin(Path::new(""), PinState::Pinned).unwrap();
@@ -963,7 +1279,8 @@ async fn re_enumerating_the_root_does_not_clear_a_pin_set_on_it() {
     );
 
     h.server.reset().await;
-    h.mock_delta(Some(("token", "v1")), vec![root_item()], "v2").await;
+    h.mock_delta(Some(("token", "v1")), vec![root_item()], "v2")
+        .await;
     h.sync().await;
 
     assert_eq!(
@@ -992,7 +1309,10 @@ async fn excluded_folders_leave_nothing_on_disk() {
 
     // Building the folder structure for a drive nobody selected leaves tens of
     // thousands of empty directories behind for no benefit.
-    assert!(!h.path("Huge").exists(), "no directory should have been created");
+    assert!(
+        !h.path("Huge").exists(),
+        "no directory should have been created"
+    );
     // The metadata is still recorded, so the folder picker has something to show.
     assert!(h.store.item("D1").unwrap().is_some());
     assert!(h.store.item("F1").unwrap().is_some());
@@ -1283,7 +1603,9 @@ async fn a_pinned_folder_keeps_its_own_timestamp_too() {
     .await;
     h.sync().await;
 
-    h.engine.set_pin(Path::new("Chosen"), PinState::Pinned).unwrap();
+    h.engine
+        .set_pin(Path::new("Chosen"), PinState::Pinned)
+        .unwrap();
 
     h.server.reset().await;
     h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
@@ -1318,7 +1640,11 @@ async fn a_drifted_directory_timestamp_is_corrected_on_the_next_pass() {
     });
     h.mock_delta(
         None,
-        vec![root_item(), docs, file("F1", "D1", "a.txt", "c1", 5, "2022-03-12T01:55:00Z")],
+        vec![
+            root_item(),
+            docs,
+            file("F1", "D1", "a.txt", "c1", 5, "2022-03-12T01:55:00Z"),
+        ],
         "v1",
     )
     .await;
@@ -1369,7 +1695,14 @@ async fn harness_with_a_downloaded_file(content: &'static [u8]) -> Harness {
         vec![
             root_item(),
             folder("D1", ROOT, "Docs"),
-            file("F1", "D1", "big.bin", "c1", content.len() as u64, "2022-03-12T01:55:00Z"),
+            file(
+                "F1",
+                "D1",
+                "big.bin",
+                "c1",
+                content.len() as u64,
+                "2022-03-12T01:55:00Z",
+            ),
         ],
         "v1",
     )
@@ -1480,13 +1813,23 @@ async fn a_cloud_edit_to_a_hydrated_on_demand_file_re_downloads_in_place() {
     h.mock_download("F1", b"old").await;
     assert_eq!(h.engine.hydrate(&path).await.unwrap(), 3);
     assert_eq!(h.read("Docs/note.txt"), "old");
-    assert!(Occupancy::read(&path).unwrap().allocated >= 3, "now materialised");
+    assert!(
+        Occupancy::read(&path).unwrap().allocated >= 3,
+        "now materialised"
+    );
 
     // Now it changes in the cloud.
     h.server.reset().await;
     h.mock_delta(
         Some(("token", "v1")),
-        vec![file("F1", "D1", "note.txt", "c2", 5, "2026-08-21T10:00:00Z")],
+        vec![file(
+            "F1",
+            "D1",
+            "note.txt",
+            "c2",
+            5,
+            "2026-08-21T10:00:00Z",
+        )],
         "v2",
     )
     .await;
@@ -1498,7 +1841,10 @@ async fn a_cloud_edit_to_a_hydrated_on_demand_file_re_downloads_in_place() {
     // the stale "old" bytes.
     assert_eq!(summary.downloaded, 1, "the hydrated file re-downloads");
     assert_eq!(h.read("Docs/note.txt"), "newer");
-    assert_eq!(h.store.item("F1").unwrap().unwrap().state, ItemState::Synced);
+    assert_eq!(
+        h.store.item("F1").unwrap().unwrap().state,
+        ItemState::Synced
+    );
     assert_eq!(Placeholder::state(&path), PlaceholderState::Hydrated);
 }
 
@@ -1538,7 +1884,10 @@ async fn freeing_space_refuses_a_file_with_unsaved_changes() {
     assert_eq!(outcome.files, 0, "nothing should have been freed");
     assert_eq!(outcome.skipped.len(), 1);
     assert!(outcome.skipped[0].1.contains("local changes"));
-    assert_eq!(std::fs::read(&path).unwrap(), b"an edit that has not been uploaded");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"an edit that has not been uploaded"
+    );
 }
 
 #[tokio::test]
@@ -1556,11 +1905,15 @@ async fn freeing_space_refuses_an_in_place_edit_that_kept_size_and_mtime() {
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
     std::fs::write(&path, b"EDITED!!").unwrap();
     let f = std::fs::File::options().write(true).open(&path).unwrap();
-    f.set_times(std::fs::FileTimes::new().set_modified(before)).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(before))
+        .unwrap();
     drop(f);
 
     let outcome = h.engine.free_space(Path::new("Docs")).unwrap();
-    assert_eq!(outcome.files, 0, "a same-size, same-mtime edit must still be protected");
+    assert_eq!(
+        outcome.files, 0,
+        "a same-size, same-mtime edit must still be protected"
+    );
     assert_eq!(
         std::fs::read(&path).unwrap(),
         b"EDITED!!",
@@ -1569,7 +1922,7 @@ async fn freeing_space_refuses_an_in_place_edit_that_kept_size_and_mtime() {
 }
 
 #[tokio::test]
-async fn materialize_never_zeroes_a_sparse_file_the_user_edited() {
+async fn destructive_placeholder_actions_never_zero_a_sparse_file_the_user_edited() {
     // The materialize hollow-rebuild turns a "downloaded" file that is actually
     // a hole back into a placeholder. A genuinely sparse file the user edited
     // in place (a VM image, a preallocated database) looks hollow too — it must
@@ -1583,13 +1936,25 @@ async fn materialize_never_zeroes_a_sparse_file_the_user_edited() {
     // apparent size, little allocated, real bytes at each end — content that
     // differs from what we recorded on download.
     {
-        let mut f = std::fs::OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
         f.set_len(1_000_000).unwrap();
         f.write_all(b"USER SPARSE DATA").unwrap();
         f.seek(SeekFrom::Start(999_990)).unwrap();
         f.write_all(b"TAIL").unwrap();
     }
     let before = std::fs::read(&path).unwrap();
+
+    let outcome = h.engine.free_space(Path::new("Docs")).unwrap();
+    assert_eq!(
+        outcome.files, 0,
+        "free-space must refuse user-owned sparse bytes"
+    );
+    assert_eq!(outcome.skipped.len(), 1);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 
     h.engine.materialize_all(|_, _| true).unwrap();
 
@@ -1612,7 +1977,8 @@ async fn a_download_preserves_a_hidden_local_edit_as_a_conflict_copy() {
     let before = std::fs::metadata(&path).unwrap().modified().unwrap();
     std::fs::write(&path, b"BBBBBBBB").unwrap();
     let f = std::fs::File::options().write(true).open(&path).unwrap();
-    f.set_times(std::fs::FileTimes::new().set_modified(before)).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(before))
+        .unwrap();
     drop(f);
 
     h.server.reset().await;
@@ -1626,8 +1992,15 @@ async fn a_download_preserves_a_hidden_local_edit_as_a_conflict_copy() {
     mock_upload(&h.server, "F1copy", "conflict").await;
 
     let summary = h.sync().await;
-    assert!(summary.conflicts >= 1, "a hidden edit must become a conflict, not be overwritten");
-    assert_eq!(h.read("Docs/big.bin"), "REMOTE!!", "the remote takes the original name");
+    assert!(
+        summary.conflicts >= 1,
+        "a hidden edit must become a conflict, not be overwritten"
+    );
+    assert_eq!(
+        h.read("Docs/big.bin"),
+        "REMOTE!!",
+        "the remote takes the original name"
+    );
 
     let copies: Vec<_> = std::fs::read_dir(h.path("Docs"))
         .unwrap()
@@ -1635,7 +2008,11 @@ async fn a_download_preserves_a_hidden_local_edit_as_a_conflict_copy() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.contains("的冲突副本"))
         .collect();
-    assert_eq!(copies.len(), 1, "the hidden edit must survive as a conflict copy: {copies:?}");
+    assert_eq!(
+        copies.len(),
+        1,
+        "the hidden edit must survive as a conflict copy: {copies:?}"
+    );
     assert_eq!(h.read(&format!("Docs/{}", copies[0])), "BBBBBBBB");
 }
 
@@ -1645,8 +2022,12 @@ async fn an_upload_that_would_overwrite_a_newer_remote_becomes_a_conflict() {
     // our upload replaces their edit — a lost update. With it the service
     // returns 412 and we must keep our copy, not overwrite theirs.
     let h = Harness::new().await;
-    h.mock_delta(None, vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")], "v1")
-        .await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
     h.mock_download("F1", b"hello").await;
     h.sync().await;
 
@@ -1665,7 +2046,10 @@ async fn an_upload_that_would_overwrite_a_newer_remote_becomes_a_conflict() {
         .await;
 
     let summary = h.sync().await;
-    assert!(summary.conflicts >= 1, "a 412 must become a conflict, not a lost update");
+    assert!(
+        summary.conflicts >= 1,
+        "a 412 must become a conflict, not a lost update"
+    );
 
     let copies: Vec<_> = std::fs::read_dir(&h.root)
         .unwrap()
@@ -1673,7 +2057,11 @@ async fn an_upload_that_would_overwrite_a_newer_remote_becomes_a_conflict() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.contains("的冲突副本"))
         .collect();
-    assert_eq!(copies.len(), 1, "our local edit must be preserved: {copies:?}");
+    assert_eq!(
+        copies.len(),
+        1,
+        "our local edit must be preserved: {copies:?}"
+    );
     assert_eq!(h.read(&copies[0]), "my local edit");
 }
 
@@ -1683,8 +2071,19 @@ async fn a_local_file_differing_only_in_case_loses_no_data() {
     // Report.txt and report.txt on disk while the service can hold only one.
     // Whatever we do to reconcile that, neither file's bytes may be destroyed.
     let h = Harness::new().await;
-    h.mock_delta(None, vec![file("F1", ROOT, "Report.txt", "c1", 8, "2026-08-20T10:00:00Z")], "v1")
-        .await;
+    h.mock_delta(
+        None,
+        vec![file(
+            "F1",
+            ROOT,
+            "Report.txt",
+            "c1",
+            8,
+            "2026-08-20T10:00:00Z",
+        )],
+        "v1",
+    )
+    .await;
     h.mock_download("F1", b"REMOTE!!").await;
     h.sync().await;
     assert_eq!(h.read("Report.txt"), "REMOTE!!");
@@ -1699,9 +2098,19 @@ async fn a_local_file_differing_only_in_case_loses_no_data() {
     let _ = h.sync().await;
 
     // Neither file's content may be silently lost.
-    assert!(h.path("Report.txt").exists(), "the synced file must survive");
-    assert_eq!(h.read("Report.txt"), "REMOTE!!", "the synced file must not be clobbered");
-    assert!(h.path("report.txt").exists(), "the new local file must survive");
+    assert!(
+        h.path("Report.txt").exists(),
+        "the synced file must survive"
+    );
+    assert_eq!(
+        h.read("Report.txt"),
+        "REMOTE!!",
+        "the synced file must not be clobbered"
+    );
+    assert!(
+        h.path("report.txt").exists(),
+        "the new local file must survive"
+    );
     assert_eq!(h.read("report.txt"), "my local file");
 }
 
@@ -1778,6 +2187,9 @@ async fn an_interrupted_upload_resumes_from_its_committed_offset() {
             expires_at: None,
             committed_offset: 327_680,
             total_size: 400_000,
+            source_fingerprint: Some(
+                gonedrive_core::sync::transfer::file_fingerprint(&file).unwrap(),
+            ),
         })
         .unwrap();
 
@@ -1798,7 +2210,10 @@ async fn an_interrupted_upload_resumes_from_its_committed_offset() {
         .await;
 
     let summary = h.sync().await;
-    assert_eq!(summary.uploaded, 1, "the upload should resume from its offset and complete");
+    assert_eq!(
+        summary.uploaded, 1,
+        "the upload should resume from its offset and complete"
+    );
     assert!(h.store.item("NEW").unwrap().is_some());
 }
 
@@ -1815,7 +2230,14 @@ async fn placeholders_can_be_created_for_files_never_downloaded() {
         vec![
             root_item(),
             folder("D1", ROOT, "Docs"),
-            file("F1", "D1", "huge.bin", "c1", 4 * 1024 * 1024, "2022-03-12T01:55:00Z"),
+            file(
+                "F1",
+                "D1",
+                "huge.bin",
+                "c1",
+                4 * 1024 * 1024,
+                "2022-03-12T01:55:00Z",
+            ),
         ],
         "v1",
     )
@@ -1827,7 +2249,10 @@ async fn placeholders_can_be_created_for_files_never_downloaded() {
     assert_eq!(outcome.files, 1);
 
     let path = h.path("Docs/huge.bin");
-    assert_eq!(Occupancy::read(&path).unwrap().apparent_size, 4 * 1024 * 1024);
+    assert_eq!(
+        Occupancy::read(&path).unwrap().apparent_size,
+        4 * 1024 * 1024
+    );
     assert_is_placeholder_on_disk(&path);
     assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
     assert_eq!(
@@ -1892,13 +2317,20 @@ async fn staging_never_writes_to_the_placeholder_itself() {
 
     // The content landed beside the placeholder, not in it.
     assert_ne!(staged, path);
-    assert_eq!(staged.parent(), path.parent(), "must stay on one filesystem");
+    assert_eq!(
+        staged.parent(),
+        path.parent(),
+        "must stay on one filesystem"
+    );
     assert_eq!(std::fs::read(&staged).unwrap(), CONTENT);
 
     // The placeholder is untouched: still empty, still marked, still sparse.
     assert_is_placeholder_on_disk(&path);
     assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
-    assert_eq!(Occupancy::read(&path).unwrap().apparent_size, CONTENT.len() as u64);
+    assert_eq!(
+        Occupancy::read(&path).unwrap().apparent_size,
+        CONTENT.len() as u64
+    );
 
     // And the staging name is one the local scanner already ignores, so it
     // cannot be mistaken for a new file and uploaded.
@@ -2005,7 +2437,10 @@ async fn a_stale_hydrating_record_is_repaired_from_the_file_itself() {
     Placeholder::mark_hydrated(&path, "F1", Some("c1")).unwrap();
     h.store.set_item_state("F1", ItemState::Hydrating).unwrap();
     assert_eq!(h.engine.repair_states().unwrap(), 1);
-    assert_eq!(h.store.item("F1").unwrap().unwrap().state, ItemState::Synced);
+    assert_eq!(
+        h.store.item("F1").unwrap().unwrap().state,
+        ItemState::Synced
+    );
 }
 
 #[tokio::test]
@@ -2040,7 +2475,10 @@ async fn freeing_one_folder_leaves_its_siblings_alone() {
         PlaceholderState::Dehydrated
     );
     // The sibling keeps its content and its marks.
-    assert_eq!(std::fs::read(h.path("Tools/sibling.txt")).unwrap(), b"sibli");
+    assert_eq!(
+        std::fs::read(h.path("Tools/sibling.txt")).unwrap(),
+        b"sibli"
+    );
     assert_eq!(
         Placeholder::state(&h.path("Tools/sibling.txt")),
         PlaceholderState::Hydrated
@@ -2072,8 +2510,12 @@ async fn auto_free_releases_lru_unpinned_files_and_spares_pinned_ones() {
     // Under the mirror-everything policy the default pin is "keep", so
     // nothing is evictable until the user says otherwise — that is the whole
     // point of the default. Mark the cache folder as not-kept explicitly.
-    h.engine.set_pin(Path::new("Keep"), PinState::Pinned).unwrap();
-    h.engine.set_pin(Path::new("Cache"), PinState::Unpinned).unwrap();
+    h.engine
+        .set_pin(Path::new("Keep"), PinState::Pinned)
+        .unwrap();
+    h.engine
+        .set_pin(Path::new("Cache"), PinState::Unpinned)
+        .unwrap();
 
     // A threshold no disk satisfies forces the release path deterministically.
     let outcome = h.engine.auto_free(u64::MAX).unwrap();
@@ -2088,7 +2530,12 @@ async fn auto_free_releases_lru_unpinned_files_and_spares_pinned_ones() {
         Placeholder::state(&h.path("Cache/new.bin")),
         PlaceholderState::Dehydrated
     );
-    assert!(Occupancy::read(&h.path("Keep/pinned.bin")).unwrap().allocated > 0);
+    assert!(
+        Occupancy::read(&h.path("Keep/pinned.bin"))
+            .unwrap()
+            .allocated
+            > 0
+    );
     assert_eq!(std::fs::read(h.path("Keep/pinned.bin")).unwrap(), b"pinnd");
 
     // And a second pass finds nothing left to do.
@@ -2111,7 +2558,9 @@ async fn auto_free_never_touches_a_file_with_unsaved_changes() {
     .await;
     h.mock_download("F1", b"hello").await;
     h.sync().await;
-    h.engine.set_pin(Path::new("Cache"), PinState::Unpinned).unwrap();
+    h.engine
+        .set_pin(Path::new("Cache"), PinState::Unpinned)
+        .unwrap();
 
     std::fs::write(h.path("Cache/edited.bin"), b"an unsaved local edit").unwrap();
 
@@ -2167,7 +2616,10 @@ async fn a_range_stage_fetches_only_the_window_and_changes_nothing() {
         h.store.item("F1").unwrap().unwrap().state,
         gonedrive_core::db::ItemState::Dehydrated
     );
-    assert_eq!(Occupancy::read(&path).unwrap().apparent_size, CONTENT.len() as u64);
+    assert_eq!(
+        Occupancy::read(&path).unwrap().apparent_size,
+        CONTENT.len() as u64
+    );
 
     // Quiet by design: no progress events, no activity — nothing for a UI to
     // flash on screen over a 16 KiB sniff.
@@ -2199,7 +2651,11 @@ async fn a_browsed_placeholder_can_still_be_freed() {
     let outcome = h.engine.free_space(Path::new("Docs")).unwrap();
     assert_eq!(outcome.files, 1, "skipped: {:?}", outcome.skipped);
     assert!(outcome.skipped.is_empty());
-    assert_eq!(Occupancy::read(&path).unwrap().allocated, 0, "cache punched");
+    assert_eq!(
+        Occupancy::read(&path).unwrap().allocated,
+        0,
+        "cache punched"
+    );
 
     // The guard still protects what it is for: a *hydrated* file with a real
     // local edit.
@@ -2241,9 +2697,7 @@ async fn a_cross_directory_rename_is_one_move_not_delete_plus_upload() {
     h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
     Mock::given(method("POST"))
         .and(path(format!("/me/drive/items/{ROOT}/children")))
-        .respond_with(
-            ResponseTemplate::new(201).set_body_json(folder("D9", ROOT, "目的地")),
-        )
+        .respond_with(ResponseTemplate::new(201).set_body_json(folder("D9", ROOT, "目的地")))
         .mount(&h.server)
         .await;
     let moved = json!({
@@ -2267,7 +2721,10 @@ async fn a_cross_directory_rename_is_one_move_not_delete_plus_upload() {
             failures.push(format!("{name}: {error}"));
         }
     }
-    assert_eq!(summary.failed, 0, "unexpected failures: {failures:?}\n{summary:?}");
+    assert_eq!(
+        summary.failed, 0,
+        "unexpected failures: {failures:?}\n{summary:?}"
+    );
     assert_eq!(summary.deleted_remote, 0);
 
     // Same item id, new home — identity and history preserved.
@@ -2275,6 +2732,81 @@ async fn a_cross_directory_rename_is_one_move_not_delete_plus_upload() {
     assert_eq!(record.name, "改名.txt");
     assert_eq!(record.parent_id.as_deref(), Some("D9"));
     assert_eq!(record.state, ItemState::Synced);
+}
+
+#[tokio::test]
+async fn moving_and_editing_a_file_applies_metadata_then_uploads_the_bytes() {
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![file(
+            "F1",
+            ROOT,
+            "before.txt",
+            "c1",
+            5,
+            "2026-08-20T10:00:00Z",
+        )],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"hello").await;
+    h.sync().await;
+
+    std::fs::rename(h.path("before.txt"), h.path("after.txt")).unwrap();
+    std::fs::write(h.path("after.txt"), b"edited after move").unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    let moved = json!({
+        "id": "F1", "name": "after.txt", "size": 5,
+        "cTag": "c1", "eTag": "e-moved",
+        "file": {"mimeType": "text/plain"},
+        "parentReference": {"driveId": "drive1", "id": ROOT},
+        "fileSystemInfo": {"lastModifiedDateTime": "2026-08-20T10:00:00Z"}
+    });
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/F1"))
+        .and(body_partial_json(json!({"name": "after.txt"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(moved))
+        .mount(&h.server)
+        .await;
+
+    let uploaded = json!({
+        "id": "F1", "name": "after.txt", "size": 17,
+        "cTag": "c2", "eTag": "e2",
+        "file": {"mimeType": "text/plain"},
+        "parentReference": {"driveId": "drive1", "id": ROOT},
+        "fileSystemInfo": {"lastModifiedDateTime": "2026-08-29T10:00:00Z"}
+    });
+    Mock::given(method("PUT"))
+        .and(path("/me/drive/items/F1/content"))
+        .and(body_bytes(b"edited after move"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(uploaded.clone()))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/F1"))
+        .and(body_partial_json(json!({"fileSystemInfo": {}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(uploaded))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.failed, 0);
+    assert_eq!(h.read("after.txt"), "edited after move");
+    let record = h.store.item("F1").unwrap().unwrap();
+    assert_eq!(record.name, "after.txt");
+    assert_eq!(record.ctag.as_deref(), Some("c2"));
+    assert_eq!(record.local_size, Some(17));
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v2")), vec![], "v3").await;
+    assert_eq!(
+        h.sync().await.uploaded,
+        0,
+        "the edit must not be suppressed or loop"
+    );
 }
 
 #[tokio::test]
@@ -2331,7 +2863,10 @@ async fn deleting_a_local_file_propagates_even_under_the_online_only_default() {
         .await;
 
     let summary = h.sync().await;
-    assert_eq!(summary.deleted_remote, 1, "the deletion must reach the cloud");
+    assert_eq!(
+        summary.deleted_remote, 1,
+        "the deletion must reach the cloud"
+    );
     assert!(h.store.item("F7").unwrap().is_none());
 }
 
@@ -2392,10 +2927,7 @@ async fn materialize_all_builds_a_browsable_placeholder_tree() {
     // Nothing on disk yet under the online-only default.
     assert!(!h.path("文档").exists());
 
-    let watched = h
-        .engine
-        .materialize_all(|_, _| true)
-        .unwrap();
+    let watched = h.engine.materialize_all(|_, _| true).unwrap();
 
     // The whole tree is now real, including the empty folder.
     assert!(h.path("文档/深层").is_dir());
@@ -2438,14 +2970,24 @@ async fn on_demand_mode_places_new_files_from_delta() {
     h.server.reset().await;
     h.mock_delta(
         Some(("token", "v1")),
-        vec![file("F9", "D1", "new.pdf", "c1", 4096, "2026-08-21T10:00:00Z")],
+        vec![file(
+            "F9",
+            "D1",
+            "new.pdf",
+            "c1",
+            4096,
+            "2026-08-21T10:00:00Z",
+        )],
         "v2",
     )
     .await;
     h.sync().await;
 
     let p = h.path("Docs/new.pdf");
-    assert!(p.exists(), "a new file should appear as a placeholder at once");
+    assert!(
+        p.exists(),
+        "a new file should appear as a placeholder at once"
+    );
     assert_eq!(Placeholder::state(&p), PlaceholderState::Dehydrated);
 }
 
@@ -2483,7 +3025,14 @@ async fn a_remote_change_to_a_placeholder_refreshes_it_silently() {
     h.server.reset().await;
     h.mock_delta(
         Some(("token", "v1")),
-        vec![file("F1", "D1", "report.bin", "c2", 5000, "2026-08-25T12:00:00Z")],
+        vec![file(
+            "F1",
+            "D1",
+            "report.bin",
+            "c2",
+            5000,
+            "2026-08-25T12:00:00Z",
+        )],
         "v2",
     )
     .await;
@@ -2511,7 +3060,10 @@ async fn a_remote_change_to_a_placeholder_refreshes_it_silently() {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().contains("冲突"))
         .collect();
-    assert!(copies.is_empty(), "a placeholder change must not conflict-copy");
+    assert!(
+        copies.is_empty(),
+        "a placeholder change must not conflict-copy"
+    );
 }
 
 #[tokio::test]
@@ -2586,7 +3138,14 @@ async fn an_explicitly_pinned_folder_is_a_check_even_while_online() {
         vec![
             root_item(),
             folder("D1", ROOT, "留存"),
-            file("F1", "D1", "big.bin", "c1", 9_000_000, "2026-08-20T10:00:00Z"),
+            file(
+                "F1",
+                "D1",
+                "big.bin",
+                "c1",
+                9_000_000,
+                "2026-08-20T10:00:00Z",
+            ),
         ],
         "v1",
     )
@@ -2603,7 +3162,9 @@ async fn an_explicitly_pinned_folder_is_a_check_even_while_online() {
     h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
     static BIG: &[u8] = &[0u8; 9_000_000];
     h.mock_download("F1", BIG).await;
-    h.engine.set_pin(Path::new("留存"), PinState::Pinned).unwrap();
+    h.engine
+        .set_pin(Path::new("留存"), PinState::Pinned)
+        .unwrap();
 
     assert_eq!(
         Placeholder::state(&h.path("留存")),

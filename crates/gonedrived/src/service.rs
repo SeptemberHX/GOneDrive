@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gonedrive_ipc::{AccountInfo, Activity, FolderEntry, Hydration, SyncStatus, OBJECT_PATH, SERVICE_NAME};
+use gonedrive_ipc::{
+    AccountInfo, Activity, FolderEntry, Hydration, SyncStatus, OBJECT_PATH, SERVICE_NAME,
+};
 use zbus::object_server::SignalEmitter;
 use zbus::{connection, interface};
 
@@ -260,8 +262,7 @@ impl DaemonService {
     ) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn item_failed(emitter: &SignalEmitter<'_>, name: &str, error: &str)
-        -> zbus::Result<()>;
+    async fn item_failed(emitter: &SignalEmitter<'_>, name: &str, error: &str) -> zbus::Result<()>;
 
     /// A destructive step was refused as likely accidental data loss. Nothing
     /// was deleted; the user should look and confirm.
@@ -372,15 +373,30 @@ mod tests {
     fn a_path_outside_the_root_is_refused() {
         // The classic escape: a sibling that shares a name prefix, and an
         // absolute path elsewhere entirely.
-        assert_eq!(confine_to_root(Path::new(ROOT), "/home/u/OneDrive-evil/x"), Err(ConfineError::Outside));
-        assert_eq!(confine_to_root(Path::new(ROOT), "/etc/passwd"), Err(ConfineError::Outside));
-        assert_eq!(confine_to_root(Path::new(ROOT), "/home/u"), Err(ConfineError::Outside));
+        assert_eq!(
+            confine_to_root(Path::new(ROOT), "/home/u/OneDrive-evil/x"),
+            Err(ConfineError::Outside)
+        );
+        assert_eq!(
+            confine_to_root(Path::new(ROOT), "/etc/passwd"),
+            Err(ConfineError::Outside)
+        );
+        assert_eq!(
+            confine_to_root(Path::new(ROOT), "/home/u"),
+            Err(ConfineError::Outside)
+        );
     }
 
     #[test]
     fn the_sync_root_itself_is_refused_so_one_click_cannot_sweep_the_drive() {
-        assert_eq!(confine_to_root(Path::new(ROOT), ROOT), Err(ConfineError::WholeRoot));
+        assert_eq!(
+            confine_to_root(Path::new(ROOT), ROOT),
+            Err(ConfineError::WholeRoot)
+        );
         // A trailing slash is still the root.
-        assert_eq!(confine_to_root(Path::new(ROOT), "/home/u/OneDrive/"), Err(ConfineError::WholeRoot));
+        assert_eq!(
+            confine_to_root(Path::new(ROOT), "/home/u/OneDrive/"),
+            Err(ConfineError::WholeRoot)
+        );
     }
 }

@@ -92,7 +92,11 @@ fn render(category: &str, size: i32) -> Option<ksni::Icon> {
             data.extend_from_slice(&[a, r, g, b]);
         }
     }
-    Some(ksni::Icon { width: w, height: h, data })
+    Some(ksni::Icon {
+        width: w,
+        height: h,
+        data,
+    })
 }
 
 /// The plain OneDrive cloud as a texture, for the login page and the avatar

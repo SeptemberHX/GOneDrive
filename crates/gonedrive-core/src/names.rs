@@ -169,7 +169,13 @@ mod tests {
 
     #[test]
     fn accepts_ordinary_names() {
-        for name in ["report.docx", "照片 2024.jpg", "a", "file.tar.gz", ".hidden"] {
+        for name in [
+            "report.docx",
+            "照片 2024.jpg",
+            "a",
+            "file.tar.gz",
+            ".hidden",
+        ] {
             assert!(validate_name(name).is_ok(), "rejected {name}");
         }
     }
@@ -181,14 +187,18 @@ mod tests {
         assert_eq!(fold_case("Report.TXT"), fold_case("report.txt"));
         assert_eq!(fold_case("MixedCase"), fold_case("mixedcase"));
         assert_eq!(fold_case("照片"), fold_case("照片")); // non-cased scripts unchanged
-        // Distinct names must not collide.
+                                                          // Distinct names must not collide.
         assert_ne!(fold_case("report.txt"), fold_case("report2.txt"));
     }
 
     #[test]
     fn fold_case_is_idempotent() {
         for name in ["Report.TXT", "straße", "İstanbul", "照片 2024.JPG"] {
-            assert_eq!(fold_case(&fold_case(name)), fold_case(name), "not idempotent: {name}");
+            assert_eq!(
+                fold_case(&fold_case(name)),
+                fold_case(name),
+                "not idempotent: {name}"
+            );
         }
     }
 
@@ -203,19 +213,31 @@ mod tests {
         // the same second must not clobber each other.
         std::fs::write(&base, b"first").unwrap();
         let p2 = free_path(&base);
-        assert_eq!(p2.file_name().unwrap().to_string_lossy(), "report 的冲突副本 (2).docx");
+        assert_eq!(
+            p2.file_name().unwrap().to_string_lossy(),
+            "report 的冲突副本 (2).docx"
+        );
 
         std::fs::write(&p2, b"second").unwrap();
         let p3 = free_path(&base);
-        assert_eq!(p3.file_name().unwrap().to_string_lossy(), "report 的冲突副本 (3).docx");
+        assert_eq!(
+            p3.file_name().unwrap().to_string_lossy(),
+            "report 的冲突副本 (3).docx"
+        );
         // The first copy is untouched.
         assert_eq!(std::fs::read(&base).unwrap(), b"first");
     }
 
     #[test]
     fn rejects_illegal_characters() {
-        for name in ["a:b", "a/b", "a?b", "a|b", "a*b", "a<b", "a>b", "a\"b", "a\\b"] {
-            assert_eq!(validate_name(name), Err(NameError::IllegalCharacter), "{name}");
+        for name in [
+            "a:b", "a/b", "a?b", "a|b", "a*b", "a<b", "a>b", "a\"b", "a\\b",
+        ] {
+            assert_eq!(
+                validate_name(name),
+                Err(NameError::IllegalCharacter),
+                "{name}"
+            );
         }
         assert_eq!(validate_name("a\nb"), Err(NameError::IllegalCharacter));
     }
@@ -233,7 +255,10 @@ mod tests {
         assert_eq!(validate_name("con.txt"), Err(NameError::ReservedName));
         assert_eq!(validate_name("desktop.ini"), Err(NameError::ReservedName));
         assert_eq!(validate_name(".lock"), Err(NameError::ReservedName));
-        assert_eq!(validate_name("~$budget.xlsx"), Err(NameError::ReservedPrefix));
+        assert_eq!(
+            validate_name("~$budget.xlsx"),
+            Err(NameError::ReservedPrefix)
+        );
         // Not reserved just because it starts with the same letters.
         assert!(validate_name("console.log").is_ok());
     }

@@ -205,9 +205,9 @@ pub mod hsm {
     #[serde(tag = "op", rename_all = "snake_case")]
     pub enum Request {
         /// Intercept reads of this placeholder until it is hydrated.
-        Watch { path: String },
+        Watch { id: u64, path: String },
         /// Stop intercepting: the file is hydrated, gone, or no longer ours.
-        Unwatch { path: String },
+        Unwatch { id: u64, path: String },
         /// Answer to a [`Event::Hydrate`].
         ///
         /// `source` names a file holding the content. The helper copies it into
@@ -277,8 +277,55 @@ pub mod hsm {
             #[serde(default)]
             partial_hydration: bool,
         },
+        /// Completion of a watch/unwatch request. A request id makes concurrent
+        /// registrations unambiguous and lets the daemon refuse to create a
+        /// readable-zero placeholder when fanotify_mark failed.
+        WatchResult {
+            id: u64,
+            ok: bool,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            message: Option<String>,
+        },
+        /// Retained for protocol compatibility with older helpers. New watch
+        /// operations use [`Event::WatchResult`].
         Ok,
-        Error { message: String },
-        Pong { version: String },
+        Error {
+            message: String,
+        },
+        Pong {
+            version: String,
+        },
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Event, Request};
+
+        #[test]
+        fn watch_acknowledgements_keep_their_request_id() {
+            let request = serde_json::to_string(&Request::Watch {
+                id: 42,
+                path: "/tmp/placeholder".into(),
+            })
+            .unwrap();
+            let parsed: Request = serde_json::from_str(&request).unwrap();
+            assert!(matches!(parsed, Request::Watch { id: 42, .. }));
+
+            let event = serde_json::to_string(&Event::WatchResult {
+                id: 42,
+                ok: false,
+                message: Some("unsupported filesystem".into()),
+            })
+            .unwrap();
+            let parsed: Event = serde_json::from_str(&event).unwrap();
+            assert!(matches!(
+                parsed,
+                Event::WatchResult {
+                    id: 42,
+                    ok: false,
+                    ..
+                }
+            ));
+        }
     }
 }

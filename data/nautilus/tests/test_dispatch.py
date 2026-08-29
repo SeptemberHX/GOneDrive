@@ -15,7 +15,8 @@ import time
 import unittest
 from unittest import mock
 
-ROOT = "/home/monotune/OneDrive"
+LIVE_TESTS = os.environ.get("GONEDRIVE_LIVE_TESTS") == "1"
+ROOT = os.environ.get("GONEDRIVE_TEST_ROOT", os.path.expanduser("~/OneDrive"))
 TOOLS = f"{ROOT}/工具"
 
 
@@ -70,7 +71,10 @@ def load_extension():
     import importlib.util
 
     path = os.path.expanduser(
-        "~/.local/share/nautilus-python/extensions/gonedrive.py"
+        os.environ.get(
+            "GONEDRIVE_EXTENSION",
+            "~/.local/share/nautilus-python/extensions/gonedrive.py",
+        )
     )
     spec = importlib.util.spec_from_file_location("gonedrive_installed", path)
     module = importlib.util.module_from_spec(spec)
@@ -78,7 +82,7 @@ def load_extension():
     return module
 
 
-ext = load_extension()
+ext = load_extension() if LIVE_TESTS else None
 
 
 class FakeFile:
@@ -112,7 +116,6 @@ def daemon_log():
     )
     assert out.stdout.strip(), "the daemon must be running for these tests"
     # The daemon writes to a session log file; read the freshest one.
-    base = os.path.dirname(os.environ.get("GONEDRIVE_TEST_LOG", ""))
     return os.environ["GONEDRIVE_TEST_LOG"]
 
 
@@ -140,6 +143,10 @@ def find(menu, needle):
     return next((i for i in menu if needle in i.label), None)
 
 
+@unittest.skipUnless(
+    LIVE_TESTS,
+    "set GONEDRIVE_LIVE_TESTS=1 with a running daemon and installed extension",
+)
 class DispatchTests(unittest.TestCase):
     def settle(self):
         time.sleep(1.0)
@@ -160,7 +167,7 @@ class DispatchTests(unittest.TestCase):
 
         audited = audit_since(mark)
         self.assertEqual(len(audited), 1, audited)
-        self.assertIn("path=/home/monotune/OneDrive/工具/软件", audited[0])
+        self.assertIn(f"path={TOOLS}/软件", audited[0])
         self.assertEqual(state_of(f"{TOOLS}/ss.txt"), before, "sibling untouched")
 
     def test_a_stray_multi_selection_is_visible_and_audited(self):
@@ -193,7 +200,7 @@ class DispatchTests(unittest.TestCase):
         mark = log_mark()
         menu = menu_for([ROOT])
         free = find(menu, "释放")
-        self.assertIn("整个文件夹「OneDrive」", free.label)
+        self.assertIn(f"整个文件夹「{os.path.basename(ROOT)}」", free.label)
 
         free.activate()
         self.settle()

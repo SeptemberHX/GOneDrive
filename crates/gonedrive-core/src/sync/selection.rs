@@ -43,7 +43,6 @@ impl PinOutcome {
     }
 }
 
-
 pub struct Selection {
     store: Store,
     config: Arc<Config>,
@@ -71,10 +70,9 @@ impl Selection {
     /// can show what a choice would cost before it is made.
     pub fn list(&self, relative: &Path) -> Result<Vec<Listing>> {
         let account = self.account()?;
-        let root_id = account
-            .root_item_id
-            .clone()
-            .ok_or_else(|| Error::other("the drive has not been enumerated yet; run a sync first"))?;
+        let root_id = account.root_item_id.clone().ok_or_else(|| {
+            Error::other("the drive has not been enumerated yet; run a sync first")
+        })?;
         let parent = self
             .store
             .item_at_path(&self.account_id, &root_id, relative)?
@@ -150,10 +148,9 @@ impl Selection {
     /// requests and only one of them was made.
     pub fn set_pin(&self, relative: &Path, pin: PinState) -> Result<PinOutcome> {
         let account = self.account()?;
-        let root_id = account
-            .root_item_id
-            .clone()
-            .ok_or_else(|| Error::other("the drive has not been enumerated yet; run a sync first"))?;
+        let root_id = account.root_item_id.clone().ok_or_else(|| {
+            Error::other("the drive has not been enumerated yet; run a sync first")
+        })?;
         let target = self
             .store
             .item_at_path(&self.account_id, &root_id, relative)?
@@ -166,11 +163,10 @@ impl Selection {
             // Withdraw anything already queued beneath here. Without this,
             // excluding a folder appears to do nothing until the downloads it
             // was meant to cancel have finished.
-            outcome.cancelled = self.store.cancel_ops_in_subtree(
-                &self.account_id,
-                &target.id,
-                OpKind::Download,
-            )? as u64;
+            outcome.cancelled =
+                self.store
+                    .cancel_ops_in_subtree(&self.account_id, &target.id, OpKind::Download)?
+                    as u64;
             return Ok(outcome);
         }
 
@@ -213,7 +209,8 @@ impl Selection {
                 Some(&path),
                 None,
             )?;
-            self.store.set_item_state(&file.id, ItemState::DirtyRemote)?;
+            self.store
+                .set_item_state(&file.id, ItemState::DirtyRemote)?;
             outcome.files += 1;
             outcome.bytes += file.size;
         }
@@ -221,7 +218,6 @@ impl Selection {
         outcome.free_bytes = available_bytes(&account.root_local_path);
         Ok(outcome)
     }
-
 }
 
 /// Bytes available to an unprivileged user on the filesystem holding `path`.

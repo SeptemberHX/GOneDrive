@@ -182,10 +182,9 @@ impl Fanotify {
             // SAFETY: the kernel handed us this descriptor; we own it now.
             let fd = unsafe { OwnedFd::from_raw_fd(meta.fd) };
 
-            let (offset, length) = read_range(
-                &buf[cursor + meta.metadata_len as usize..cursor + event_len],
-            )
-            .unwrap_or((0, 0));
+            let (offset, length) =
+                read_range(&buf[cursor + meta.metadata_len as usize..cursor + event_len])
+                    .unwrap_or((0, 0));
 
             events.push(PreContentEvent {
                 path: path_of(&fd),
@@ -233,8 +232,7 @@ fn read_range(mut tail: &[u8]) -> Option<(u64, u64)> {
         if len == 0 || len > tail.len() {
             return None;
         }
-        if header.info_type == FAN_EVENT_INFO_TYPE_RANGE
-            && len >= std::mem::size_of::<RangeInfo>()
+        if header.info_type == FAN_EVENT_INFO_TYPE_RANGE && len >= std::mem::size_of::<RangeInfo>()
         {
             // SAFETY: the length check above covers the whole struct.
             let range: RangeInfo = unsafe { std::ptr::read_unaligned(tail.as_ptr() as *const _) };
@@ -260,10 +258,8 @@ mod tests {
     /// The raw bytes of a `#[repr(C)]` value, as the kernel would lay them out.
     fn as_bytes<T: Copy>(v: &T) -> Vec<u8> {
         // SAFETY: reading `size_of::<T>()` bytes of a value we hold by ref.
-        unsafe {
-            std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>())
-        }
-        .to_vec()
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+            .to_vec()
     }
 
     fn range_record(offset: u64, count: u64) -> RangeInfo {
@@ -289,7 +285,11 @@ mod tests {
     fn read_range_skips_records_of_other_types_to_find_the_range() {
         // A leading non-range info record, then the range: the parser must walk
         // past the first by its len and still find the second.
-        let other = InfoHeader { info_type: 1, pad: 0, len: 8 };
+        let other = InfoHeader {
+            info_type: 1,
+            pad: 0,
+            len: 8,
+        };
         let mut buf = as_bytes(&other);
         buf.extend_from_slice(&[0u8; 4]); // pad the 'other' record out to len 8
         buf.extend_from_slice(&as_bytes(&range_record(512, 16)));
@@ -300,7 +300,11 @@ mod tests {
     fn read_range_returns_none_for_empty_or_rangeless_buffers() {
         assert_eq!(read_range(&[]), None);
         // A record whose declared len is zero must not loop forever.
-        let zero = InfoHeader { info_type: 1, pad: 0, len: 0 };
+        let zero = InfoHeader {
+            info_type: 1,
+            pad: 0,
+            len: 0,
+        };
         assert_eq!(read_range(&as_bytes(&zero)), None);
     }
 }

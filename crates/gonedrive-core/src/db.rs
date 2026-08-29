@@ -21,7 +21,7 @@ use time::OffsetDateTime;
 use crate::error::{Error, Result};
 use crate::names::fold_case;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 7;
 
 const ACTIVITY_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS activity (
@@ -31,6 +31,29 @@ CREATE TABLE IF NOT EXISTS activity (
     detail   TEXT NOT NULL DEFAULT '',
     when_ts  INTEGER NOT NULL
 );
+"#;
+
+const DELTA_STAGING_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS delta_batches (
+    account_id    TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    mode          TEXT NOT NULL,
+    generation    INTEGER,
+    item_count    INTEGER NOT NULL DEFAULT 0,
+    page_count    INTEGER NOT NULL DEFAULT 0,
+    next_sequence INTEGER NOT NULL DEFAULT 0,
+    complete      INTEGER NOT NULL DEFAULT 0,
+    delta_link    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS delta_staging (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    item_id    TEXT NOT NULL,
+    sequence   INTEGER NOT NULL,
+    payload    TEXT NOT NULL,
+    PRIMARY KEY (account_id, item_id)
+);
+CREATE INDEX IF NOT EXISTS delta_staging_order
+    ON delta_staging(account_id, sequence);
 "#;
 
 /// One entry in the persisted activity log.
@@ -223,7 +246,11 @@ impl ItemRecord {
     }
 
     /// A minimal record for a newly-seen remote item.
-    pub fn new(account_id: impl Into<String>, id: impl Into<String>, name: impl Into<String>) -> Self {
+    pub fn new(
+        account_id: impl Into<String>,
+        id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             account_id: account_id.into(),
@@ -266,6 +293,21 @@ pub struct UploadSessionRecord {
     pub expires_at: Option<OffsetDateTime>,
     pub committed_offset: u64,
     pub total_size: u64,
+    /// File identity captured when the session began. A session can only be
+    /// resumed while this still matches, otherwise its committed prefix may
+    /// belong to an older same-size version of the file.
+    pub source_fingerprint: Option<String>,
+}
+
+/// A durable Graph delta enumeration being assembled across pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaBatch {
+    pub mode: String,
+    pub generation: Option<i64>,
+    pub item_count: u64,
+    pub page_count: u64,
+    pub complete: bool,
+    pub delta_link: Option<String>,
 }
 
 /// Handle to the state database.
@@ -317,13 +359,17 @@ impl Store {
             if version >= SCHEMA_VERSION {
                 return Ok(());
             }
+            // Schema changes and user_version advance as one unit. A process
+            // dying after ALTER TABLE but before the pragma must not leave a
+            // database that attempts the same ALTER forever on next startup.
+            let tx = conn.unchecked_transaction()?;
             if version < 1 {
-                conn.execute_batch(SCHEMA)?;
+                tx.execute_batch(SCHEMA)?;
             }
             if version < 2 {
                 // Where a part-finished enumeration left off, so an interrupted
                 // first pass over a large drive resumes instead of restarting.
-                conn.execute_batch("ALTER TABLE accounts ADD COLUMN enum_link TEXT")?;
+                tx.execute_batch("ALTER TABLE accounts ADD COLUMN enum_link TEXT")?;
             }
             if version < 3 {
                 // An earlier build stamped every *upload* as `pinned`. That
@@ -333,7 +379,7 @@ impl Store {
                 // path is fixed; this scrubs the records it already poisoned.
                 // Genuine user pins are re-established the moment the user
                 // pins something, so clearing the ambiguous ones is safe.
-                let scrubbed = conn.execute(
+                let scrubbed = tx.execute(
                     "UPDATE items SET pin_state = 'inherit' WHERE pin_state = 'pinned'",
                     [],
                 )?;
@@ -347,14 +393,21 @@ impl Store {
                 // likely unmounted, leaving an empty mountpoint — and a scan
                 // that trusted the empty tree would delete the whole account
                 // server-side. Recorded on first scan, checked on every scan.
-                conn.execute_batch("ALTER TABLE accounts ADD COLUMN root_dev INTEGER")?;
+                tx.execute_batch("ALTER TABLE accounts ADD COLUMN root_dev INTEGER")?;
             }
             if version < 5 {
                 // The activity log, persisted so it survives a restart instead
                 // of living only in the front end's memory.
-                conn.execute_batch(ACTIVITY_TABLE)?;
+                tx.execute_batch(ACTIVITY_TABLE)?;
             }
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            if version < 6 {
+                tx.execute_batch("ALTER TABLE upload_sessions ADD COLUMN source_fingerprint TEXT")?;
+            }
+            if version < 7 {
+                tx.execute_batch(DELTA_STAGING_TABLES)?;
+            }
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
             Ok(())
         })
     }
@@ -507,6 +560,165 @@ impl Store {
         })
     }
 
+    // ---- durable delta assembly -------------------------------------------
+
+    pub fn delta_batch(&self, account_id: &str) -> Result<Option<DeltaBatch>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT mode, generation, item_count, page_count, complete, delta_link
+                       FROM delta_batches WHERE account_id = ?1",
+                    params![account_id],
+                    |row| {
+                        Ok(DeltaBatch {
+                            mode: row.get(0)?,
+                            generation: row.get(1)?,
+                            item_count: row.get::<_, i64>(2)? as u64,
+                            page_count: row.get::<_, i64>(3)? as u64,
+                            complete: row.get::<_, i64>(4)? != 0,
+                            delta_link: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+    }
+
+    pub fn begin_delta_batch(
+        &self,
+        account_id: &str,
+        mode: &str,
+        generation: Option<i64>,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM delta_staging WHERE account_id = ?1",
+                params![account_id],
+            )?;
+            tx.execute(
+                "DELETE FROM delta_batches WHERE account_id = ?1",
+                params![account_id],
+            )?;
+            tx.execute(
+                "INSERT INTO delta_batches (account_id, mode, generation)
+                 VALUES (?1, ?2, ?3)",
+                params![account_id, mode, generation],
+            )?;
+            tx.execute(
+                "UPDATE accounts SET enum_link = NULL WHERE id = ?1",
+                params![account_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Add one page atomically with the continuation needed for the next page.
+    /// Repeated item ids replace the earlier occurrence, preserving Graph's
+    /// documented "last occurrence wins" rule.
+    pub fn stage_delta_page(
+        &self,
+        account_id: &str,
+        items: &[(String, String)],
+        next_link: Option<&str>,
+        delta_link: Option<&str>,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut sequence: i64 = tx.query_row(
+                "SELECT next_sequence FROM delta_batches WHERE account_id = ?1",
+                params![account_id],
+                |row| row.get(0),
+            )?;
+            for (item_id, payload) in items {
+                tx.execute(
+                    "INSERT INTO delta_staging (account_id, item_id, sequence, payload)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(account_id, item_id) DO UPDATE SET
+                       sequence = excluded.sequence,
+                       payload = excluded.payload",
+                    params![account_id, item_id, sequence, payload],
+                )?;
+                sequence += 1;
+            }
+            tx.execute(
+                "UPDATE delta_batches SET
+                   item_count = item_count + ?2,
+                   page_count = page_count + 1,
+                   next_sequence = ?3,
+                   complete = ?4,
+                   delta_link = ?5
+                 WHERE account_id = ?1",
+                params![
+                    account_id,
+                    items.len() as i64,
+                    sequence,
+                    i64::from(next_link.is_none()),
+                    delta_link,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE accounts SET enum_link = ?2 WHERE id = ?1",
+                params![account_id, next_link],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn staged_delta_payloads(&self, account_id: &str) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT payload FROM delta_staging
+                  WHERE account_id = ?1 ORDER BY sequence",
+            )?;
+            let rows = stmt.query_map(params![account_id], |row| row.get(0))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Advance the cursor only after every staged filesystem change succeeded.
+    pub fn finish_delta_batch(&self, account_id: &str, delta_link: Option<&str>) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE accounts SET delta_link = ?2, enum_link = NULL WHERE id = ?1",
+                params![account_id, delta_link],
+            )?;
+            tx.execute(
+                "DELETE FROM delta_staging WHERE account_id = ?1",
+                params![account_id],
+            )?;
+            tx.execute(
+                "DELETE FROM delta_batches WHERE account_id = ?1",
+                params![account_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn abort_delta_batch(&self, account_id: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM delta_staging WHERE account_id = ?1",
+                params![account_id],
+            )?;
+            tx.execute(
+                "DELETE FROM delta_batches WHERE account_id = ?1",
+                params![account_id],
+            )?;
+            tx.execute(
+                "UPDATE accounts SET enum_link = NULL WHERE id = ?1",
+                params![account_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn set_quota(&self, account_id: &str, total: Option<u64>, used: Option<u64>) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -547,7 +759,11 @@ impl Store {
     pub fn item(&self, id: &str) -> Result<Option<ItemRecord>> {
         self.with_conn(|conn| {
             Ok(conn
-                .query_row(&format!("{ITEM_COLUMNS} WHERE id = ?1"), params![id], row_to_item)
+                .query_row(
+                    &format!("{ITEM_COLUMNS} WHERE id = ?1"),
+                    params![id],
+                    row_to_item,
+                )
                 .optional()?)
         })
     }
@@ -820,17 +1036,18 @@ impl Store {
                 "{ITEM_COLUMNS} WHERE account_id = ?1 AND is_folder = 1 AND parent_id IS NOT NULL"
             ))?;
             let rows = stmt.query_map(params![account_id], row_to_item)?;
-            let mut folders: Vec<ItemRecord> =
-                rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut folders: Vec<ItemRecord> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
             // Depth by ancestor count; cheap because parent_id is indexed and
             // trees are shallow relative to their node count.
             let depth_of = |mut id: Option<String>| -> usize {
                 let mut d = 0;
                 while let Some(cur) = id {
                     match conn
-                        .query_row("SELECT parent_id FROM items WHERE id = ?1", params![cur], |r| {
-                            r.get::<_, Option<String>>(0)
-                        })
+                        .query_row(
+                            "SELECT parent_id FROM items WHERE id = ?1",
+                            params![cur],
+                            |r| r.get::<_, Option<String>>(0),
+                        )
                         .optional()
                     {
                         Ok(Some(p)) => {
@@ -898,26 +1115,85 @@ impl Store {
         local_path: Option<&Path>,
         payload: Option<&str>,
     ) -> Result<i64> {
+        self.with_conn(|conn| enqueue_pending(conn, account_id, kind, item_id, local_path, payload))
+    }
+
+    /// Queue a metadata move and the content upload that belongs with it as
+    /// one durable decision. A crash must never leave an edited rename with
+    /// only its move half recorded.
+    pub fn enqueue_move_and_upload(
+        &self,
+        account_id: &str,
+        item_id: &str,
+        local_path: &Path,
+    ) -> Result<()> {
         self.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO pending_ops
-                   (account_id, kind, item_id, local_path, payload, next_attempt_at, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
-                 ON CONFLICT(account_id, kind, dedup_key) DO UPDATE SET
-                   payload = excluded.payload,
-                   next_attempt_at = 0,
-                   attempts = 0,
-                   last_error = NULL",
-                params![
-                    account_id,
-                    kind.as_str(),
-                    item_id,
-                    local_path.map(|p| p.to_string_lossy().into_owned()),
-                    payload,
-                    now(),
-                ],
+            let tx = conn.unchecked_transaction()?;
+            enqueue_pending(
+                &tx,
+                account_id,
+                OpKind::MoveRemote,
+                Some(item_id),
+                Some(local_path),
+                None,
             )?;
-            Ok(conn.last_insert_rowid())
+            enqueue_pending(
+                &tx,
+                account_id,
+                OpKind::Upload,
+                Some(item_id),
+                Some(local_path),
+                None,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Rewrite durable work after a remote folder/file move changed its local
+    /// absolute path. Operations keyed by item id otherwise keep trying the old
+    /// name forever; path-keyed new uploads are coalesced with any row already
+    /// queued for the destination.
+    pub fn rebase_pending_paths(
+        &self,
+        account_id: &str,
+        old_path: &Path,
+        new_path: &Path,
+    ) -> Result<()> {
+        let old = old_path.to_string_lossy().into_owned();
+        let new = new_path.to_string_lossy().into_owned();
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE OR IGNORE pending_ops
+                    SET local_path = ?3 || substr(local_path, length(?2) + 1)
+                  WHERE account_id = ?1
+                    AND (local_path = ?2 OR substr(local_path, 1, length(?2) + 1) = ?2 || '/')",
+                params![account_id, old, new],
+            )?;
+            // A row left at the old path collided with equivalent work already
+            // queued at the new path; the destination row is the one to keep.
+            tx.execute(
+                "DELETE FROM pending_ops
+                  WHERE account_id = ?1
+                    AND (local_path = ?2 OR substr(local_path, 1, length(?2) + 1) = ?2 || '/')",
+                params![account_id, old],
+            )?;
+            tx.execute(
+                "UPDATE OR IGNORE upload_sessions
+                    SET key = ?3 || substr(key, length(?2) + 1)
+                  WHERE account_id = ?1
+                    AND (key = ?2 OR substr(key, 1, length(?2) + 1) = ?2 || '/')",
+                params![account_id, old, new],
+            )?;
+            tx.execute(
+                "DELETE FROM upload_sessions
+                  WHERE account_id = ?1
+                    AND (key = ?2 OR substr(key, 1, length(?2) + 1) = ?2 || '/')",
+                params![account_id, old],
+            )?;
+            tx.commit()?;
+            Ok(())
         })
     }
 
@@ -1022,8 +1298,7 @@ impl Store {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             {
-                let mut stmt =
-                    tx.prepare("UPDATE items SET seen_gen = ?2 WHERE id = ?1")?;
+                let mut stmt = tx.prepare("UPDATE items SET seen_gen = ?2 WHERE id = ?1")?;
                 for id in ids {
                     stmt.execute(params![id, generation])?;
                 }
@@ -1102,13 +1377,15 @@ impl Store {
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO upload_sessions
-                   (key, account_id, upload_url, expires_at, committed_offset, total_size)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                   (key, account_id, upload_url, expires_at, committed_offset, total_size,
+                    source_fingerprint)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(key) DO UPDATE SET
                    upload_url = excluded.upload_url,
                    expires_at = excluded.expires_at,
                    committed_offset = excluded.committed_offset,
-                   total_size = excluded.total_size",
+                   total_size = excluded.total_size,
+                   source_fingerprint = excluded.source_fingerprint",
                 params![
                     session.key,
                     session.account_id,
@@ -1116,6 +1393,7 @@ impl Store {
                     session.expires_at.map(|t| t.unix_timestamp()),
                     session.committed_offset as i64,
                     session.total_size as i64,
+                    session.source_fingerprint,
                 ],
             )?;
             Ok(())
@@ -1126,7 +1404,8 @@ impl Store {
         self.with_conn(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT key, account_id, upload_url, expires_at, committed_offset, total_size
+                    "SELECT key, account_id, upload_url, expires_at, committed_offset, total_size,
+                            source_fingerprint
                        FROM upload_sessions WHERE key = ?1",
                     params![key],
                     |row| {
@@ -1139,6 +1418,7 @@ impl Store {
                                 .and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok()),
                             committed_offset: row.get::<_, i64>(4)? as u64,
                             total_size: row.get::<_, i64>(5)? as u64,
+                            source_fingerprint: row.get(6)?,
                         })
                     },
                 )
@@ -1261,6 +1541,36 @@ fn to_time(secs: Option<i64>) -> Option<OffsetDateTime> {
 
 fn now() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp()
+}
+
+fn enqueue_pending(
+    conn: &Connection,
+    account_id: &str,
+    kind: OpKind,
+    item_id: Option<&str>,
+    local_path: Option<&Path>,
+    payload: Option<&str>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO pending_ops
+           (account_id, kind, item_id, local_path, payload, next_attempt_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+         ON CONFLICT(account_id, kind, dedup_key) DO UPDATE SET
+           payload = excluded.payload,
+           local_path = excluded.local_path,
+           next_attempt_at = 0,
+           attempts = 0,
+           last_error = NULL",
+        params![
+            account_id,
+            kind.as_str(),
+            item_id,
+            local_path.map(|p| p.to_string_lossy().into_owned()),
+            payload,
+            now(),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
 }
 
 const SCHEMA: &str = r#"
@@ -1436,7 +1746,9 @@ mod tests {
     #[test]
     fn relative_path_walks_the_parent_chain() {
         let (store, account) = store_with_account();
-        store.upsert_item(&folder("D1", "ROOT", "Documents")).unwrap();
+        store
+            .upsert_item(&folder("D1", "ROOT", "Documents"))
+            .unwrap();
         store.upsert_item(&folder("D2", "D1", "Reports")).unwrap();
         store.upsert_item(&file("F1", "D2", "q3.docx")).unwrap();
 
@@ -1445,7 +1757,10 @@ mod tests {
             PathBuf::from("Documents/Reports/q3.docx")
         );
         // The root maps to the sync root itself, not to a "root" directory.
-        assert_eq!(store.relative_path("ROOT").unwrap().unwrap(), PathBuf::new());
+        assert_eq!(
+            store.relative_path("ROOT").unwrap().unwrap(),
+            PathBuf::new()
+        );
         assert_eq!(
             store.local_path(&account, "F1").unwrap().unwrap(),
             PathBuf::from("/home/u/OneDrive/Documents/Reports/q3.docx")
@@ -1456,7 +1771,9 @@ mod tests {
     fn relative_path_is_none_when_an_ancestor_is_missing() {
         let (store, _) = store_with_account();
         // A delta page can mention a child before its parent has arrived.
-        store.upsert_item(&file("F1", "NOT_YET", "orphan.txt")).unwrap();
+        store
+            .upsert_item(&file("F1", "NOT_YET", "orphan.txt"))
+            .unwrap();
         assert!(store.relative_path("F1").unwrap().is_none());
         assert!(store.relative_path("NOBODY").unwrap().is_none());
     }
@@ -1487,7 +1804,9 @@ mod tests {
     #[test]
     fn case_insensitive_names_collide_the_way_onedrive_does() {
         let (store, _) = store_with_account();
-        store.upsert_item(&file("F1", "ROOT", "Report.docx")).unwrap();
+        store
+            .upsert_item(&file("F1", "ROOT", "Report.docx"))
+            .unwrap();
 
         // A *different* item with the same case-folded name is a real conflict
         // and must be refused rather than silently creating a second row.
@@ -1557,6 +1876,24 @@ mod tests {
     }
 
     #[test]
+    fn edited_move_queues_metadata_and_content_together() {
+        let (store, _) = store_with_account();
+        store.upsert_item(&file("F1", "ROOT", "a.txt")).unwrap();
+
+        store
+            .enqueue_move_and_upload("acct", "F1", Path::new("/sync/b.txt"))
+            .unwrap();
+
+        let queued = store.due_ops("acct", 10).unwrap();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].kind, OpKind::MoveRemote);
+        assert_eq!(queued[1].kind, OpKind::Upload);
+        assert!(queued
+            .iter()
+            .all(|op| op.local_path.as_deref() == Some(Path::new("/sync/b.txt"))));
+    }
+
+    #[test]
     fn failed_ops_back_off_and_come_back_when_due() {
         let (store, _) = store_with_account();
         store.upsert_item(&file("F1", "ROOT", "a.txt")).unwrap();
@@ -1594,6 +1931,7 @@ mod tests {
             expires_at: None,
             committed_offset: 0,
             total_size: 100 * 1024 * 1024,
+            source_fingerprint: Some("dev:ino:size:time".into()),
         };
         store.save_upload_session(&session).unwrap();
         store.set_upload_offset("F1", 20 * 1024 * 1024).unwrap();
@@ -1625,7 +1963,15 @@ mod tests {
         // Opaque and full of characters we must not mangle.
         let link = "https://graph.microsoft.com/v1.0/me/drive/root/delta?token=aTEuMDs...%3d%3d";
         store.set_delta_link("acct", Some(link)).unwrap();
-        assert_eq!(store.account("acct").unwrap().unwrap().delta_link.as_deref(), Some(link));
+        assert_eq!(
+            store
+                .account("acct")
+                .unwrap()
+                .unwrap()
+                .delta_link
+                .as_deref(),
+            Some(link)
+        );
 
         store.set_delta_link("acct", None).unwrap();
         assert!(store.account("acct").unwrap().unwrap().delta_link.is_none());

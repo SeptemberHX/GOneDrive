@@ -301,7 +301,7 @@ journalctl -u gonedrive-hsm -f          # 特权 helper（含读者进程名）
 | `repaired a stale hydrating record` | 崩溃残留被自动纠正 |
 
 四起真实事故（误伤兄弟文件、整盘释放、进文件夹触发下载、暂存文件残留）都已固化为
-`data/nautilus/tests/test_dispatch.py` —— 用真守护进程、真总线、真文件回放右键链路。
+`data/nautilus/tests/test_dispatch.py` —— 用真守护进程、真总线、真文件回放右键链路。该组测试需显式设置 `GONEDRIVE_LIVE_TESTS=1`，并可用 `GONEDRIVE_TEST_ROOT`、`GONEDRIVE_EXTENSION` 和 `GONEDRIVE_TEST_LOG` 指定测试环境；普通测试发现会安全跳过它。
 
 ## 已知的开发环境怪癖
 

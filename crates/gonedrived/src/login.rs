@@ -49,11 +49,30 @@ impl Login {
             http.clone(),
             gonedrive_core::TokenSource::Static(token_set.access_token.clone()),
         );
-        let user = probe.me().await.context("could not read the signed-in user")?;
+        let user = probe
+            .me()
+            .await
+            .context("could not read the signed-in user")?;
         let drive = probe.drive().await.context("could not read the drive")?;
-        let root = probe.root().await.context("could not read the drive root")?;
+        let root = probe
+            .root()
+            .await
+            .context("could not read the drive root")?;
 
         let account_id = user.id.clone();
+        let other_accounts: Vec<_> = store
+            .accounts()?
+            .into_iter()
+            .filter(|account| account.id != account_id)
+            .map(|account| account.id)
+            .collect();
+        if !other_accounts.is_empty() {
+            anyhow::bail!(
+                "GOnedrive currently supports one account per profile; sign out of {} before signing in to {}",
+                other_accounts.join(", "),
+                account_id
+            );
+        }
         Authenticator::adopt(
             http,
             config.client_id.clone(),

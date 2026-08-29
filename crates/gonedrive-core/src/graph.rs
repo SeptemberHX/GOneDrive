@@ -77,9 +77,7 @@ impl GraphClient {
 
     pub async fn me(&self) -> Result<User> {
         let base = &self.base;
-        let response = self
-            .send(|http| http.get(format!("{base}/me")))
-            .await?;
+        let response = self.send(|http| http.get(format!("{base}/me"))).await?;
         Ok(response.json().await?)
     }
 
@@ -221,10 +219,8 @@ impl GraphClient {
         let base = &self.base;
         let response = self
             .send(|http| {
-                http.post(format!(
-                    "{base}/me/drive/items/{parent_id}/children"
-                ))
-                .json(&body)
+                http.post(format!("{base}/me/drive/items/{parent_id}/children"))
+                    .json(&body)
             })
             .await?;
         Ok(response.json().await?)

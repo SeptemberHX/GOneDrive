@@ -4,6 +4,8 @@
 *.db-wal
 *.db-shm
 .env
+__pycache__/
+*.py[cod]
 
 # deb build artifact
 gonedrive_*.deb

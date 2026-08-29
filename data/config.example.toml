@@ -33,10 +33,7 @@ upload_session_threshold = 4194304
 # 10 MiB = 32 x 320 KiB.
 upload_chunk_size = 10485760
 
-max_concurrent_transfers = 4
-
-# Files on demand. Not yet implemented (M2); parsed now so config files
-# written today stay valid.
+# Files on demand.
 # 真·按需下载：把整棵 OneDrive 物化成磁盘上的占位符树，文件管理器里全盘
 # 可见、离线可浏览、打开才下载（对齐 Windows）。false 则为选择性同步。
 on_demand = false

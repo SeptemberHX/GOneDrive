@@ -45,7 +45,11 @@ use gonedrive_ipc::reader_policy::{is_background_reader, is_bulk_copier};
 const HYDRATE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Parser)]
-#[command(name = "gonedrive-hsm", version, about = "GOnedrive files-on-demand helper")]
+#[command(
+    name = "gonedrive-hsm",
+    version,
+    about = "GOnedrive files-on-demand helper"
+)]
 struct Cli {
     /// Unix socket to listen on.
     #[arg(long, default_value = SOCKET_PATH)]
@@ -247,35 +251,37 @@ fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
                 partial_hydration: true,
             });
         }
-        Request::Watch { path } => {
+        Request::Watch { id, path } => {
             let path = PathBuf::from(path);
-            match authorise(&path, uid) {
-                Err(e) => {
-                    let _ = shared.send(&Event::Error {
-                        message: e.to_string(),
-                    });
-                }
+            let result = match authorise(&path, uid) {
+                Err(e) => Err(e),
                 Ok(()) => match shared.fan.watch(&path) {
                     Ok(()) => {
                         tracing::debug!(path = %path.display(), "watching");
-                        let _ = shared.send(&Event::Ok);
+                        Ok(())
                     }
-                    Err(e) => {
-                        let _ = shared.send(&Event::Error {
-                            message: format!("could not watch {}: {e}", path.display()),
-                        });
-                    }
+                    Err(e) => Err(anyhow::anyhow!("could not watch {}: {e}", path.display())),
                 },
-            }
+            };
+            let _ = shared.send(&Event::WatchResult {
+                id,
+                ok: result.is_ok(),
+                message: result.err().map(|error| error.to_string()),
+            });
         }
-        Request::Unwatch { path } => {
+        Request::Unwatch { id, path } => {
             let path = PathBuf::from(path);
-            // Removing a mark is harmless whatever the path, but keeping the
-            // check makes the authorised set the same in both directions.
-            if authorise(&path, uid).is_ok() {
-                let _ = shared.fan.unwatch(&path);
-            }
-            let _ = shared.send(&Event::Ok);
+            let result = authorise(&path, uid).and_then(|()| {
+                shared
+                    .fan
+                    .unwatch(&path)
+                    .with_context(|| format!("could not unwatch {}", path.display()))
+            });
+            let _ = shared.send(&Event::WatchResult {
+                id,
+                ok: result.is_ok(),
+                message: result.err().map(|error| error.to_string()),
+            });
         }
         Request::Hydrated {
             id,
@@ -316,11 +322,14 @@ fn authorise(path: &Path, uid: u32) -> Result<()> {
     if !path.is_absolute() {
         bail!("{} is not an absolute path", path.display());
     }
-    if path.components().any(|c| c == std::path::Component::ParentDir) {
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
         bail!("{} contains a parent-directory component", path.display());
     }
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("cannot stat {}", path.display()))?;
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("cannot stat {}", path.display()))?;
     use std::os::unix::fs::MetadataExt;
     if meta.uid() != uid {
         bail!(
@@ -491,11 +500,32 @@ fn hydrate(shared: &Arc<Shared>, event: &PreContentEvent) -> Result<(bool, bool)
         Reply::Deny => return Ok((false, true)),
     };
 
+    let staged_len = std::fs::metadata(&staged)?.len();
+    let target_len = descriptor_len(event.fd.as_raw_fd())?;
+    let expected = if full {
+        target_len
+    } else {
+        event.length.min(target_len.saturating_sub(offset))
+    };
+    if staged_len != expected {
+        let _ = std::fs::remove_file(&staged);
+        bail!(
+            "staged content has {staged_len} bytes, expected {expected} for {}",
+            path.display()
+        );
+    }
+
     // Written through the event's own descriptor. Any other descriptor would
     // fault the hole back through this same hook and loop forever.
     let written = fill_from(&staged, &event.fd, offset)
         .with_context(|| format!("filling from {}", staged.display()))?;
     let _ = std::fs::remove_file(&staged);
+    if written != expected {
+        bail!(
+            "filled {written} bytes, expected {expected} for {}",
+            path.display()
+        );
+    }
 
     if full {
         // The file now holds its content, so it no longer needs intercepting.
@@ -516,6 +546,17 @@ fn hydrate(shared: &Arc<Shared>, event: &PreContentEvent) -> Result<(bool, bool)
         );
     }
     Ok((true, full))
+}
+
+fn descriptor_len(fd: std::os::unix::io::RawFd) -> Result<u64> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `stat` points to writable storage and `fd` belongs to the event.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: fstat succeeded and initialized the structure.
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.st_size.max(0) as u64)
 }
 
 /// Copy a staged file into the placeholder through the event descriptor,
@@ -555,7 +596,6 @@ fn fill_from(source: &Path, target: &std::os::unix::io::OwnedFd, offset: u64) ->
     Ok(total)
 }
 
-
 /// Name the process if it is one that should never trigger a download.
 fn background_reader(pid: i32) -> Option<&'static str> {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
@@ -593,7 +633,11 @@ mod tests {
         // A sparse placeholder the size of the file: zeros to be filled.
         std::fs::write(&target, vec![0u8; 16]).unwrap();
 
-        let fd: OwnedFd = std::fs::OpenOptions::new().write(true).open(&target).unwrap().into();
+        let fd: OwnedFd = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .into();
         let n = fill_from(&source, &fd, 0).unwrap();
         assert_eq!(n, 16);
         assert_eq!(std::fs::read(&target).unwrap(), b"the real content");
@@ -609,14 +653,26 @@ mod tests {
         // 32 bytes of 'A'; the fill must touch only [10, 16).
         std::fs::write(&target, vec![b'A'; 32]).unwrap();
 
-        let fd: OwnedFd = std::fs::OpenOptions::new().write(true).open(&target).unwrap().into();
+        let fd: OwnedFd = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .into();
         let n = fill_from(&source, &fd, 10).unwrap();
         assert_eq!(n, 6);
 
         let got = std::fs::read(&target).unwrap();
-        assert_eq!(&got[..10], &[b'A'; 10], "bytes before the offset are untouched");
+        assert_eq!(
+            &got[..10],
+            &[b'A'; 10],
+            "bytes before the offset are untouched"
+        );
         assert_eq!(&got[10..16], b"MIDDLE", "the range landed at its offset");
-        assert_eq!(&got[16..], &[b'A'; 16], "bytes after the range are untouched");
+        assert_eq!(
+            &got[16..],
+            &[b'A'; 16],
+            "bytes after the range are untouched"
+        );
         assert_eq!(got.len(), 32, "the file was not grown past its size");
     }
 
@@ -638,7 +694,9 @@ mod tests {
         // an indexer walking the home directory would download the whole drive.
         for name in ["localsearch-3", "tracker-miner-f", "baloo_file", "tumblerd"] {
             assert!(
-                gonedrive_ipc::reader_policy::BACKGROUND_READERS.iter().any(|p| name.starts_with(p)),
+                gonedrive_ipc::reader_policy::BACKGROUND_READERS
+                    .iter()
+                    .any(|p| name.starts_with(p)),
                 "{name} should be refused"
             );
         }
@@ -648,7 +706,9 @@ mod tests {
     fn ordinary_applications_are_not_refused() {
         for name in ["gedit", "libreoffice", "cat", "firefox", "nautilus"] {
             assert!(
-                !gonedrive_ipc::reader_policy::BACKGROUND_READERS.iter().any(|p| name.starts_with(p)),
+                !gonedrive_ipc::reader_policy::BACKGROUND_READERS
+                    .iter()
+                    .any(|p| name.starts_with(p)),
                 "{name} must still be able to open its files"
             );
         }

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -51,10 +51,17 @@ fn decide_stage(
     allow_partial: bool,
 ) -> StagePlan {
     if is_open {
-        return if is_bulk_copier(reader) { StagePlan::Full } else { StagePlan::AllowOpen };
+        return if is_bulk_copier(reader) {
+            StagePlan::Full
+        } else {
+            StagePlan::AllowOpen
+        };
     }
     if is_browsing_reader(reader) {
-        return StagePlan::BrowseLocal { offset, length: length.max(1) };
+        return StagePlan::BrowseLocal {
+            offset,
+            length: length.max(1),
+        };
     }
     let partial = allow_partial
         && length > 0
@@ -62,12 +69,15 @@ fn decide_stage(
         && length <= PARTIAL_HYDRATION_CEILING
         && length < size;
     if partial {
-        StagePlan::Range { offset, length: length.min(size.saturating_sub(offset)).max(1) }
+        StagePlan::Range {
+            offset,
+            length: length.min(size.saturating_sub(offset)).max(1),
+        }
     } else {
         StagePlan::Full
     }
 }
-use tokio::sync::{broadcast, Notify, RwLock};
+use tokio::sync::{broadcast, Mutex, Notify, OwnedMutexGuard, RwLock};
 
 /// How much the poll interval grows after a pass that found nothing.
 const IDLE_BACKOFF: f64 = 1.5;
@@ -78,14 +88,25 @@ pub enum DaemonEvent {
     Status(SyncStatus),
     LoginCompleted(String),
     LoginFailed(String),
-    Conflict { original: String, copy: String },
-    ItemFailed { name: String, error: String },
+    Conflict {
+        original: String,
+        copy: String,
+    },
+    ItemFailed {
+        name: String,
+        error: String,
+    },
     /// A destructive step was refused as likely accidental data loss (an
     /// unmounted sync root, or an alarming mass deletion). Nothing was deleted.
-    SafetyStop { reason: String },
+    SafetyStop {
+        reason: String,
+    },
     HydrationStarted(Hydration),
     HydrationProgress(Hydration),
-    HydrationFinished { path: String, ok: bool },
+    HydrationFinished {
+        path: String,
+        ok: bool,
+    },
 }
 
 /// A placeholder currently being filled.
@@ -93,6 +114,33 @@ struct InFlight {
     hydration: Hydration,
     /// Set to abandon the transfer.
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    staged: Option<std::path::PathBuf>,
+    /// Held from staging until the helper reports Filled, so no second reader
+    /// can truncate or consume the same sibling staging file.
+    _path_guard: OwnedMutexGuard<()>,
+}
+
+#[derive(Default)]
+struct PathLocks {
+    locks: Mutex<HashMap<std::path::PathBuf, Weak<Mutex<()>>>>,
+}
+
+impl PathLocks {
+    async fn acquire(&self, path: &std::path::Path) -> OwnedMutexGuard<()> {
+        let path_lock = {
+            let mut locks = self.locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(path).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        path_lock.lock_owned().await
+    }
 }
 
 pub struct App {
@@ -107,6 +155,7 @@ pub struct App {
     pub wake: Arc<Notify>,
     /// Placeholders being filled right now, keyed by absolute path.
     hydrations: Arc<RwLock<HashMap<std::path::PathBuf, InFlight>>>,
+    hydration_locks: PathLocks,
 
     /// The privileged helper, when files-on-demand is available. Without it a
     /// placeholder is just a file full of zeroes that nothing will ever fill.
@@ -140,6 +189,7 @@ impl App {
             paused: AtomicBool::new(false),
             wake: Arc::new(Notify::new()),
             hydrations: Arc::new(RwLock::new(HashMap::new())),
+            hydration_locks: PathLocks::default(),
             hsm: RwLock::new(None),
             monitor: Arc::new(std::sync::Mutex::new(None)),
             events,
@@ -155,14 +205,26 @@ impl App {
         let _ = self.events.send(event);
     }
 
-    /// Bring up an engine for every account already in the database.
+    /// Bring up the engine for the account already in the database.
     ///
-    /// An account whose refresh token no longer works is reported and skipped
-    /// rather than failing startup — with several accounts configured, one
-    /// revoked grant must not take the others down.
+    /// Item ids and placeholder xattrs are not namespaced by account yet, so
+    /// allowing two engines to scan the same root could copy content between
+    /// accounts. Refuse that legacy state before either engine touches disk.
     pub async fn load_accounts(&self) -> Result<usize> {
+        let accounts = self.store.accounts()?;
+        if accounts.len() > 1 {
+            let ids = accounts
+                .iter()
+                .map(|account| account.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "multiple accounts are configured ({ids}); GOnedrive currently supports one account per profile. Sign out of all but one account before starting the daemon"
+            );
+        }
+
         let mut loaded = 0;
-        for account in self.store.accounts()? {
+        for account in accounts {
             match self.attach_account(&account.id).await {
                 Ok(()) => loaded += 1,
                 Err(e) => {
@@ -176,6 +238,27 @@ impl App {
 
     /// Build and register the engine for one account.
     pub async fn attach_account(&self, account_id: &str) -> Result<()> {
+        if let Some(other) = self
+            .store
+            .accounts()?
+            .into_iter()
+            .find(|account| account.id != account_id)
+        {
+            anyhow::bail!(
+                "cannot attach account {account_id} while {} is configured; GOnedrive currently supports one account per profile",
+                other.id
+            );
+        }
+        if let Some(other) = self
+            .engines
+            .read()
+            .await
+            .keys()
+            .find(|id| id.as_str() != account_id)
+        {
+            anyhow::bail!("account {other} is already active");
+        }
+
         let auth = Authenticator::restore(
             self.http.clone(),
             self.config.client_id.clone(),
@@ -274,13 +357,8 @@ impl App {
                                 record_activity(&store, "deleted", name, String::new()).await;
                             }
                             SyncEvent::Conflict { original, copy } => {
-                                record_activity(
-                                    &store,
-                                    "conflict",
-                                    original.clone(),
-                                    copy.clone(),
-                                )
-                                .await;
+                                record_activity(&store, "conflict", original.clone(), copy.clone())
+                                    .await;
                                 let _ = sender.send(DaemonEvent::Conflict { original, copy });
                                 continue;
                             }
@@ -474,45 +552,89 @@ impl App {
         allow_partial: bool,
     ) -> Result<Option<(std::path::PathBuf, u64, bool)>> {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let plan = decide_stage(is_open, reader, offset, length, size, allow_partial);
+        if plan == StagePlan::AllowOpen {
+            return Ok(None);
+        }
+        let cancel = self.begin_hydration(path).await;
 
-        match decide_stage(is_open, reader, offset, length, size, allow_partial) {
+        let result = match plan {
             // Let the open proceed untouched; the reads that follow drive
             // hydration. Keeps a media player streaming instead of pulling the
             // whole file just to read a header.
-            StagePlan::AllowOpen => Ok(None),
+            StagePlan::AllowOpen => unreachable!(),
             // A sparse-aware copier (on open) or a consumer past the head:
             // give it the whole file before it looks.
-            StagePlan::Full => {
-                let staged = self.stage_content(path).await?;
-                Ok(Some((staged, 0, true)))
-            }
+            StagePlan::Full => self
+                .stage_content(path, cancel)
+                .await
+                .map(|staged| Some((staged, 0, true))),
             // Browsing: serve the window only if it is already on disk from a
             // real earlier read; otherwise allow the read against the sparse
             // file with no network. The type comes from the name, as on Windows.
             StagePlan::BrowseLocal { offset, length } => {
                 let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
                 if let Some(engine) = engines.first() {
-                    if let Ok(Some(staged)) = engine.stage_range_if_local(path, offset, length).await
+                    if let Ok(Some(staged)) =
+                        engine.stage_range_if_local(path, offset, length).await
                     {
-                        return Ok(Some((staged, offset, false)));
+                        Ok(Some((staged, offset, false)))
+                    } else {
+                        Ok(None)
                     }
+                } else {
+                    Ok(None)
                 }
-                Ok(None)
             }
             // The first head-read of a consumer: fetch just that window.
             StagePlan::Range { offset, length } => {
                 let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-                let engine = engines
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
-                let staged = engine.stage_range(path, offset, length).await?;
-                Ok(Some((staged, offset, false)))
+                match engines.first() {
+                    Some(engine) => engine
+                        .stage_range(path, offset, length)
+                        .await
+                        .map(|staged| Some((staged, offset, false)))
+                        .map_err(anyhow::Error::from),
+                    None => Err(anyhow::anyhow!("no account is signed in")),
+                }
+            }
+        };
+        if result.is_err() {
+            self.hydrations.write().await.remove(path);
+        } else if let Ok(Some((staged, _, _))) = &result {
+            if let Some(entry) = self.hydrations.write().await.get_mut(path) {
+                entry.staged = Some(staged.clone());
             }
         }
+        result
     }
 
     /// Download a placeholder's content to a staging file for the helper.
-    pub async fn stage_content(&self, path: &std::path::Path) -> Result<std::path::PathBuf> {
+    async fn stage_content(
+        &self,
+        path: &std::path::Path,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<std::path::PathBuf> {
+        self.show_progress_soon(path.to_path_buf());
+
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        let mut last = None;
+        for engine in engines {
+            match engine.stage_content_cancellable(path, cancel.clone()).await {
+                Ok(staged) => return Ok(staged),
+                Err(Error::Other(message)) => last = Some(message),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        anyhow::bail!(
+            "no account owns {}{}",
+            path.display(),
+            last.map(|m| format!(" ({m})")).unwrap_or_default()
+        )
+    }
+
+    async fn begin_hydration(&self, path: &std::path::Path) -> Arc<std::sync::atomic::AtomicBool> {
+        let guard = self.hydration_locks.acquire(path).await;
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.hydrations.write().await.insert(
             path.to_path_buf(),
@@ -528,28 +650,11 @@ impl App {
                     total: 0,
                 },
                 cancel: cancel.clone(),
+                staged: None,
+                _path_guard: guard,
             },
         );
-        self.show_progress_soon(path.to_path_buf());
-
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let mut last = None;
-        for engine in engines {
-            match engine.stage_content_cancellable(path, cancel.clone()).await {
-                Ok(staged) => return Ok(staged),
-                Err(Error::Other(message)) => last = Some(message),
-                Err(e) => {
-                    self.hydrations.write().await.remove(path);
-                    return Err(e.into());
-                }
-            }
-        }
-        self.hydrations.write().await.remove(path);
-        anyhow::bail!(
-            "no account owns {}{}",
-            path.display(),
-            last.map(|m| format!(" ({m})")).unwrap_or_default()
-        )
+        cancel
     }
 
     /// What was synced recently, newest first.
@@ -588,6 +693,21 @@ impl App {
         }
     }
 
+    /// Remove the exact unique hand-off file used by this request. The helper
+    /// normally removes it first; this is the daemon-side cleanup for an older
+    /// helper or a failed unlink.
+    pub async fn cleanup_hydration_staging(&self, path: &std::path::Path) {
+        let staged = self
+            .hydrations
+            .write()
+            .await
+            .get_mut(path)
+            .and_then(|entry| entry.staged.take());
+        if let Some(staged) = staged {
+            let _ = std::fs::remove_file(staged);
+        }
+    }
+
     /// Put a progress window on screen if this hydration is still running a
     /// moment from now.
     ///
@@ -610,9 +730,27 @@ impl App {
     /// Record that the helper finished filling a placeholder.
     pub async fn finish_hydration(&self, path: &std::path::Path) -> Result<()> {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        let mut result = Ok(());
         for engine in engines {
-            engine.finish_hydration(path)?;
+            if let Err(error) = engine.finish_hydration(path) {
+                result = Err(error.into());
+                break;
+            }
         }
+        self.hydrations.write().await.remove(path);
+        result
+    }
+
+    /// Release a failed per-path hydration and put its database state back to
+    /// dehydrated so a later reader can retry it.
+    pub async fn fail_hydration(&self, path: &std::path::Path) -> Result<()> {
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        for engine in engines {
+            if engine.fail_hydration(path).is_ok() {
+                break;
+            }
+        }
+        self.hydrations.write().await.remove(path);
         Ok(())
     }
 
@@ -624,6 +762,7 @@ impl App {
                 break;
             }
         }
+        self.hydrations.write().await.remove(path);
         Ok(())
     }
 
@@ -637,7 +776,9 @@ impl App {
     pub async fn hydrate(&self, path: &std::path::Path) -> Result<u64> {
         let hsm = self.hsm.read().await.clone();
         if let Some(hsm) = &hsm {
-            let _ = hsm.unwatch(path).await;
+            hsm.unwatch(path).await.with_context(|| {
+                format!("could not suspend interception for {}", path.display())
+            })?;
         }
 
         let result = self.hydrate_inner(path).await;
@@ -647,7 +788,9 @@ impl App {
                 if gonedrive_core::hydrate::Placeholder::state(path)
                     == gonedrive_core::hydrate::PlaceholderState::Dehydrated
                 {
-                    let _ = hsm.watch(path).await;
+                    if let Err(error) = hsm.watch(path).await {
+                        tracing::error!(path = %path.display(), %error, "could not restore interception");
+                    }
                 }
             }
         }
@@ -672,13 +815,33 @@ impl App {
     }
 
     pub async fn set_hsm(&self, client: Option<Arc<crate::hsm_client::HsmClient>>) {
+        if client.is_none() {
+            let mut hydrations = self.hydrations.write().await;
+            for entry in hydrations.values() {
+                entry.cancel.store(true, Ordering::Relaxed);
+            }
+            hydrations.clear();
+        }
         *self.hsm.write().await = client;
+    }
+
+    /// Remove a dehydrated file that the helper could not mark. Leaving it on
+    /// disk would expose sparse zeroes as real content; the remote record stays
+    /// so a later successful materialisation can recreate it.
+    pub async fn discard_unwatched_placeholder(&self, path: &std::path::Path) -> Result<()> {
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        for engine in engines {
+            if engine.discard_unwatched_placeholder(path).is_ok() {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("no account owns {}", path.display())
     }
 
     /// Present the whole drive as a browsable placeholder tree.
     ///
     /// Runs on a blocking thread — it can touch a hundred thousand files — and
-    /// registers each placeholder with the helper as it goes. Safe to call
+    /// registers every resulting placeholder with the helper. Safe to call
     /// repeatedly: existing files are left untouched.
     pub async fn materialize_tree(self: &Arc<Self>) -> Result<u64> {
         let hsm = self.require_hsm().await?;
@@ -700,9 +863,7 @@ impl App {
         .await??;
 
         let count = paths.len() as u64;
-        for path in paths {
-            let _ = hsm.watch(&path).await;
-        }
+        self.protect_placeholders(&hsm, &paths).await?;
         tracing::info!(placeholders = count, "placeholder tree ready");
         Ok(count)
     }
@@ -723,26 +884,36 @@ impl App {
             .first()
             .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
 
-        // Watches come off before anything is written. Dehydration writes into
-        // the files it is freeing, and a write into a watched file blocks on a
-        // question addressed to this very process — with a helper that does
-        // not recognise our pid, that is a deadlock that takes the D-Bus
-        // interface and every waiting file manager thread down with it.
-        for path in engine.subtree_local_files(relative)? {
-            let _ = hsm.unwatch(&path).await;
+        // Install every mark before punching the first hole. The helper admits
+        // the daemon's own pid, so keeping the mark through fallocate is safe;
+        // publishing holes first and discovering fanotify_mark failed is not.
+        let candidates = engine.subtree_local_files(relative)?;
+        let mut newly_protected: Vec<(std::path::PathBuf, bool)> = Vec::new();
+        for path in &candidates {
+            let was_dehydrated = gonedrive_core::hydrate::Placeholder::state(path)
+                == gonedrive_core::hydrate::PlaceholderState::Dehydrated;
+            if let Err(error) = hsm.watch(path).await {
+                for (protected, was_dehydrated) in newly_protected {
+                    if !was_dehydrated {
+                        let _ = hsm.unwatch(&protected).await;
+                    }
+                }
+                return Err(error).with_context(|| {
+                    format!("could not protect {} before freeing it", path.display())
+                });
+            }
+            newly_protected.push((path.clone(), was_dehydrated));
         }
-
         let outcome = engine.free_space(relative)?;
-        // Re-arm from the ground truth, not from the outcome: the unwatch
-        // above stripped the whole subtree, and a file the free *skipped* is
-        // still a placeholder that needs intercepting. Watching only what was
-        // freed once left skipped files readable with no one to fill them.
-        for path in engine.subtree_local_files(relative)? {
+        // Files the safety checks skipped remain hydrated and should not keep a
+        // permission mark. Successfully dehydrated files retain the mark that
+        // was installed before their blocks were released.
+        for path in candidates {
             if gonedrive_core::hydrate::Placeholder::state(&path)
-                == gonedrive_core::hydrate::PlaceholderState::Dehydrated
+                != gonedrive_core::hydrate::PlaceholderState::Dehydrated
             {
-                if let Err(e) = hsm.watch(&path).await {
-                    tracing::error!(path = %path.display(), error = %e, "could not intercept");
+                if let Err(e) = hsm.unwatch(&path).await {
+                    tracing::warn!(path = %path.display(), error = %e, "could not remove unused mark");
                 }
             }
         }
@@ -812,12 +983,39 @@ impl App {
             .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
 
         let outcome = engine.make_on_demand(relative)?;
-        for path in &outcome.paths {
-            if let Err(e) = hsm.watch(path).await {
-                tracing::error!(path = %path.display(), error = %e, "could not intercept");
+        self.protect_placeholders(&hsm, &outcome.paths).await?;
+        Ok(outcome)
+    }
+
+    /// Protect a batch, removing every not-yet-protected placeholder if one
+    /// mark fails. A zero-readable sparse file must never outlive a partial
+    /// registration attempt.
+    async fn protect_placeholders(
+        &self,
+        hsm: &crate::hsm_client::HsmClient,
+        paths: &[std::path::PathBuf],
+    ) -> Result<()> {
+        for (index, path) in paths.iter().enumerate() {
+            if let Err(error) = hsm.watch(path).await {
+                let mut cleanup_errors = Vec::new();
+                for unprotected in &paths[index..] {
+                    if let Err(cleanup_error) =
+                        self.discard_unwatched_placeholder(unprotected).await
+                    {
+                        cleanup_errors.push(format!("{}: {cleanup_error}", unprotected.display()));
+                    }
+                }
+                let cleanup = if cleanup_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!("; cleanup also failed for {}", cleanup_errors.join(", "))
+                };
+                return Err(error).with_context(|| {
+                    format!("could not protect placeholder {}{cleanup}", path.display())
+                });
             }
         }
-        Ok(outcome)
+        Ok(())
     }
 
     /// Placeholders on disk that still need intercepting.
@@ -870,6 +1068,16 @@ impl App {
                 }
             }
         }
+        // Delta application may have created new dehydrated files after the
+        // helper's startup reconciliation. Register them before returning the
+        // pass; HsmClient tracks existing marks, so this is incremental even
+        // though the source of truth is scanned here.
+        if let Some(hsm) = self.hsm.read().await.clone() {
+            if let Err(error) = hsm.watch_all(self).await {
+                tracing::error!(%error, "could not register new placeholders");
+                self.set_state("error", Some(error.to_string())).await;
+            }
+        }
         did_work
     }
 
@@ -887,6 +1095,31 @@ impl App {
         };
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         for engine in engines {
+            let candidates = match engine.auto_free_candidates(threshold) {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    tracing::warn!(%error, "could not plan auto-free");
+                    continue;
+                }
+            };
+            let mut protected = Vec::new();
+            let mut protection_failed = false;
+            for path in &candidates {
+                match hsm.watch(path).await {
+                    Ok(()) => protected.push(path.clone()),
+                    Err(error) => {
+                        tracing::error!(path = %path.display(), %error, "auto-free mark failed");
+                        protection_failed = true;
+                        break;
+                    }
+                }
+            }
+            if protection_failed {
+                for path in protected {
+                    let _ = hsm.unwatch(&path).await;
+                }
+                continue;
+            }
             match engine.auto_free(threshold) {
                 Ok(outcome) if outcome.files > 0 => {
                     tracing::info!(
@@ -894,12 +1127,16 @@ impl App {
                         freed = outcome.freed,
                         "auto-released space"
                     );
-                    for path in &outcome.paths {
-                        let _ = hsm.watch(path).await;
-                    }
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "auto-free failed"),
+            }
+            for path in candidates {
+                if gonedrive_core::hydrate::Placeholder::state(&path)
+                    != gonedrive_core::hydrate::PlaceholderState::Dehydrated
+                {
+                    let _ = hsm.unwatch(&path).await;
+                }
             }
         }
     }
@@ -968,7 +1205,6 @@ fn build_http_client() -> Result<reqwest::Client> {
         .context("could not build the HTTP client")
 }
 
-
 /// How many finished items the activity list keeps.
 const ACTIVITY_LIMIT: usize = 100;
 
@@ -1014,7 +1250,35 @@ fn ensure_progress_window(monitor: &Arc<std::sync::Mutex<Option<std::process::Ch
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_stage, is_browsing_reader, StagePlan, PARTIAL_HYDRATION_CEILING};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{
+        decide_stage, is_browsing_reader, PathLocks, StagePlan, PARTIAL_HYDRATION_CEILING,
+    };
+
+    #[tokio::test]
+    async fn hydration_locks_cover_the_whole_request_for_one_path() {
+        let locks = Arc::new(PathLocks::default());
+        let first = locks.acquire(std::path::Path::new("/tmp/a")).await;
+        let waiting_locks = locks.clone();
+        let mut second =
+            tokio::spawn(
+                async move { waiting_locks.acquire(std::path::Path::new("/tmp/a")).await },
+            );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err(),
+            "a second fill of the same path must wait"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("second request should proceed after Filled releases the first")
+            .unwrap();
+    }
 
     #[test]
     fn a_bulk_copier_hydrates_fully_on_open_but_others_pass_through() {
@@ -1022,8 +1286,14 @@ mod tests {
         // file on open; a normal open is allowed and its reads drive the rest.
         assert_eq!(decide_stage(true, "cp", 0, 0, 1000, true), StagePlan::Full);
         assert_eq!(decide_stage(true, "tar", 0, 0, 1000, true), StagePlan::Full);
-        assert_eq!(decide_stage(true, "vlc", 0, 0, 1000, true), StagePlan::AllowOpen);
-        assert_eq!(decide_stage(true, "gedit", 0, 0, 1000, true), StagePlan::AllowOpen);
+        assert_eq!(
+            decide_stage(true, "vlc", 0, 0, 1000, true),
+            StagePlan::AllowOpen
+        );
+        assert_eq!(
+            decide_stage(true, "gedit", 0, 0, 1000, true),
+            StagePlan::AllowOpen
+        );
     }
 
     #[test]
@@ -1031,12 +1301,18 @@ mod tests {
         // A thumbnailer sniffing a head must never reach the network.
         assert_eq!(
             decide_stage(false, "gdk-pixbuf-thum", 0, 4096, 1_000_000, true),
-            StagePlan::BrowseLocal { offset: 0, length: 4096 }
+            StagePlan::BrowseLocal {
+                offset: 0,
+                length: 4096
+            }
         );
         // A zero-length browse sniff still asks for at least one byte.
         assert_eq!(
             decide_stage(false, "nautilus", 0, 0, 1_000_000, true),
-            StagePlan::BrowseLocal { offset: 0, length: 1 }
+            StagePlan::BrowseLocal {
+                offset: 0,
+                length: 1
+            }
         );
     }
 
@@ -1045,19 +1321,38 @@ mod tests {
         // Small head-read at offset 0: just the window.
         assert_eq!(
             decide_stage(false, "sha256sum", 0, 65536, 1_000_000, true),
-            StagePlan::Range { offset: 0, length: 65536 }
+            StagePlan::Range {
+                offset: 0,
+                length: 65536
+            }
         );
         // Coming back for offset > 0 is sequential reading: hydrate fully.
-        assert_eq!(decide_stage(false, "sha256sum", 65536, 65536, 1_000_000, true), StagePlan::Full);
+        assert_eq!(
+            decide_stage(false, "sha256sum", 65536, 65536, 1_000_000, true),
+            StagePlan::Full
+        );
         // A head-read above the ceiling is a real read, not a sniff: full.
         assert_eq!(
-            decide_stage(false, "cat", 0, PARTIAL_HYDRATION_CEILING + 1, 1_000_000, true),
+            decide_stage(
+                false,
+                "cat",
+                0,
+                PARTIAL_HYDRATION_CEILING + 1,
+                1_000_000,
+                true
+            ),
             StagePlan::Full
         );
         // A read covering the whole (small) file is full, not a range.
-        assert_eq!(decide_stage(false, "cat", 0, 500, 500, true), StagePlan::Full);
+        assert_eq!(
+            decide_stage(false, "cat", 0, 500, 500, true),
+            StagePlan::Full
+        );
         // Partial hydration disabled by the helper: always full.
-        assert_eq!(decide_stage(false, "cat", 0, 4096, 1_000_000, false), StagePlan::Full);
+        assert_eq!(
+            decide_stage(false, "cat", 0, 4096, 1_000_000, false),
+            StagePlan::Full
+        );
     }
 
     #[test]
@@ -1066,9 +1361,14 @@ mod tests {
         // others, downloading them. Every thumbnailer and preview helper must
         // read as "browsing" so it is served offline, never pulling content.
         for t in [
-            "glycin-thumbnai", "gdk-pixbuf-thum", "gst-video-thumb",
-            "gst-audio-thumb", "heif-thumbnaile", "papers-thumbnai",
-            "nautilus", "sushi",
+            "glycin-thumbnai",
+            "gdk-pixbuf-thum",
+            "gst-video-thumb",
+            "gst-audio-thumb",
+            "heif-thumbnaile",
+            "papers-thumbnai",
+            "nautilus",
+            "sushi",
         ] {
             assert!(is_browsing_reader(t), "{t} must browse, not download");
         }

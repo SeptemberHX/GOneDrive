@@ -6,23 +6,40 @@
 //! placeholder's own extended attributes, so the helper never has to be told
 //! about the database.
 
+use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use gonedrive_ipc::hsm::{Event, Request, SOCKET_PATH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 use crate::app::App;
 
 use gonedrive_ipc::reader_policy::is_background_reader as background_reader;
 
+type MarkResult = std::result::Result<(), String>;
+type MarkWaiters = HashMap<u64, oneshot::Sender<MarkResult>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+type WatchedFiles = HashMap<PathBuf, FileIdentity>;
+
 /// A live connection to the privileged helper.
 pub struct HsmClient {
     writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     closed: Arc<tokio::sync::Notify>,
+    next_request: AtomicU64,
+    pending_marks: Arc<Mutex<MarkWaiters>>,
+    watched: Arc<Mutex<WatchedFiles>>,
 }
 
 impl HsmClient {
@@ -48,9 +65,14 @@ impl HsmClient {
         // used until the helper says it understands it.
         let partial_hydration = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let closed = Arc::new(tokio::sync::Notify::new());
+        let pending_marks = Arc::new(Mutex::new(HashMap::new()));
+        let watched = Arc::new(Mutex::new(HashMap::new()));
         let client = Self {
             writer: writer.clone(),
             closed: closed.clone(),
+            next_request: AtomicU64::new(1),
+            pending_marks: pending_marks.clone(),
+            watched: watched.clone(),
         };
         client.send(&Request::Ping).await?;
         client.send(&Request::Features).await?;
@@ -63,21 +85,26 @@ impl HsmClient {
                         let app = app.clone();
                         let writer = writer.clone();
                         let partial_hydration = partial_hydration.clone();
+                        let pending_marks = pending_marks.clone();
+                        let watched = watched.clone();
                         // Each hydration runs on its own task: a process is
                         // blocked on it, and a large file must not hold up the
                         // next reader.
                         tokio::spawn(async move {
-                            handle(app, writer, partial_hydration, line).await
+                            handle(app, writer, partial_hydration, pending_marks, watched, line)
+                                .await
                         });
                     }
                     Ok(Some(_)) => continue,
                     Ok(None) => {
                         tracing::warn!("the files-on-demand helper closed the connection");
+                        fail_pending_marks(&pending_marks, "helper closed the connection").await;
                         closed.notify_waiters();
                         return;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "helper connection failed");
+                        fail_pending_marks(&pending_marks, &e.to_string()).await;
                         closed.notify_waiters();
                         return;
                     }
@@ -108,29 +135,122 @@ impl HsmClient {
 
     /// Ask the kernel to intercept reads of this placeholder.
     pub async fn watch(&self, path: &Path) -> Result<()> {
-        self.send(&Request::Watch {
-            path: path.to_string_lossy().into_owned(),
-        })
-        .await
+        let identity = file_identity(path)?;
+        if self.watched.lock().await.get(path) == Some(&identity) {
+            return Ok(());
+        }
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        self.request_mark(
+            id,
+            Request::Watch {
+                id,
+                path: path.to_string_lossy().into_owned(),
+            },
+        )
+        .await?;
+        self.watched
+            .lock()
+            .await
+            .insert(path.to_path_buf(), identity);
+        Ok(())
     }
 
     /// Stop intercepting: the file is hydrated, deleted, or no longer ours.
     pub async fn unwatch(&self, path: &Path) -> Result<()> {
-        self.send(&Request::Unwatch {
-            path: path.to_string_lossy().into_owned(),
-        })
-        .await
+        if !self.watched.lock().await.contains_key(path) {
+            return Ok(());
+        }
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        self.request_mark(
+            id,
+            Request::Unwatch {
+                id,
+                path: path.to_string_lossy().into_owned(),
+            },
+        )
+        .await?;
+        self.watched.lock().await.remove(path);
+        Ok(())
+    }
+
+    async fn request_mark(&self, id: u64, request: Request) -> Result<()> {
+        const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_marks.lock().await.insert(id, tx);
+        if let Err(error) = self.send(&request).await {
+            self.pending_marks.lock().await.remove(&id);
+            return Err(error);
+        }
+        match tokio::time::timeout(ACK_TIMEOUT, rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(message))) => anyhow::bail!(message),
+            Ok(Err(_)) => anyhow::bail!("helper dropped watch request {id}"),
+            Err(_) => {
+                self.pending_marks.lock().await.remove(&id);
+                anyhow::bail!(
+                    "helper did not acknowledge watch request {id} within {ACK_TIMEOUT:?}"
+                )
+            }
+        }
     }
 
     /// Register every placeholder currently on disk.
     pub async fn watch_all(&self, app: &App) -> Result<usize> {
         let paths = app.dehydrated_paths().await?;
+        let present: HashSet<_> = paths.iter().cloned().collect();
+        self.watched
+            .lock()
+            .await
+            .retain(|path, _| present.contains(path));
+        let mut watched = 0usize;
+        let mut failures = Vec::new();
         for path in &paths {
-            if let Err(e) = self.watch(path).await {
-                tracing::warn!(path = %path.display(), error = %e, "could not watch");
+            match self.watch(path).await {
+                Ok(()) => watched += 1,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "could not watch");
+                    if let Err(discard_error) = app.discard_unwatched_placeholder(path).await {
+                        tracing::error!(
+                            path = %path.display(),
+                            error = %discard_error,
+                            "could not hide unsafe placeholder"
+                        );
+                    }
+                    failures.push(format!("{}: {error}", path.display()));
+                }
             }
         }
-        Ok(paths.len())
+        if failures.is_empty() {
+            Ok(watched)
+        } else {
+            anyhow::bail!(
+                "failed to register {} placeholder(s): {}",
+                failures.len(),
+                failures.join("; ")
+            )
+        }
+    }
+}
+
+fn file_identity(path: &Path) -> Result<FileIdentity> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("could not inspect placeholder {}", path.display()))?;
+    Ok(FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+async fn fail_pending_marks(pending: &Mutex<MarkWaiters>, message: &str) {
+    let requests: Vec<_> = pending
+        .lock()
+        .await
+        .drain()
+        .map(|(_, sender)| sender)
+        .collect();
+    for sender in requests {
+        let _ = sender.send(Err(message.to_string()));
     }
 }
 
@@ -138,6 +258,8 @@ async fn handle(
     app: Arc<App>,
     writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     partial_hydration: Arc<std::sync::atomic::AtomicBool>,
+    pending_marks: Arc<Mutex<MarkWaiters>>,
+    watched: Arc<Mutex<WatchedFiles>>,
     line: String,
 ) {
     let event: Event = match serde_json::from_str(&line) {
@@ -173,17 +295,16 @@ async fn handle(
             // read refused before a byte is fetched or a window is shown.
             if let Some(matched) = background_reader(&reader) {
                 tracing::info!(reader = matched, "refusing a background reader");
-                let mut reply =
-                    match serde_json::to_string(&Request::Hydrated {
-                        id,
-                        ok: false,
-                        source: None,
-                        offset: 0,
-                        full: true,
-                    }) {
-                        Ok(reply) => reply,
-                        Err(_) => return,
-                    };
+                let mut reply = match serde_json::to_string(&Request::Hydrated {
+                    id,
+                    ok: false,
+                    source: None,
+                    offset: 0,
+                    full: true,
+                }) {
+                    Ok(reply) => reply,
+                    Err(_) => return,
+                };
                 reply.push('\n');
                 let mut writer = writer.lock().await;
                 let _ = writer.write_all(reply.as_bytes()).await;
@@ -196,25 +317,26 @@ async fn handle(
             // which is a read, which re-enters the hook that asked for this
             // hydration. The helper writes it through the kernel's own
             // descriptor, which is exempt from that.
-            let allow_partial =
-                partial_hydration.load(std::sync::atomic::Ordering::Relaxed);
-            let (ok, source, offset, full) =
-                match app.stage_for(&path, offset, length, &reader, is_open, allow_partial).await {
-                    // Fill this window from a staged file.
-                    Ok(Some((staged, offset, full))) => (
-                        true,
-                        Some(staged.to_string_lossy().into_owned()),
-                        offset,
-                        full,
-                    ),
-                    // Allow the read with no fill: a browsing sniff of an
-                    // untouched placeholder reads zeros, offline.
-                    Ok(None) => (true, None, 0, false),
-                    Err(e) => {
-                        tracing::error!(path = %path.display(), error = %e, "could not stage content");
-                        (false, None, 0, true)
-                    }
-                };
+            let allow_partial = partial_hydration.load(std::sync::atomic::Ordering::Relaxed);
+            let (ok, source, offset, full) = match app
+                .stage_for(&path, offset, length, &reader, is_open, allow_partial)
+                .await
+            {
+                // Fill this window from a staged file.
+                Ok(Some((staged, offset, full))) => (
+                    true,
+                    Some(staged.to_string_lossy().into_owned()),
+                    offset,
+                    full,
+                ),
+                // Allow the read with no fill: a browsing sniff of an
+                // untouched placeholder reads zeros, offline.
+                Ok(None) => (true, None, 0, false),
+                Err(e) => {
+                    tracing::error!(path = %path.display(), error = %e, "could not stage content");
+                    (false, None, 0, true)
+                }
+            };
 
             let mut reply = match serde_json::to_string(&Request::Hydrated {
                 id,
@@ -233,16 +355,12 @@ async fn handle(
         }
         Event::Filled { ok, path, full, .. } => {
             let path = PathBuf::from(path);
-            // The helper consumes and deletes its staged file, but an older
-            // helper — or one whose delete failed — would leave it in the
-            // user's folder for the hour until the scan sweeps it. The daemon
-            // knows the name it staged, so it removes it here too: by the time
-            // this arrives the fill is done and the staging file is spent.
-            let staged = gonedrive_core::sync::transfer::staging_sibling(&path);
-            if staged.exists() {
-                let _ = std::fs::remove_file(&staged);
-            }
+            // Remove this request's exact unique hand-off. Deriving the
+            // ordinary download partial from `path` here once deleted an
+            // unrelated scheduled download racing the same file.
+            app.cleanup_hydration_staging(&path).await;
             if ok && full {
+                watched.lock().await.remove(&path);
                 if let Err(e) = app.finish_hydration(&path).await {
                     tracing::warn!(path = %path.display(), error = %e, "could not finalise");
                 }
@@ -253,13 +371,27 @@ async fn handle(
                 if let Err(e) = app.restore_mtime(&path).await {
                     tracing::debug!(path = %path.display(), error = %e, "could not restore mtime");
                 }
+            } else if let Err(e) = app.fail_hydration(&path).await {
+                tracing::debug!(path = %path.display(), error = %e, "could not reset hydration");
             }
         }
-        Event::Features { partial_hydration: partial } => {
+        Event::Features {
+            partial_hydration: partial,
+        } => {
             partial_hydration.store(partial, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(partial_hydration = partial, "helper features");
         }
         Event::Pong { version } => tracing::info!(version, "files-on-demand helper connected"),
+        Event::WatchResult { id, ok, message } => {
+            if let Some(reply) = pending_marks.lock().await.remove(&id) {
+                let result = if ok {
+                    Ok(())
+                } else {
+                    Err(message.unwrap_or_else(|| "fanotify mark failed".into()))
+                };
+                let _ = reply.send(result);
+            }
+        }
         Event::Error { message } => tracing::warn!(message, "helper reported an error"),
         Event::Ok => {}
     }

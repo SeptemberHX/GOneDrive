@@ -42,7 +42,8 @@ impl RatePacer {
         }
         self.transferred += bytes;
         let due = std::time::Duration::from_secs_f64(self.transferred as f64 / self.limit as f64);
-        due.checked_sub(self.started.elapsed()).filter(|d| !d.is_zero())
+        due.checked_sub(self.started.elapsed())
+            .filter(|d| !d.is_zero())
     }
 
     pub async fn pace(&mut self, bytes: u64) {
@@ -56,6 +57,106 @@ use std::time::Duration;
 
 /// Suffix for the temporary file a download is written to.
 const PARTIAL_SUFFIX: &str = ".gonedrive-partial";
+
+/// Identity and high-resolution timestamps for a local file at one instant.
+///
+/// Whole-second mtimes are sufficient for ordinary reconciliation, but not for
+/// protecting a file while an HTTP request is in flight: an editor can rewrite
+/// the same number of bytes inside one second. ctime also catches metadata and
+/// in-place writes whose mtime was deliberately restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileVersion {
+    exists: bool,
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl FileVersion {
+    pub(crate) fn capture(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => Ok(Self {
+                exists: true,
+                dev: meta.dev(),
+                ino: meta.ino(),
+                size: meta.len(),
+                mtime: meta.mtime(),
+                mtime_nsec: meta.mtime_nsec(),
+                ctime: meta.ctime(),
+                ctime_nsec: meta.ctime_nsec(),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                exists: false,
+                dev: 0,
+                ino: 0,
+                size: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+                ctime: 0,
+                ctime_nsec: 0,
+            }),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn stable_identity(self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            u8::from(self.exists),
+            self.dev,
+            self.ino,
+            self.size,
+            self.mtime,
+            self.mtime_nsec
+        )
+    }
+
+    /// Compare the bytes-bearing properties while ignoring ctime. Writing the
+    /// placeholder xattrs changes ctime even though the file content does not.
+    pub(crate) fn same_content_as(self, other: Self) -> bool {
+        self.exists == other.exists
+            && self.dev == other.dev
+            && self.ino == other.ino
+            && self.size == other.size
+            && self.mtime == other.mtime
+            && self.mtime_nsec == other.mtime_nsec
+    }
+}
+
+/// Stable identity used to decide whether a persisted upload session still
+/// belongs to the file currently at `path`.
+pub fn file_fingerprint(path: &Path) -> Result<String> {
+    let before = FileVersion::capture(path)?;
+    let hash = crate::hash::quick_xor_file(path)?;
+    let after = FileVersion::capture(path)?;
+    if !after.same_content_as(before) {
+        return Err(file_changed_error(path, "hashing it for upload resume"));
+    }
+    Ok(format!("{}:{hash}", before.stable_identity()))
+}
+
+pub(crate) fn file_changed_error(path: &Path, operation: &str) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!(
+            "{} changed while {operation}; retrying without overwriting it",
+            path.display()
+        ),
+    ))
+}
+
+/// A download that has been atomically published to its destination.
+#[derive(Debug)]
+pub struct DownloadedFile {
+    pub bytes: u64,
+    pub(crate) version: FileVersion,
+}
 
 /// Download an item's content to `dest`.
 ///
@@ -74,7 +175,7 @@ pub async fn download_to_file(
     etag: Option<&str>,
     mtime: Option<OffsetDateTime>,
     mut on_progress: impl FnMut(u64, Option<u64>) -> bool,
-) -> Result<u64> {
+) -> Result<DownloadedFile> {
     download_to_file_limited(graph, item_id, dest, etag, mtime, 0, &mut on_progress).await
 }
 
@@ -95,11 +196,12 @@ pub async fn download_to_file_limited(
     mtime: Option<OffsetDateTime>,
     rate_limit: u64,
     on_progress: &mut (impl FnMut(u64, Option<u64>) -> bool + ?Sized),
-) -> Result<u64> {
+) -> Result<DownloadedFile> {
     let parent = dest
         .parent()
         .ok_or_else(|| Error::other(format!("{} has no parent directory", dest.display())))?;
     tokio::fs::create_dir_all(parent).await?;
+    let destination_version = FileVersion::capture(dest)?;
 
     let partial = partial_path(dest);
 
@@ -119,8 +221,7 @@ pub async fn download_to_file_limited(
     // The service honours the resume only with 206; a 200 means it sent the
     // whole file (the eTag moved, or the range was ignored), so the leftover
     // prefix is discarded and we write from the top.
-    let resuming =
-        resume_from > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let resuming = resume_from > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     let total = if resuming {
         content_range_total(&response)
     } else {
@@ -128,7 +229,10 @@ pub async fn download_to_file_limited(
     };
 
     let mut file = if resuming {
-        tokio::fs::OpenOptions::new().append(true).open(&partial).await?
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&partial)
+            .await?
     } else {
         tokio::fs::File::create(&partial).await?
     };
@@ -178,11 +282,19 @@ pub async fn download_to_file_limited(
         }
     }
 
-    tokio::fs::rename(&partial, dest).await?;
     if let Some(mtime) = mtime {
-        set_mtime(dest, mtime)?;
+        // Prepare the timestamp before publishing the inode. Once the rename
+        // happens, no follow-up write is allowed to race a user's edit.
+        set_mtime(&partial, mtime)?;
     }
-    Ok(written)
+    if FileVersion::capture(dest)? != destination_version {
+        return Err(file_changed_error(dest, "downloading"));
+    }
+    tokio::fs::rename(&partial, dest).await?;
+    Ok(DownloadedFile {
+        bytes: written,
+        version: FileVersion::capture(dest)?,
+    })
 }
 
 /// Total size from a `Content-Range: bytes START-END/TOTAL` header, if present.
@@ -232,6 +344,23 @@ pub fn staging_sibling(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// A unique hand-off file for one fanotify hydration request.
+///
+/// It deliberately still ends in `PARTIAL_SUFFIX`, so the local scanner and
+/// startup janitor treat it as scratch. It must not share the ordinary
+/// download's staging name: the helper deletes its hand-off after filling, and
+/// deleting an unrelated background download at that point corrupts both.
+pub fn hydration_staging_sibling(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(format!(".gonedrive-hydration-{}-{id}", std::process::id()));
+    name.push(PARTIAL_SUFFIX);
+    path.with_file_name(name)
+}
+
 /// Where an upload should go and what it should be called.
 pub struct UploadTarget<'a> {
     pub account_id: &'a str,
@@ -263,14 +392,18 @@ pub async fn upload_file(
     target: UploadTarget<'_>,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<DriveItem> {
+    let source_version = FileVersion::capture(source)?;
     let meta = tokio::fs::metadata(source).await?;
     let size = meta.len();
     let mtime = OffsetDateTime::from(meta.modified()?);
 
     if size < config.upload_session_threshold {
         let content = Bytes::from(tokio::fs::read(source).await?);
+        if FileVersion::capture(source)? != source_version {
+            return Err(file_changed_error(source, "reading it for upload"));
+        }
         on_progress(size, size);
-        return graph
+        let item = graph
             .upload_simple(
                 target.parent_id,
                 target.name,
@@ -279,10 +412,34 @@ pub async fn upload_file(
                 Some(mtime),
                 target.etag,
             )
-            .await;
+            .await?;
+        if FileVersion::capture(source)? != source_version {
+            return Err(file_changed_error(source, "uploading"));
+        }
+        return Ok(item);
     }
 
-    upload_resumable(graph, store, config, source, size, mtime, target, &mut on_progress).await
+    let source_fingerprint = file_fingerprint(source)?;
+    if !FileVersion::capture(source)?.same_content_as(source_version) {
+        return Err(file_changed_error(source, "preparing an upload session"));
+    }
+    let item = upload_resumable(
+        graph,
+        store,
+        config,
+        source,
+        size,
+        mtime,
+        source_version,
+        source_fingerprint,
+        target,
+        &mut on_progress,
+    )
+    .await?;
+    if FileVersion::capture(source)? != source_version {
+        return Err(file_changed_error(source, "uploading"));
+    }
+    Ok(item)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -293,10 +450,13 @@ async fn upload_resumable(
     source: &Path,
     size: u64,
     mtime: OffsetDateTime,
+    source_version: FileVersion,
+    source_fingerprint: String,
     target: UploadTarget<'_>,
     on_progress: &mut impl FnMut(u64, u64),
 ) -> Result<DriveItem> {
-    let mut session = resume_or_create(graph, store, &target, size, mtime).await?;
+    let mut session =
+        resume_or_create(graph, store, &target, size, mtime, &source_fingerprint).await?;
     let mut offset = session.committed_offset;
 
     let mut file = tokio::fs::File::open(source).await?;
@@ -323,6 +483,9 @@ async fn upload_resumable(
             Ok(ChunkOutcome::Completed(item)) => {
                 store.delete_upload_session(target.session_key)?;
                 on_progress(size, size);
+                if FileVersion::capture(source)? != source_version {
+                    return Err(file_changed_error(source, "uploading"));
+                }
                 return Ok(*item);
             }
             Ok(ChunkOutcome::Accepted { next_offset }) => {
@@ -338,7 +501,8 @@ async fn upload_resumable(
                 // is re-read from the beginning, which is the only correct
                 // recovery when the service has discarded the staging area.
                 store.delete_upload_session(target.session_key)?;
-                session = resume_or_create(graph, store, &target, size, mtime).await?;
+                session = resume_or_create(graph, store, &target, size, mtime, &source_fingerprint)
+                    .await?;
                 offset = 0;
             }
             Err(e) => return Err(e),
@@ -352,9 +516,11 @@ async fn resume_or_create(
     target: &UploadTarget<'_>,
     size: u64,
     mtime: OffsetDateTime,
+    source_fingerprint: &str,
 ) -> Result<UploadSessionRecord> {
     if let Some(existing) = store.upload_session(target.session_key)? {
         let usable = existing.total_size == size
+            && existing.source_fingerprint.as_deref() == Some(source_fingerprint)
             && existing
                 .expires_at
                 .is_none_or(|t| t > OffsetDateTime::now_utc());
@@ -387,6 +553,7 @@ async fn resume_or_create(
         expires_at: created.expiration_date_time,
         committed_offset: 0,
         total_size: size,
+        source_fingerprint: Some(source_fingerprint.to_string()),
     };
     store.save_upload_session(&record)?;
     Ok(record)
@@ -444,6 +611,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hydration_staging_is_unique_and_still_hidden_from_scans() {
+        let path = Path::new("/a/report.txt");
+        let first = hydration_staging_sibling(path);
+        let second = hydration_staging_sibling(path);
+        assert_ne!(first, second);
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(PARTIAL_SUFFIX));
+        assert_eq!(first.parent(), path.parent());
+    }
+
     #[tokio::test]
     async fn an_interrupted_download_resumes_from_its_partial() {
         use wiremock::matchers::{header, method, path};
@@ -454,8 +635,11 @@ mod tests {
         // file on a flaky connection may never finish otherwise.
         let content: &[u8] = b"0123456789ABCDEF"; // 16 bytes
         let server = MockServer::start().await;
-        let graph = GraphClient::new(reqwest::Client::new(), crate::TokenSource::Static("t".into()))
-            .with_base_url(server.uri());
+        let graph = GraphClient::new(
+            reqwest::Client::new(),
+            crate::TokenSource::Static("t".into()),
+        )
+        .with_base_url(server.uri());
 
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("Docs/big.bin");
@@ -478,14 +662,150 @@ mod tests {
             .mount(&server)
             .await;
 
-        let written =
-            download_to_file_limited(&graph, "F1", &dest, Some("etag-c1"), None, 0, &mut |_, _| true)
-                .await
-                .unwrap();
+        let written = download_to_file_limited(
+            &graph,
+            "F1",
+            &dest,
+            Some("etag-c1"),
+            None,
+            0,
+            &mut |_, _| true,
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(written, 16);
-        assert_eq!(std::fs::read(&dest).unwrap(), content, "the whole file, resumed");
-        assert!(!partial_path(&dest).exists(), "the partial was renamed into place");
+        assert_eq!(written.bytes, 16);
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            content,
+            "the whole file, resumed"
+        );
+        assert!(
+            !partial_path(&dest).exists(),
+            "the partial was renamed into place"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_edit_during_download_is_not_overwritten() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let graph = GraphClient::new(
+            reqwest::Client::new(),
+            crate::TokenSource::Static("t".into()),
+        )
+        .with_base_url(server.uri());
+        Mock::given(method("GET"))
+            .and(path("/me/drive/items/F1/content"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_bytes(b"remote version"),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("report.txt");
+        std::fs::write(&dest, b"old version").unwrap();
+
+        let download = download_to_file(&graph, "F1", &dest, None, None, |_, _| true);
+        let edit = async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            std::fs::write(&dest, b"local edit").unwrap();
+        };
+        let (result, ()) = tokio::join!(download, edit);
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "unexpected download result: {result:?}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"local edit");
+        assert!(
+            partial_path(&dest).exists(),
+            "the remote bytes remain resumable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_edit_during_upload_is_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let graph = GraphClient::new(
+            reqwest::Client::new(),
+            crate::TokenSource::Static("t".into()),
+        )
+        .with_base_url(server.uri());
+        let response = serde_json::json!({
+            "id": "F1",
+            "name": "report.txt",
+            "size": 11,
+            "file": {"mimeType": "text/plain"},
+            "parentReference": {"driveId": "drive", "id": "ROOT"}
+        });
+        Mock::given(method("PUT"))
+            .and(path("/me/drive/items/F1/content"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json(response),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/me/drive/items/F1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "F1",
+                "name": "report.txt",
+                "size": 11,
+                "file": {"mimeType": "text/plain"},
+                "parentReference": {"driveId": "drive", "id": "ROOT"}
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("report.txt");
+        std::fs::write(&source, b"old version").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = Config::default();
+
+        let upload = upload_file(
+            &graph,
+            &store,
+            &config,
+            &source,
+            UploadTarget {
+                account_id: "acct",
+                parent_id: "ROOT",
+                name: "report.txt",
+                item_id: Some("F1"),
+                etag: None,
+                session_key: "F1",
+            },
+            |_, _| {},
+        );
+        let edit = async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            std::fs::write(&source, b"local edit!").unwrap();
+        };
+        let (result, ()) = tokio::join!(upload, edit);
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "unexpected upload result: {result:?}"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"local edit!");
     }
 
     #[tokio::test]

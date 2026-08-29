@@ -72,15 +72,19 @@ pub struct Config {
     /// Chunk size for resumable uploads. Must be a multiple of 320 KiB.
     pub upload_chunk_size: u64,
 
-    /// Concurrent transfers.
-    pub max_concurrent_transfers: usize,
+    /// Accepted only so configurations written by older releases keep
+    /// loading. Transfers are ordered for dependency and conflict safety, so
+    /// the old setting never controlled real concurrency and is not emitted.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
+    pub max_concurrent_transfers: Option<usize>,
 
     /// Refuse to start a download that would leave less than this much free
     /// space. A safety net independent of what the user pinned: running the
     /// root filesystem to zero takes the whole desktop session down with it.
     pub min_free_bytes: u64,
 
-    /// Files-on-demand. Wired up in M2; parsed now so config files stay stable.
+    /// Present remote files as sparse placeholders and hydrate them on access.
     pub on_demand: bool,
 
     /// Storage-sense style automatic space recovery: when free space drops
@@ -149,7 +153,7 @@ impl Default for Config {
             local_debounce_ms: 500,
             upload_session_threshold: 4 * 1024 * 1024,
             upload_chunk_size: 10 * 1024 * 1024, // 32 x 320 KiB
-            max_concurrent_transfers: 4,
+            max_concurrent_transfers: None,
             min_free_bytes: 2 * 1024 * 1024 * 1024,
             auto_free_below_bytes: 0,
             download_limit_bytes_per_sec: 0,
@@ -401,5 +405,15 @@ mod tests {
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.client_id, "abc");
         assert_eq!(back.upload_chunk_size, cfg.upload_chunk_size);
+    }
+
+    #[test]
+    fn legacy_concurrency_setting_is_accepted_but_not_rewritten() {
+        let text = "client_id = 'abc'\nmax_concurrent_transfers = 4\n";
+        let config: Config = toml::from_str(text).unwrap();
+        assert_eq!(config.max_concurrent_transfers, Some(4));
+
+        let rewritten = toml::to_string_pretty(&config).unwrap();
+        assert!(!rewritten.contains("max_concurrent_transfers"));
     }
 }

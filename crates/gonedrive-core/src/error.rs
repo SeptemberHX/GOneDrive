@@ -77,9 +77,7 @@ impl Error {
             // entering a tunnel mid-download) surfaces here, not as a connect
             // or request error. Without it such an interruption counts as
             // permanent and the transfer is abandoned on the first failure.
-            Error::Http(e) => {
-                e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()
-            }
+            Error::Http(e) => e.is_timeout() || e.is_connect() || e.is_request() || e.is_body(),
             Error::Io(e) => matches!(
                 e.kind(),
                 std::io::ErrorKind::Interrupted
@@ -145,7 +143,9 @@ impl std::fmt::Display for NameError {
         let s = match self {
             NameError::Empty => "the name is empty",
             NameError::TooLong => "the name exceeds 255 characters",
-            NameError::IllegalCharacter => "contains one of \" * : < > ? / \\ | or a control character",
+            NameError::IllegalCharacter => {
+                "contains one of \" * : < > ? / \\ | or a control character"
+            }
             NameError::TrailingSpaceOrDot => "ends with a space or a dot",
             NameError::LeadingSpace => "starts with a space",
             NameError::ReservedName => "is a name OneDrive reserves",

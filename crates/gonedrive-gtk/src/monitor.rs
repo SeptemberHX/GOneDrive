@@ -237,7 +237,10 @@ impl Monitor {
             .hexpand(true)
             .build();
         // Bold, body-sized: the file name is the one thing the user must read.
-        name.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(&hydration.name)));
+        name.set_markup(&format!(
+            "<b>{}</b>",
+            glib::markup_escape_text(&hydration.name)
+        ));
 
         let cancel = gtk::Button::builder()
             .icon_name("window-close-symbolic")

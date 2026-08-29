@@ -9,3 +9,6 @@ description = "Shared D-Bus interface definitions for GOnedrive"
 [dependencies]
 serde.workspace = true
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+serde_json.workspace = true
