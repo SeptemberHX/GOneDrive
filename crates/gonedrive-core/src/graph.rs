@@ -170,6 +170,34 @@ impl GraphClient {
         .await
     }
 
+    /// Download from `offset` to the end, resuming an interrupted transfer.
+    ///
+    /// `if_range` (an eTag) makes the resume safe: the service replies `206`
+    /// and streams only the bytes from `offset` on *if the content still
+    /// matches*, or `200` with the whole file if it changed — so a stale
+    /// partial is transparently restarted rather than corrupted. `offset == 0`
+    /// is an ordinary full download.
+    pub async fn download_from(
+        &self,
+        item_id: &str,
+        offset: u64,
+        if_range: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        if offset == 0 {
+            return self.download(item_id, None).await;
+        }
+        let url = format!("{}/me/drive/items/{item_id}/content", self.base);
+        let if_range = if_range.map(str::to_owned);
+        self.send(move |http| {
+            let mut request = http.get(&url).header("Range", format!("bytes={offset}-"));
+            if let Some(etag) = &if_range {
+                request = request.header("If-Range", etag.clone());
+            }
+            request
+        })
+        .await
+    }
+
     // ---- mutations --------------------------------------------------------
 
     pub async fn create_folder(&self, parent_id: &str, name: &str) -> Result<DriveItem> {

@@ -259,7 +259,13 @@ async fn login() -> Result<()> {
     println!("If nothing opens, visit this URL:\n\n  {}\n", flow.url);
     open_in_browser(&flow.url);
 
-    let http = reqwest::Client::new();
+    // Same deadlines as the daemon's client: a flaky link must not hang the
+    // token exchange forever.
+    let http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
     let account_id = flow.complete(http, &config, &store, tokens).await?;
 
     let account = store.account(&account_id)?;

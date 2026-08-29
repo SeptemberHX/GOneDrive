@@ -27,9 +27,6 @@ use crate::sync::plan::{
 use crate::sync::selection::{available_bytes, human_bytes, Listing, PinOutcome, Selection};
 use crate::sync::transfer::{self, UploadTarget};
 
-/// Give up on an operation after this many failures and surface it to the user.
-const MAX_OP_ATTEMPTS: u32 = 8;
-
 /// Operations pulled off the queue per pass.
 const QUEUE_BATCH: usize = 64;
 
@@ -1213,7 +1210,7 @@ impl Engine {
 
         let limit = self.config.download_limit_bytes_per_sec;
         let result =
-            transfer::download_to_file_limited(&self.graph, &item_id, &staged, None, limit, &mut move |done, total| {
+            transfer::download_to_file_limited(&self.graph, &item_id, &staged, None, None, limit, &mut move |done, total| {
                 let total = total.unwrap_or(size);
                 if done == total || done.saturating_sub(last_sent) >= step {
                     last_sent = done;
@@ -1983,7 +1980,15 @@ impl Engine {
             .store
             .fail_op(op.id, &error.to_string(), retry_delay(op.attempts))?;
 
-        if permanent || attempts >= MAX_OP_ATTEMPTS {
+        // A transient failure — the link dropped, the service is throttling or
+        // briefly 5xx-ing — is never a reason to abandon a transfer. On a train
+        // the signal comes back and the file must still sync, so transient ops
+        // keep retrying with capped backoff (every few minutes) until they
+        // succeed or the item changes underneath them, rather than being given
+        // up after a fixed count that a long tunnel would exhaust. Only a
+        // *permanent* error — a rejected name, a gone item, a local permission
+        // problem — gives up.
+        if permanent {
             tracing::warn!(%name, error = %error, attempts, "giving up on operation");
             summary.failed += 1;
             self.emit(SyncEvent::Failed {
@@ -2067,6 +2072,7 @@ impl Engine {
             &self.graph,
             item_id,
             &path,
+            record.etag.as_deref(),
             record.remote_mtime,
             self.config.download_limit_bytes_per_sec,
             &mut |done, total| {

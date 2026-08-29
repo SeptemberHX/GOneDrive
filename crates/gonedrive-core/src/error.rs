@@ -72,16 +72,59 @@ impl Error {
     pub fn is_transient(&self) -> bool {
         match self {
             Error::Throttled(_) => true,
-            Error::Http(e) => e.is_timeout() || e.is_connect() || e.is_request(),
+            // `is_body` is the one that matters on a flaky link: a connection
+            // dropped or reset *while streaming a response body* (a train
+            // entering a tunnel mid-download) surfaces here, not as a connect
+            // or request error. Without it such an interruption counts as
+            // permanent and the transfer is abandoned on the first failure.
+            Error::Http(e) => {
+                e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()
+            }
             Error::Io(e) => matches!(
                 e.kind(),
                 std::io::ErrorKind::Interrupted
                     | std::io::ErrorKind::WouldBlock
                     | std::io::ErrorKind::TimedOut
+                    // A body that ended early, or a connection torn down under
+                    // an in-flight transfer — all retryable, none a reason to
+                    // give up on the file.
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
             ),
             Error::Graph { status, .. } => *status >= 500,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use std::io;
+
+    #[test]
+    fn a_dropped_connection_mid_transfer_is_retryable() {
+        // The failure this guards: a signal drop mid-download must be treated
+        // as transient (retry later), never as a permanent error that abandons
+        // the transfer on its first attempt.
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Interrupted,
+        ] {
+            assert!(
+                Error::Io(io::Error::from(kind)).is_transient(),
+                "{kind:?} should be retryable"
+            );
+        }
+        // A genuine local problem is not a network hiccup: do not retry forever.
+        assert!(!Error::Io(io::Error::from(io::ErrorKind::PermissionDenied)).is_transient());
+        assert!(!Error::other("bad name").is_transient());
     }
 }
 

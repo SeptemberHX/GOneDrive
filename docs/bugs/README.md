@@ -17,6 +17,7 @@
 | [`hydration-and-placeholders.md`](hydration-and-placeholders.md) | 按需下载 / 占位符生命周期：级联下载、拷零、部分回填时间戳漂移、进度窗 |
 | [`emblems-and-state.md`](emblems-and-state.md) | 角标语义与 xattr/DB 状态一致性 |
 | [`scope-and-safety.md`](scope-and-safety.md) | 作用域与破坏性动作护栏：整盘一键、越根路径、批量删除阀 |
-| [`sync-correctness.md`](sync-correctness.md) | 同步正确性：重命名=移动、resync 清扫、大小写碰撞 |
+| [`sync-correctness.md`](sync-correctness.md) | 同步正确性：重命名=移动、resync 清扫、大小写碰撞、cTag 抢先、hydrated 文件降级 |
+| [`network-resilience.md`](network-resilience.md) | 弱网韧性：中途掉线的分类与重试、read 超时、不过早放弃、下载断点续传 |
 
-运行全部回归测试：`cargo test --workspace`（当前 157 项）。
+运行全部回归测试：`cargo test --workspace`（当前 191 项）。

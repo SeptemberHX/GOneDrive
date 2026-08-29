@@ -952,9 +952,17 @@ impl App {
 fn build_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("GOnedrive/", env!("CARGO_PKG_VERSION")))
-        // Large uploads legitimately take a long time; only the connect phase
-        // gets a short deadline.
+        // Large uploads legitimately take a long time, so there is no overall
+        // request deadline; the connect phase gets a short one.
         .connect_timeout(Duration::from_secs(20))
+        // But a *stalled* stream must not hang the client for minutes. This is
+        // the per-read deadline: a body (or upload response) that goes silent
+        // for this long — a signal drop on a train leaving the connection
+        // half-open — fails fast and is retried, instead of blocking a sync
+        // pass, or a file-open waiting on hydration, until the OS gives up on
+        // the dead socket. It bounds each read, not the whole transfer, so a
+        // slow-but-alive link still completes.
+        .read_timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(90))
         .build()
         .context("could not build the HTTP client")

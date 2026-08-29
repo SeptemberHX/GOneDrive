@@ -71,17 +71,27 @@ pub async fn download_to_file(
     graph: &GraphClient,
     item_id: &str,
     dest: &Path,
+    etag: Option<&str>,
     mtime: Option<OffsetDateTime>,
     mut on_progress: impl FnMut(u64, Option<u64>) -> bool,
 ) -> Result<u64> {
-    download_to_file_limited(graph, item_id, dest, mtime, 0, &mut on_progress).await
+    download_to_file_limited(graph, item_id, dest, etag, mtime, 0, &mut on_progress).await
 }
 
 /// As [`download_to_file`], with a bytes-per-second ceiling (zero = none).
+///
+/// The transfer resumes: an attempt cut short by a dropped link leaves its
+/// bytes in the temporary file, and the next call continues from that offset
+/// with an HTTP range request. `etag` guards the resume — the service replies
+/// `206 Partial Content` and streams only the remainder while the content still
+/// matches, or `200 OK` with the whole file if it changed under us, in which
+/// case the stale prefix is discarded. Without an `etag` we cannot prove a
+/// leftover prefix still belongs to the current version, so we start over.
 pub async fn download_to_file_limited(
     graph: &GraphClient,
     item_id: &str,
     dest: &Path,
+    etag: Option<&str>,
     mtime: Option<OffsetDateTime>,
     rate_limit: u64,
     on_progress: &mut (impl FnMut(u64, Option<u64>) -> bool + ?Sized),
@@ -92,11 +102,37 @@ pub async fn download_to_file_limited(
     tokio::fs::create_dir_all(parent).await?;
 
     let partial = partial_path(dest);
-    let response = graph.download(item_id, None).await?;
-    let expected = response.content_length();
 
-    let mut file = tokio::fs::File::create(&partial).await?;
-    let mut written = 0u64;
+    // Pick up where an interrupted attempt left off, but only when we can
+    // validate the leftover bytes against a version (`etag`); otherwise a stale
+    // prefix could be spliced onto new content.
+    let resume_from = match (etag, tokio::fs::metadata(&partial).await) {
+        (Some(_), Ok(meta)) if meta.len() > 0 => meta.len(),
+        _ => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            0
+        }
+    };
+
+    let response = graph.download_from(item_id, resume_from, etag).await?;
+
+    // The service honours the resume only with 206; a 200 means it sent the
+    // whole file (the eTag moved, or the range was ignored), so the leftover
+    // prefix is discarded and we write from the top.
+    let resuming =
+        resume_from > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let total = if resuming {
+        content_range_total(&response)
+    } else {
+        response.content_length()
+    };
+
+    let mut file = if resuming {
+        tokio::fs::OpenOptions::new().append(true).open(&partial).await?
+    } else {
+        tokio::fs::File::create(&partial).await?
+    };
+    let mut written = if resuming { resume_from } else { 0 };
     let mut stream = response.bytes_stream();
     let mut pacer = RatePacer::new(rate_limit);
 
@@ -106,7 +142,7 @@ pub async fn download_to_file_limited(
             file.write_all(&chunk).await?;
             written += chunk.len() as u64;
             pacer.pace(chunk.len() as u64).await;
-            if !on_progress(written, expected) {
+            if !on_progress(written, total) {
                 return Err(Error::Cancelled);
             }
         }
@@ -119,19 +155,25 @@ pub async fn download_to_file_limited(
     .await;
 
     if let Err(e) = result {
-        let _ = tokio::fs::remove_file(&partial).await;
+        // Keep the partial so the next attempt resumes from here — but only for
+        // a failure a retry can recover from. A permanent error discards it, so
+        // a genuinely broken transfer leaves no mis-resumable litter.
+        if !e.is_transient() {
+            let _ = tokio::fs::remove_file(&partial).await;
+        }
         return Err(e);
     }
     drop(file);
 
-    // A short read means the connection ended early but cleanly; publishing it
-    // would look exactly like a successful sync of a corrupted file.
-    if let Some(expected) = expected {
-        if written != expected {
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(Error::other(format!(
-                "{} ended after {written} of {expected} bytes",
-                dest.display()
+    // A short read means the connection ended early. The prefix on disk is
+    // valid (we wrote exactly the bytes streamed, in order), so keep it and
+    // fail transiently: the next attempt resumes from here rather than
+    // publishing a truncated file as a successful sync.
+    if let Some(total) = total {
+        if written != total {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{} ended after {written} of {total} bytes", dest.display()),
             )));
         }
     }
@@ -141,6 +183,20 @@ pub async fn download_to_file_limited(
         set_mtime(dest, mtime)?;
     }
     Ok(written)
+}
+
+/// Total size from a `Content-Range: bytes START-END/TOTAL` header, if present.
+fn content_range_total(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .rsplit('/')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Stamp a local file's modification time.
@@ -386,6 +442,50 @@ mod tests {
             partial_path(Path::new("/a/README")).file_name().unwrap(),
             ".README.gonedrive-partial"
         );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_download_resumes_from_its_partial() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Regression (weak network): a transfer cut short by a dropped link
+        // must continue from the bytes already on disk, not restart — a large
+        // file on a flaky connection may never finish otherwise.
+        let content: &[u8] = b"0123456789ABCDEF"; // 16 bytes
+        let server = MockServer::start().await;
+        let graph = GraphClient::new(reqwest::Client::new(), crate::TokenSource::Static("t".into()))
+            .with_base_url(server.uri());
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("Docs/big.bin");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        // An earlier attempt landed the first 6 bytes before the signal dropped.
+        std::fs::write(partial_path(&dest), &content[..6]).unwrap();
+
+        // Only a ranged, version-checked request is served. A full download
+        // would 404 here, so the test can only pass if the resume path is taken
+        // — and the If-Range guard proves the leftover prefix is validated.
+        Mock::given(method("GET"))
+            .and(path("/me/drive/items/F1/content"))
+            .and(header("Range", "bytes=6-"))
+            .and(header("If-Range", "etag-c1"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", "bytes 6-15/16")
+                    .set_body_bytes(&content[6..]),
+            )
+            .mount(&server)
+            .await;
+
+        let written =
+            download_to_file_limited(&graph, "F1", &dest, Some("etag-c1"), None, 0, &mut |_, _| true)
+                .await
+                .unwrap();
+
+        assert_eq!(written, 16);
+        assert_eq!(std::fs::read(&dest).unwrap(), content, "the whole file, resumed");
+        assert!(!partial_path(&dest).exists(), "the partial was renamed into place");
     }
 
     #[tokio::test]
