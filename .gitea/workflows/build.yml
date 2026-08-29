@@ -49,8 +49,13 @@ jobs:
       - name: Install Rust (stable + rustfmt + clippy)
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --component rustfmt clippy
+            | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # rustup-init's --component takes one value per flag; add both here,
+          # where `rustup component add` accepts several. (cargo/rustup are not
+          # yet on PATH this step — GITHUB_PATH applies to later steps — so call
+          # rustup by full path.)
+          "$HOME/.cargo/bin/rustup" component add rustfmt clippy
 
       - name: Cache cargo + target
         uses: actions/cache@v4
