@@ -78,6 +78,17 @@ pub struct SyncStatus {
     pub last_error: String,
 }
 
+/// Completion of an explicitly requested remote sync generation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct SyncRequestResult {
+    pub ok: bool,
+    /// Remote delta entries observed by the pass.
+    pub changes: u64,
+    /// Durable operations remaining after the delta was committed.
+    pub queued: u64,
+    pub error: String,
+}
+
 impl SyncStatus {
     pub fn idle(pending: u64) -> Self {
         Self {
@@ -111,6 +122,10 @@ pub trait Daemon {
 
     /// Ask for a sync pass immediately rather than waiting for the poll timer.
     fn sync_now(&self) -> zbus::Result<()>;
+
+    /// Ask for a sync pass and return a generation that can be awaited through
+    /// `sync_request_completed`.
+    fn request_sync(&self) -> zbus::Result<u64>;
 
     fn set_paused(&self, paused: bool) -> zbus::Result<()>;
 
@@ -160,6 +175,9 @@ pub trait Daemon {
     fn status_changed(status: SyncStatus) -> zbus::Result<()>;
 
     #[zbus(signal)]
+    fn sync_request_completed(generation: u64, result: SyncRequestResult) -> zbus::Result<()>;
+
+    #[zbus(signal)]
     fn login_completed(account_id: &str) -> zbus::Result<()>;
 
     #[zbus(signal)]
@@ -199,6 +217,8 @@ pub mod hsm {
     /// Default socket path. The directory is root-owned; the socket itself is
     /// mode 0666 and every connection is checked with `SO_PEERCRED`.
     pub const SOCKET_PATH: &str = "/run/gonedrive/hsm.sock";
+    /// Maximum newline-delimited JSON frame accepted in either direction.
+    pub const MAX_FRAME_SIZE: usize = 64 * 1024;
 
     /// Sent by the daemon to the helper.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +305,14 @@ pub mod hsm {
             ok: bool,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             message: Option<String>,
+            /// Identity of the descriptor the helper actually marked. The
+            /// daemon must cache this value rather than stat the pathname
+            /// again after acknowledgement, which would reintroduce a rename
+            /// race on its side of the protocol.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            dev: Option<u64>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            ino: Option<u64>,
         },
         /// Retained for protocol compatibility with older helpers. New watch
         /// operations use [`Event::WatchResult`].
@@ -315,6 +343,8 @@ pub mod hsm {
                 id: 42,
                 ok: false,
                 message: Some("unsupported filesystem".into()),
+                dev: None,
+                ino: None,
             })
             .unwrap();
             let parsed: Event = serde_json::from_str(&event).unwrap();

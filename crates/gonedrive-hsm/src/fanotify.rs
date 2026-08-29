@@ -115,25 +115,30 @@ impl Fanotify {
     /// every read on the filesystem through this process, which is both a
     /// performance disaster and a much larger blast radius for a bug in a
     /// root-owned daemon.
-    pub fn watch(&self, path: &std::path::Path) -> io::Result<()> {
-        self.mark(FAN_MARK_ADD, path)
+    pub fn watch_fd(&self, fd: RawFd) -> io::Result<()> {
+        self.mark_fd(FAN_MARK_ADD, fd)
     }
 
-    pub fn unwatch(&self, path: &std::path::Path) -> io::Result<()> {
-        self.mark(FAN_MARK_REMOVE, path)
+    pub fn unwatch_fd(&self, fd: RawFd) -> io::Result<()> {
+        self.mark_fd(FAN_MARK_REMOVE, fd)
     }
 
-    fn mark(&self, flags: u32, path: &std::path::Path) -> io::Result<()> {
-        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
-        // SAFETY: `c_path` is a valid NUL-terminated string; `self.fd` is valid.
+    /// Mark the exact object already opened by the caller.
+    ///
+    /// A pathname-based mark would reopen the path after the privileged helper
+    /// checked its owner. A rename between those two operations could make the
+    /// mark land on an unrelated root-owned inode. Linux accepts a NULL path
+    /// here and then treats `dirfd` itself as the object to mark.
+    fn mark_fd(&self, flags: u32, fd: RawFd) -> io::Result<()> {
+        // SAFETY: both descriptors are valid and a NULL path tells the kernel
+        // to mark `fd` itself.
         let rc = unsafe {
             libc::fanotify_mark(
                 self.fd.as_raw_fd(),
                 flags,
                 FAN_PRE_ACCESS | FAN_OPEN_PERM,
-                libc::AT_FDCWD,
-                c_path.as_ptr(),
+                fd,
+                std::ptr::null(),
             )
         };
         if rc != 0 {
@@ -173,6 +178,11 @@ impl Fanotify {
                 unsafe { std::ptr::read_unaligned(buf.as_ptr().add(cursor) as *const _) };
             let event_len = meta.event_len as usize;
             if event_len < std::mem::size_of::<EventMetadata>() || cursor + event_len > len {
+                if meta.fd >= 0 {
+                    // The kernel transfers ownership even when the surrounding
+                    // record is unusable; do not leak it on the defensive path.
+                    unsafe { libc::close(meta.fd) };
+                }
                 break;
             }
             if meta.fd < 0 {
@@ -182,9 +192,14 @@ impl Fanotify {
             // SAFETY: the kernel handed us this descriptor; we own it now.
             let fd = unsafe { OwnedFd::from_raw_fd(meta.fd) };
 
+            let metadata_len = meta.metadata_len as usize;
+            if metadata_len < std::mem::size_of::<EventMetadata>() || metadata_len > event_len {
+                cursor += event_len;
+                continue;
+            }
+
             let (offset, length) =
-                read_range(&buf[cursor + meta.metadata_len as usize..cursor + event_len])
-                    .unwrap_or((0, 0));
+                read_range(&buf[cursor + metadata_len..cursor + event_len]).unwrap_or((0, 0));
 
             events.push(PreContentEvent {
                 path: path_of(&fd),

@@ -2,7 +2,12 @@
 
 pub mod emblems;
 pub mod engine;
+mod hydration;
+mod local;
 pub mod plan;
+mod queue;
+mod remote;
+pub(crate) mod rooted_fs;
 pub mod selection;
 pub mod transfer;
 

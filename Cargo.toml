@@ -27,6 +27,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["formatting", "parsing", "serde", "macros"] }
+libc = "0.2.189"
 
 [profile.release]
 lto = "thin"

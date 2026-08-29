@@ -6,7 +6,7 @@
 //! or reconciliation machinery.
 
 use crate::db::{Account, ItemState};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::hydrate::{Placeholder, PlaceholderState};
 
 use super::engine::Engine;
@@ -25,14 +25,20 @@ impl Engine {
         let Some(path) = self.store.local_path(account, folder_id)? else {
             return Ok(false);
         };
-        if !path.is_dir() {
-            return Ok(false);
-        }
+        let rooted = self.rooted(account)?;
+        let folder = match rooted.open_read(&path) {
+            Ok(file) if file.metadata()?.is_dir() => file,
+            Ok(_) => return Ok(false),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
         // An explicit "always keep on this device" wins outright.
         if self.store.explicitly_pinned(folder_id)? {
-            let changed = Placeholder::state(&path) != PlaceholderState::Hydrated;
-            let _ = Placeholder::mark_dir(&path, PlaceholderState::Hydrated, folder_id);
-            let _ = Placeholder::set_pin(&path, "pinned");
+            let changed = Placeholder::state_file(&folder) != PlaceholderState::Hydrated;
+            let _ = Placeholder::mark_dir_file(&folder, PlaceholderState::Hydrated, folder_id);
+            let _ = Placeholder::set_pin_file(&folder, "pinned");
             return Ok(changed);
         }
 
@@ -42,8 +48,10 @@ impl Engine {
                 // A subfolder counts as local only if it, too, is fully local.
                 self.store
                     .local_path(account, &child.id)?
-                    .map(|p| Placeholder::state(&p) == PlaceholderState::Hydrated)
-                    .unwrap_or(false)
+                    .and_then(|path| rooted.open_read(&path).ok())
+                    .is_some_and(|file| {
+                        Placeholder::state_file(&file) == PlaceholderState::Hydrated
+                    })
             } else {
                 child.state == ItemState::Synced && child.local_ino.is_some()
             };
@@ -58,9 +66,9 @@ impl Engine {
         } else {
             PlaceholderState::Dehydrated
         };
-        let changed = Placeholder::state(&path) != target;
+        let changed = Placeholder::state_file(&folder) != target;
         if changed {
-            let _ = Placeholder::mark_dir(&path, target, folder_id);
+            let _ = Placeholder::mark_dir_file(&folder, target, folder_id);
         }
         Ok(changed)
     }

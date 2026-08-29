@@ -18,31 +18,36 @@
 //!   the reader sees as an ordinary I/O error.
 
 mod fanotify;
+mod marks;
+mod worker;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use gonedrive_ipc::hsm::{Event, Request, SOCKET_PATH};
+use gonedrive_ipc::hsm::{Event, Request, MAX_FRAME_SIZE, SOCKET_PATH};
 
-use crate::fanotify::{Fanotify, PreContentEvent};
-
-// Process classification (background indexers, bulk copiers, browsers) is
-// shared with the daemon through `gonedrive_ipc::reader_policy`, so the two
-// sides of the trust boundary cannot drift apart.
-use gonedrive_ipc::reader_policy::{is_background_reader, is_bulk_copier};
+use crate::fanotify::Fanotify;
+use crate::marks::{install_mark, open_authorised, remove_marks_for_path};
+#[cfg(test)]
+use crate::worker::{background_reader, expected_fill_len, fill_from};
+use crate::worker::{event_loop, fail_pending_for_uid, handle_event, remove_marks_for_uid};
 
 /// How long a blocked reader waits before we give up and fail its read.
 /// Long enough for a large file over a slow link, short enough that a wedged
 /// daemon does not hang an application indefinitely.
 const HYDRATE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Pre-content events block real readers, but an attacker must not be able to
+/// turn each one into an unbounded root-owned thread.
+const WORKERS: usize = 64;
+const WORK_QUEUE: usize = 256;
 
 #[derive(Parser)]
 #[command(
@@ -55,7 +60,7 @@ struct Cli {
     #[arg(long, default_value = SOCKET_PATH)]
     socket: PathBuf,
 
-    /// Only serve this uid. Defaults to whoever connects first.
+    /// Only serve this uid. Without it, each uid gets one isolated session.
     #[arg(long)]
     uid: Option<u32>,
 }
@@ -63,7 +68,7 @@ struct Cli {
 /// A hydration the helper is waiting on.
 enum Reply {
     /// Fill this window from the staged file, then place/finalise it.
-    Fill(PathBuf, u64, bool),
+    Fill(std::fs::File, u64, bool),
     /// Let the read proceed against the sparse file, unchanged. A browsing
     /// sniff of an untouched placeholder — no fetch happened.
     AllowEmpty,
@@ -72,40 +77,93 @@ enum Reply {
 }
 
 struct Pending {
+    uid: u32,
     reply: mpsc::Sender<Reply>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+struct MarkEntry {
+    uid: u32,
+    path: PathBuf,
+    /// Kept open so even a replaced or deleted pathname can be unmarked by
+    /// descriptor, without reopening attacker-controlled path components.
+    file: std::fs::File,
+}
+
+#[derive(Clone)]
+struct ClientSession {
+    pid: i32,
+    stream: Arc<Mutex<UnixStream>>,
 }
 
 struct Shared {
     fan: Fanotify,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
-    /// The connected daemon, if any.
-    daemon: Mutex<Option<UnixStream>>,
-    /// The uid the daemon runs as; paths are confined to its home directory.
-    owner: Mutex<Option<u32>>,
-    /// The daemon's pid, from the socket's peer credentials.
-    ///
-    /// Events raised by this pid are allowed through untouched: the daemon's
-    /// own writes — punching holes, restoring timestamps, filling content —
-    /// are always deliberate. Asking it whether its own blocked write should
-    /// be hydrated is a deadlock with extra steps, and exactly that froze the
-    /// daemon, its D-Bus interface, and every file manager thread queued
-    /// behind them.
-    client_pid: std::sync::atomic::AtomicI32,
+    sessions: Mutex<HashMap<u32, ClientSession>>,
+    marks: Mutex<HashMap<FileIdentity, MarkEntry>>,
+    allowed_uid: Option<u32>,
 }
 
 impl Shared {
-    fn send(&self, event: &Event) -> Result<()> {
-        let mut guard = self.daemon.lock().unwrap();
-        let Some(stream) = guard.as_mut() else {
-            bail!("no daemon is connected");
+    fn send(&self, uid: u32, event: &Event) -> Result<()> {
+        let session = {
+            let sessions = self.sessions.lock().unwrap();
+            let Some(session) = sessions.get(&uid) else {
+                bail!("no daemon is connected for uid {uid}");
+            };
+            session.clone()
         };
-        let mut line = serde_json::to_string(event)?;
-        line.push('\n');
-        stream.write_all(line.as_bytes())?;
-        stream.flush()?;
+        send_to_session(&session, event)
+    }
+
+    fn begin_hydration(
+        &self,
+        uid: u32,
+        session: &ClientSession,
+        id: u64,
+        pending: Pending,
+        event: &Event,
+    ) -> Result<()> {
+        let stream = {
+            // Hold the session table through pending insertion. Disconnect
+            // cleanup takes the same lock before draining that uid, so a
+            // request can belong wholly to the old or new connection, never
+            // straddle both.
+            let sessions = self.sessions.lock().unwrap();
+            let Some(current) = sessions.get(&uid) else {
+                bail!("no daemon is connected for uid {uid}");
+            };
+            if current.pid != session.pid || !Arc::ptr_eq(&current.stream, &session.stream) {
+                bail!("daemon session for uid {uid} changed");
+            }
+            self.pending.lock().unwrap().insert(id, pending);
+            current.stream.clone()
+        };
+        if let Err(error) = send_to_stream(&stream, event) {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(error);
+        }
         Ok(())
     }
+}
+
+fn send_to_session(session: &ClientSession, event: &Event) -> Result<()> {
+    send_to_stream(&session.stream, event)
+}
+
+fn send_to_stream(stream: &Arc<Mutex<UnixStream>>, event: &Event) -> Result<()> {
+    let mut line = serde_json::to_string(event)?;
+    line.push('\n');
+    let mut stream = stream.lock().unwrap();
+    stream.write_all(line.as_bytes())?;
+    stream.flush()?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -127,31 +185,46 @@ fn main() -> Result<()> {
         fan,
         next_id: AtomicU64::new(1),
         pending: Mutex::new(HashMap::new()),
-        daemon: Mutex::new(None),
-        owner: Mutex::new(cli.uid),
-        client_pid: std::sync::atomic::AtomicI32::new(0),
+        sessions: Mutex::new(HashMap::new()),
+        marks: Mutex::new(HashMap::new()),
+        allowed_uid: cli.uid,
     });
 
     let listener = bind_socket(&cli.socket)?;
     tracing::info!(socket = %cli.socket.display(), "listening");
 
+    let (work_tx, work_rx) = mpsc::sync_channel(WORK_QUEUE);
+    let work_rx = Arc::new(Mutex::new(work_rx));
+    for index in 0..WORKERS {
+        let shared = shared.clone();
+        let work_rx = work_rx.clone();
+        std::thread::Builder::new()
+            .name(format!("hydrate-{index}"))
+            .spawn(move || loop {
+                let event = match work_rx.lock().unwrap().recv() {
+                    Ok(event) => event,
+                    Err(_) => return,
+                };
+                handle_event(shared.clone(), event);
+            })?;
+    }
+
     {
         let shared = shared.clone();
         std::thread::Builder::new()
             .name("fanotify".into())
-            .spawn(move || event_loop(shared))?;
+            .spawn(move || event_loop(shared, work_tx))?;
     }
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(e) = serve_daemon(&shared, stream) {
-                    tracing::warn!(error = %e, "daemon connection ended");
-                }
-                // Marks belong to the group, not the connection, but a daemon
-                // that went away can no longer hydrate anything, so anything
-                // still waiting has to be failed rather than left hanging.
-                fail_all_pending(&shared);
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = serve_daemon(&shared, stream) {
+                        tracing::warn!(error = %e, "daemon connection ended");
+                    }
+                });
             }
             Err(e) => tracing::warn!(error = %e, "accept failed"),
         }
@@ -163,6 +236,19 @@ fn main() -> Result<()> {
 fn bind_socket(path: &Path) -> Result<UnixListener> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(parent)?;
+        // SAFETY: geteuid has no arguments and cannot fail.
+        let effective_uid = unsafe { libc::geteuid() };
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != effective_uid
+        {
+            bail!(
+                "socket directory {} must be a real directory owned by the helper uid",
+                parent.display()
+            );
+        }
         // The directory is the access control: only root may replace the
         // socket, while any local user may attempt to connect and is then
         // checked with SO_PEERCRED.
@@ -171,7 +257,17 @@ fn bind_socket(path: &Path) -> Result<UnixListener> {
         perms.set_mode(0o755);
         std::fs::set_permissions(parent, perms)?;
     }
-    let _ = std::fs::remove_file(path);
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            use std::os::unix::fs::FileTypeExt;
+            if !metadata.file_type().is_socket() {
+                bail!("refusing to replace non-socket {}", path.display());
+            }
+            std::fs::remove_file(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let listener = UnixListener::bind(path)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
@@ -198,90 +294,166 @@ fn peer_creds(stream: &UnixStream) -> Result<(u32, i32)> {
     Ok((cred.uid, cred.pid))
 }
 
-fn serve_daemon(shared: &Arc<Shared>, stream: UnixStream) -> Result<()> {
-    let (uid, pid) = peer_creds(&stream)?;
-    {
-        let mut owner = shared.owner.lock().unwrap();
-        match *owner {
-            Some(expected) if expected != uid => {
-                bail!("refusing a connection from uid {uid}; this helper serves uid {expected}")
+/// Removes exactly the session installed by one connection, on every exit
+/// path, including malformed/oversized frames and socket read errors.
+struct SessionGuard {
+    shared: Arc<Shared>,
+    uid: u32,
+    pid: i32,
+    stream: Arc<Mutex<UnixStream>>,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let disconnected = {
+            let mut sessions = self
+                .shared
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if sessions.get(&self.uid).is_some_and(|session| {
+                session.pid == self.pid && Arc::ptr_eq(&session.stream, &self.stream)
+            }) {
+                sessions.remove(&self.uid);
+                true
+            } else {
+                false
             }
-            Some(_) => {}
-            None => {
-                tracing::info!(uid, "serving");
-                *owner = Some(uid);
-            }
+        };
+        if disconnected {
+            fail_pending_for_uid(&self.shared, self.uid);
+            remove_marks_for_uid(&self.shared, self.uid);
         }
     }
+}
 
-    shared.client_pid.store(pid, Ordering::Relaxed);
-    *shared.daemon.lock().unwrap() = Some(stream.try_clone()?);
-    let reader = BufReader::new(stream);
+fn serve_daemon(shared: &Arc<Shared>, stream: UnixStream) -> Result<()> {
+    let (uid, pid) = peer_creds(&stream)?;
+    let writer = Arc::new(Mutex::new(stream.try_clone()?));
+    if shared.allowed_uid.is_some_and(|expected| expected != uid) {
+        bail!("refusing a connection from uid {uid}");
+    }
+    {
+        let mut sessions = shared.sessions.lock().unwrap();
+        if sessions.contains_key(&uid) {
+            bail!("a daemon for uid {uid} is already connected");
+        }
+        sessions.insert(
+            uid,
+            ClientSession {
+                pid,
+                stream: writer.clone(),
+            },
+        );
+    }
+    tracing::info!(uid, pid, "serving daemon");
+    let _session = SessionGuard {
+        shared: shared.clone(),
+        uid,
+        pid,
+        stream: writer,
+    };
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut reader = BufReader::new(stream);
+    while let Some(line) = read_frame(&mut reader)? {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
             continue;
         }
-        let request: Request = match serde_json::from_str(&line) {
+        let request: Request = match serde_json::from_slice(&line) {
             Ok(request) => request,
             Err(e) => {
-                let _ = shared.send(&Event::Error {
-                    message: format!("malformed request: {e}"),
-                });
+                let _ = shared.send(
+                    uid,
+                    &Event::Error {
+                        message: format!("malformed request: {e}"),
+                    },
+                );
                 continue;
             }
         };
         handle_request(shared, request, uid);
     }
-
-    *shared.daemon.lock().unwrap() = None;
     Ok(())
+}
+
+/// Read one newline-delimited JSON frame without ever allocating beyond the
+/// protocol limit. An oversized frame closes only that uid's session.
+fn read_frame(reader: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>> {
+    let mut frame = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((!frame.is_empty()).then_some(frame));
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if frame.len() + newline > MAX_FRAME_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HSM request exceeds 64 KiB",
+                ));
+            }
+            frame.extend_from_slice(&available[..newline]);
+            reader.consume(newline + 1);
+            return Ok(Some(frame));
+        }
+        if frame.len() + available.len() > MAX_FRAME_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HSM request exceeds 64 KiB",
+            ));
+        }
+        let len = available.len();
+        frame.extend_from_slice(available);
+        reader.consume(len);
+    }
 }
 
 fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
     match request {
         Request::Ping => {
-            let _ = shared.send(&Event::Pong {
-                version: env!("CARGO_PKG_VERSION").into(),
-            });
+            let _ = shared.send(
+                uid,
+                &Event::Pong {
+                    version: env!("CARGO_PKG_VERSION").into(),
+                },
+            );
         }
         Request::Features => {
-            let _ = shared.send(&Event::Features {
-                partial_hydration: true,
-            });
+            let _ = shared.send(
+                uid,
+                &Event::Features {
+                    partial_hydration: true,
+                },
+            );
         }
         Request::Watch { id, path } => {
             let path = PathBuf::from(path);
-            let result = match authorise(&path, uid) {
-                Err(e) => Err(e),
-                Ok(()) => match shared.fan.watch(&path) {
-                    Ok(()) => {
-                        tracing::debug!(path = %path.display(), "watching");
-                        Ok(())
-                    }
-                    Err(e) => Err(anyhow::anyhow!("could not watch {}: {e}", path.display())),
+            let result = install_mark(shared, &path, uid);
+            let identity = result.as_ref().ok().copied();
+            let _ = shared.send(
+                uid,
+                &Event::WatchResult {
+                    id,
+                    ok: result.is_ok(),
+                    message: result.err().map(|error| error.to_string()),
+                    dev: identity.map(|identity| identity.dev),
+                    ino: identity.map(|identity| identity.ino),
                 },
-            };
-            let _ = shared.send(&Event::WatchResult {
-                id,
-                ok: result.is_ok(),
-                message: result.err().map(|error| error.to_string()),
-            });
+            );
         }
         Request::Unwatch { id, path } => {
             let path = PathBuf::from(path);
-            let result = authorise(&path, uid).and_then(|()| {
-                shared
-                    .fan
-                    .unwatch(&path)
-                    .with_context(|| format!("could not unwatch {}", path.display()))
-            });
-            let _ = shared.send(&Event::WatchResult {
-                id,
-                ok: result.is_ok(),
-                message: result.err().map(|error| error.to_string()),
-            });
+            let result = remove_marks_for_path(shared, &path, uid);
+            let _ = shared.send(
+                uid,
+                &Event::WatchResult {
+                    id,
+                    ok: result.is_ok(),
+                    message: result.err().map(|error| error.to_string()),
+                    dev: None,
+                    ino: None,
+                },
+            );
         }
         Request::Hydrated {
             id,
@@ -290,13 +462,23 @@ fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
             offset,
             full,
         } => {
+            let belongs_to_client = shared
+                .pending
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|pending| pending.uid == uid);
+            if !belongs_to_client {
+                tracing::warn!(uid, id, "ignoring a hydration reply for another session");
+                return;
+            }
             let reply = match (ok, source) {
                 (true, Some(source)) => {
                     let source = PathBuf::from(source);
-                    // The staged file is named by an unprivileged process, so
-                    // it gets the same ownership check as anything else.
-                    match authorise(&source, uid) {
-                        Ok(()) => Reply::Fill(source, offset, full),
+                    // Open once, without following the final symlink. The same
+                    // descriptor is validated, sized and copied by the worker.
+                    match open_authorised(&source, uid, libc::O_RDONLY) {
+                        Ok(source) => Reply::Fill(source.file, offset, full),
                         Err(e) => {
                             tracing::warn!(error = %e, "refusing staged content");
                             Reply::Deny
@@ -313,464 +495,5 @@ fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
     }
 }
 
-/// Confine the helper to files the connecting user owns.
-///
-/// Without this, any local user who could reach the socket could ask a
-/// root-privileged process to install marks on arbitrary paths — a local
-/// privilege escalation dressed up as a sync feature.
-fn authorise(path: &Path, uid: u32) -> Result<()> {
-    if !path.is_absolute() {
-        bail!("{} is not an absolute path", path.display());
-    }
-    if path
-        .components()
-        .any(|c| c == std::path::Component::ParentDir)
-    {
-        bail!("{} contains a parent-directory component", path.display());
-    }
-    let meta =
-        std::fs::metadata(path).with_context(|| format!("cannot stat {}", path.display()))?;
-    use std::os::unix::fs::MetadataExt;
-    if meta.uid() != uid {
-        bail!(
-            "{} belongs to uid {}, not to the connecting uid {uid}",
-            path.display(),
-            meta.uid()
-        );
-    }
-    Ok(())
-}
-
-/// Poll for events and hand each one to a worker.
-///
-/// The loop itself must never block on anything but the poll: doing the fill
-/// here would deadlock, because the write can block on the very event that has
-/// not been answered yet.
-fn event_loop(shared: Arc<Shared>) {
-    let mut poll = libc::pollfd {
-        fd: shared.fan.as_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    loop {
-        // SAFETY: a single valid pollfd, with a timeout.
-        let rc = unsafe { libc::poll(&mut poll, 1, 1000) };
-        if rc < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            tracing::error!(error = %err, "poll failed");
-            return;
-        }
-        if rc == 0 {
-            continue;
-        }
-        match shared.fan.read_events() {
-            Ok(events) => {
-                for event in events {
-                    let shared = shared.clone();
-                    // One thread per blocked reader. There is already a process
-                    // parked on each of these, so the count is bounded by real
-                    // concurrent access rather than by anything we control.
-                    std::thread::spawn(move || handle_event(shared, event));
-                }
-            }
-            Err(e) => tracing::error!(error = %e, "reading events failed"),
-        }
-    }
-}
-
-fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
-    let fd = event.fd.as_raw_fd();
-
-    // The daemon's own access is always deliberate; blocking it on a question
-    // only it can answer is a deadlock. Straight through.
-    if event.pid == shared.client_pid.load(Ordering::Relaxed)
-        || event.pid == std::process::id() as i32
-    {
-        if let Err(e) = shared.fan.respond(fd, true) {
-            tracing::error!(error = %e, "could not answer our own client");
-        }
-        return;
-    }
-
-    // Background sweeps are refused before any work is done, so they neither
-    // download anything nor put a progress window on the user's screen for a
-    // file they never asked for.
-    if let Some(reader) = background_reader(event.pid) {
-        tracing::debug!(
-            pid = event.pid,
-            reader,
-            path = ?event.path,
-            "refusing to hydrate for a background reader"
-        );
-        if let Err(e) = shared.fan.respond(fd, false) {
-            tracing::error!(error = %e, "could not answer the blocked reader");
-        }
-        return;
-    }
-
-    // An open event: let the daemon decide whether this opener needs the whole
-    // file up front (a sparse-aware copier does, because it will SEEK over the
-    // holes without ever reading). Most openers are allowed straight through
-    // and their reads are handled progressively by pre-content events.
-    // An open by anything other than a sparse-aware copier is allowed here,
-    // without a daemon round-trip: its reads are what drive hydration. Only a
-    // copier — which will SEEK over the holes and never read — needs the whole
-    // file fetched first, and only that case goes to the daemon. This keeps
-    // opening a folder of placeholders fast: one cheap allow per file.
-    if event.is_open {
-        let comm = std::fs::read_to_string(format!("/proc/{}/comm", event.pid))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        if !is_bulk_copier(&comm) {
-            if let Err(e) = shared.fan.respond(fd, true) {
-                tracing::error!(error = %e, "could not answer an open");
-            }
-            return;
-        }
-        tracing::info!(reader = %comm, path = ?event.path, "copier open; hydrating whole file");
-    }
-
-    let (allow, full) = match hydrate(&shared, &event) {
-        Ok(result) => result,
-        Err(e) => {
-            tracing::warn!(error = %e, pid = event.pid, "hydration failed");
-            (false, true)
-        }
-    };
-    // Answered no matter what: an unanswered pre-content event leaves the
-    // reading process blocked forever.
-    if let Err(e) = shared.fan.respond(fd, allow) {
-        tracing::error!(error = %e, "could not answer the blocked reader");
-    }
-    if let Some(path) = &event.path {
-        let _ = shared.send(&Event::Filled {
-            id: 0,
-            ok: allow,
-            path: path.to_string_lossy().into_owned(),
-            full,
-        });
-    }
-}
-
-fn hydrate(shared: &Arc<Shared>, event: &PreContentEvent) -> Result<(bool, bool)> {
-    let Some(path) = &event.path else {
-        bail!("the event carried no resolvable path");
-    };
-
-    let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = mpsc::channel();
-    shared
-        .pending
-        .lock()
-        .unwrap()
-        .insert(id, Pending { reply: tx });
-
-    let reader = std::fs::read_to_string(format!("/proc/{}/comm", event.pid))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let request = Event::Hydrate {
-        id,
-        path: path.to_string_lossy().into_owned(),
-        offset: event.offset,
-        // A zero-length range means the kernel did not say; ask for the whole
-        // file rather than guessing at a window.
-        length: event.length,
-        reader: reader.clone(),
-        is_open: event.is_open,
-    };
-    if let Err(e) = shared.send(&request) {
-        shared.pending.lock().unwrap().remove(&id);
-        return Err(e);
-    }
-
-    let reply = match rx.recv_timeout(HYDRATE_TIMEOUT) {
-        Ok(reply) => reply,
-        Err(_) => {
-            shared.pending.lock().unwrap().remove(&id);
-            bail!("the daemon did not answer within {HYDRATE_TIMEOUT:?}")
-        }
-    };
-    let (staged, offset, full) = match reply {
-        Reply::Fill(path, offset, full) => (path, offset, full),
-        // Browsing sniff of an untouched placeholder: allow, no fill, offline.
-        Reply::AllowEmpty => return Ok((true, false)),
-        Reply::Deny => return Ok((false, true)),
-    };
-
-    let staged_len = std::fs::metadata(&staged)?.len();
-    let target_len = descriptor_len(event.fd.as_raw_fd())?;
-    let expected = if full {
-        target_len
-    } else {
-        event.length.min(target_len.saturating_sub(offset))
-    };
-    if staged_len != expected {
-        let _ = std::fs::remove_file(&staged);
-        bail!(
-            "staged content has {staged_len} bytes, expected {expected} for {}",
-            path.display()
-        );
-    }
-
-    // Written through the event's own descriptor. Any other descriptor would
-    // fault the hole back through this same hook and loop forever.
-    let written = fill_from(&staged, &event.fd, offset)
-        .with_context(|| format!("filling from {}", staged.display()))?;
-    let _ = std::fs::remove_file(&staged);
-    if written != expected {
-        bail!(
-            "filled {written} bytes, expected {expected} for {}",
-            path.display()
-        );
-    }
-
-    if full {
-        // The file now holds its content, so it no longer needs intercepting.
-        if let Err(e) = shared.fan.unwatch(path) {
-            tracing::debug!(path = %path.display(), error = %e, "could not drop the mark");
-        }
-        tracing::info!(path = %path.display(), bytes = written, %reader, pid = event.pid, "hydrated");
-    } else {
-        // Only the requested window was filled; the watch stays, so a reader
-        // that keeps going comes back for the rest.
-        tracing::info!(
-            path = %path.display(),
-            bytes = written,
-            offset,
-            %reader,
-            pid = event.pid,
-            "hydrated range"
-        );
-    }
-    Ok((true, full))
-}
-
-fn descriptor_len(fd: std::os::unix::io::RawFd) -> Result<u64> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `stat` points to writable storage and `fd` belongs to the event.
-    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // SAFETY: fstat succeeded and initialized the structure.
-    let stat = unsafe { stat.assume_init() };
-    Ok(stat.st_size.max(0) as u64)
-}
-
-/// Copy a staged file into the placeholder through the event descriptor,
-/// starting at `offset` within the placeholder.
-fn fill_from(source: &Path, target: &std::os::unix::io::OwnedFd, offset: u64) -> Result<u64> {
-    use std::io::Read;
-    let mut reader = std::fs::File::open(source)?;
-    let mut buf = vec![0u8; 1024 * 1024];
-    let mut offset = offset;
-    let mut total = 0u64;
-
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        let mut written = 0usize;
-        while written < n {
-            // SAFETY: writing `n - written` bytes from a buffer we own into a
-            // descriptor the kernel gave us, at an explicit offset.
-            let rc = unsafe {
-                libc::pwrite(
-                    target.as_raw_fd(),
-                    buf[written..n].as_ptr() as *const libc::c_void,
-                    n - written,
-                    (offset + written as u64) as libc::off_t,
-                )
-            };
-            if rc < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            written += rc as usize;
-        }
-        offset += n as u64;
-        total += n as u64;
-    }
-    Ok(total)
-}
-
-/// Name the process if it is one that should never trigger a download.
-fn background_reader(pid: i32) -> Option<&'static str> {
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    is_background_reader(comm.trim())
-}
-
-/// Fail everything still waiting, so no reader is left blocked.
-fn fail_all_pending(shared: &Arc<Shared>) {
-    let pending: Vec<_> = shared.pending.lock().unwrap().drain().collect();
-    for (_, entry) in pending {
-        let _ = entry.reply.send(Reply::Deny);
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn my_uid() -> u32 {
-        // SAFETY: getuid cannot fail and takes no arguments.
-        unsafe { libc::getuid() }
-    }
-
-    // fill_from is the byte-writing core: it pwrites fetched content into the
-    // placeholder at an explicit offset. A wrong offset or an over-write here
-    // corrupts data beneath every core-level safety net, so it is pinned down.
-
-    #[test]
-    fn fill_from_places_content_at_offset_zero_exactly() {
-        use std::os::unix::io::OwnedFd;
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("staged");
-        let target = dir.path().join("placeholder");
-        std::fs::write(&source, b"the real content").unwrap();
-        // A sparse placeholder the size of the file: zeros to be filled.
-        std::fs::write(&target, vec![0u8; 16]).unwrap();
-
-        let fd: OwnedFd = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&target)
-            .unwrap()
-            .into();
-        let n = fill_from(&source, &fd, 0).unwrap();
-        assert_eq!(n, 16);
-        assert_eq!(std::fs::read(&target).unwrap(), b"the real content");
-    }
-
-    #[test]
-    fn fill_from_lands_a_range_at_its_offset_and_leaves_the_rest() {
-        use std::os::unix::io::OwnedFd;
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("staged");
-        let target = dir.path().join("placeholder");
-        std::fs::write(&source, b"MIDDLE").unwrap();
-        // 32 bytes of 'A'; the fill must touch only [10, 16).
-        std::fs::write(&target, vec![b'A'; 32]).unwrap();
-
-        let fd: OwnedFd = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&target)
-            .unwrap()
-            .into();
-        let n = fill_from(&source, &fd, 10).unwrap();
-        assert_eq!(n, 6);
-
-        let got = std::fs::read(&target).unwrap();
-        assert_eq!(
-            &got[..10],
-            &[b'A'; 10],
-            "bytes before the offset are untouched"
-        );
-        assert_eq!(&got[10..16], b"MIDDLE", "the range landed at its offset");
-        assert_eq!(
-            &got[16..],
-            &[b'A'; 16],
-            "bytes after the range are untouched"
-        );
-        assert_eq!(got.len(), 32, "the file was not grown past its size");
-    }
-
-    #[test]
-    fn the_daemons_own_access_is_never_questioned() {
-        // The deadlock this prevents: the daemon writes to a watched file,
-        // the kernel blocks the write and asks the helper, the helper asks the
-        // daemon — which cannot answer, because it is the blocked write.
-        let shared_pid = 4242;
-        let event_pid = 4242;
-        assert_eq!(shared_pid, event_pid, "same pid must be allowed through");
-        // The real check is `event.pid == client_pid` in handle_event; this
-        // test pins the intent so the guard is not "simplified" away.
-    }
-
-    #[test]
-    fn the_desktop_indexer_is_recognised() {
-        // The case that matters: a placeholder looks like an ordinary file, so
-        // an indexer walking the home directory would download the whole drive.
-        for name in ["localsearch-3", "tracker-miner-f", "baloo_file", "tumblerd"] {
-            assert!(
-                gonedrive_ipc::reader_policy::BACKGROUND_READERS
-                    .iter()
-                    .any(|p| name.starts_with(p)),
-                "{name} should be refused"
-            );
-        }
-    }
-
-    #[test]
-    fn ordinary_applications_are_not_refused() {
-        for name in ["gedit", "libreoffice", "cat", "firefox", "nautilus"] {
-            assert!(
-                !gonedrive_ipc::reader_policy::BACKGROUND_READERS
-                    .iter()
-                    .any(|p| name.starts_with(p)),
-                "{name} must still be able to open its files"
-            );
-        }
-    }
-
-    #[test]
-    fn our_own_process_is_not_a_background_reader() {
-        assert!(background_reader(std::process::id() as i32).is_none());
-    }
-
-    #[test]
-    fn a_dead_process_is_not_claimed() {
-        // A reader that exited between the event and the lookup must not be
-        // matched against a stale name.
-        assert!(background_reader(i32::MAX).is_none());
-    }
-
-    #[test]
-    fn a_users_own_file_is_accepted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mine.bin");
-        std::fs::write(&path, b"x").unwrap();
-        assert!(authorise(&path, my_uid()).is_ok());
-    }
-
-    #[test]
-    fn another_users_file_is_refused() {
-        // This is the whole point of the check: without it, any local user who
-        // can reach the socket can make a root process install marks on files
-        // they do not own.
-        let path = Path::new("/etc/shadow");
-        if !path.exists() {
-            return;
-        }
-        let err = authorise(path, my_uid()).unwrap_err().to_string();
-        assert!(err.contains("belongs to uid"), "{err}");
-    }
-
-    #[test]
-    fn relative_paths_are_refused() {
-        let err = authorise(Path::new("OneDrive/a.bin"), my_uid())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("absolute"), "{err}");
-    }
-
-    #[test]
-    fn parent_directory_traversal_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sub").join("..").join("escape.bin");
-        std::fs::write(dir.path().join("escape.bin"), b"x").unwrap();
-        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
-        // The file resolves, so only the explicit component check stops it.
-        let err = authorise(&path, my_uid()).unwrap_err().to_string();
-        assert!(err.contains("parent-directory"), "{err}");
-    }
-
-    #[test]
-    fn a_missing_file_is_refused_rather_than_assumed_safe() {
-        let err = authorise(Path::new("/nonexistent/nope.bin"), my_uid())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("cannot stat"), "{err}");
-    }
-}
+mod tests;

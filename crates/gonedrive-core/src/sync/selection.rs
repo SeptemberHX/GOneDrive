@@ -11,6 +11,8 @@ use crate::config::Config;
 use crate::db::{Account, ItemRecord, ItemState, OpKind, PinState, Store};
 use crate::error::{Error, Result};
 
+use super::rooted_fs::RootedFs;
+
 /// One row of a browsable listing.
 #[derive(Debug, Clone)]
 pub struct Listing {
@@ -156,6 +158,24 @@ impl Selection {
             .item_at_path(&self.account_id, &root_id, relative)?
             .ok_or_else(|| Error::other(format!("no such path: {}", relative.display())))?;
 
+        // The directory itself first: a pinned but empty folder should still
+        // appear, and downloads below it need somewhere to land.
+        if pin.wants_content() && target.is_folder {
+            if let Some(dir) = self.store.local_path(&account, &target.id)? {
+                let rooted = RootedFs::open(&account.root_local_path)?;
+                rooted.ensure_dir(&dir)?;
+                // The engine re-stamps directories after the transfers land;
+                // this only gets the empty-folder case right.
+                if let Some(mtime) = target.remote_mtime {
+                    let times = std::fs::FileTimes::new()
+                        .set_modified(crate::sync::plan::to_filetime(mtime));
+                    let _ = rooted.set_times(&dir, times);
+                }
+            }
+        }
+
+        // Persist the preference only after all filesystem preconditions have
+        // succeeded, so a failed pin cannot be reported while remaining set.
         self.store.set_pin_state(&target.id, pin)?;
 
         let mut outcome = PinOutcome::default();
@@ -168,19 +188,6 @@ impl Selection {
                     .cancel_ops_in_subtree(&self.account_id, &target.id, OpKind::Download)?
                     as u64;
             return Ok(outcome);
-        }
-
-        // The directory itself first: a pinned but empty folder should still
-        // appear, and downloads below it need somewhere to land.
-        if target.is_folder {
-            if let Some(dir) = self.store.local_path(&account, &target.id)? {
-                std::fs::create_dir_all(&dir)?;
-                // The engine re-stamps directories after the transfers land;
-                // this only gets the empty-folder case right.
-                if let Some(mtime) = target.remote_mtime {
-                    let _ = crate::sync::transfer::set_mtime(&dir, mtime);
-                }
-            }
         }
 
         let files = if target.is_folder {

@@ -14,6 +14,7 @@
 //! whose value we compare against.
 
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 const WIDTH_IN_BITS: usize = 160;
@@ -127,11 +128,25 @@ impl QuickXorHash {
 /// quickXorHash a whole file, streaming so a large file never lands in memory.
 /// Returns the base64 string, comparable directly to `items.quickxor`.
 pub fn quick_xor_file(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    quick_xor_reader(&mut file)
+}
+
+/// quickXorHash bytes from an already-authorised descriptor.
+pub fn quick_xor_reader(reader: &mut impl Read) -> std::io::Result<String> {
     let mut hasher = QuickXorHash::new();
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
-        let n = file.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }

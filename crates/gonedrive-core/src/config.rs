@@ -59,8 +59,13 @@ pub struct Config {
     /// How often to poll `/delta` while the user is active.
     pub poll_interval_secs: u64,
 
-    /// Ceiling the poll interval backs off to while idle.
+    /// Ceiling for retry backoff after remote polling errors. Successful idle
+    /// polls stay on `poll_interval_secs` so cloud changes have bounded delay.
     pub max_poll_interval_secs: u64,
+
+    /// Low-frequency whole-tree verification for events missed while stopped
+    /// or after an inotify overflow.
+    pub full_scan_interval_secs: u64,
 
     /// Quiet period a local file must have before it is queued for upload.
     pub local_debounce_ms: u64,
@@ -107,12 +112,12 @@ pub struct Config {
     /// choose, then transfer.
     pub download_new: DownloadPolicy,
 
-    /// Mass-deletion safety valve. A single scan that would delete more than
-    /// `mass_delete_min` items *and* more than this fraction of everything on
-    /// record is treated as accidental data loss (a vanished mount, a bad
-    /// bind, an `rm -rf` the user did not mean to propagate): the deletions are
-    /// held and the user is asked to confirm rather than executed. `1.0`
-    /// disables the fraction test.
+    /// Mass-deletion safety valve. Pending deletion batches that together
+    /// would delete more than `mass_delete_min` items *and* more than this
+    /// fraction of everything on record are treated as accidental data loss
+    /// (a vanished mount, a bad bind, an `rm -rf` the user did not mean to
+    /// propagate): the deletions are held and the user is asked to confirm
+    /// rather than executed. `1.0` disables the fraction test.
     pub mass_delete_fraction: f64,
     /// The floor below which the fraction test never trips, so deleting a few
     /// files out of a small drive is never second-guessed.
@@ -142,6 +147,7 @@ impl DownloadPolicy {
 
 /// Graph requires resumable upload chunks to be a multiple of this.
 pub const UPLOAD_CHUNK_GRANULARITY: u64 = 320 * 1024;
+const MAX_UPLOAD_CHUNK_SIZE: u64 = 60 * 1024 * 1024;
 
 impl Default for Config {
     fn default() -> Self {
@@ -150,6 +156,7 @@ impl Default for Config {
             sync_root: default_sync_root(),
             poll_interval_secs: 30,
             max_poll_interval_secs: 300,
+            full_scan_interval_secs: 30 * 60,
             local_debounce_ms: 500,
             upload_session_threshold: 4 * 1024 * 1024,
             upload_chunk_size: 10 * 1024 * 1024, // 32 x 320 KiB
@@ -237,6 +244,12 @@ impl Config {
                 self.upload_chunk_size
             )));
         }
+        if self.upload_chunk_size >= MAX_UPLOAD_CHUNK_SIZE {
+            return Err(Error::Config(format!(
+                "upload_chunk_size must be less than {} MiB",
+                MAX_UPLOAD_CHUNK_SIZE / 1024 / 1024
+            )));
+        }
         if self.upload_session_threshold > 4 * 1024 * 1024 {
             return Err(Error::Config(
                 "upload_session_threshold cannot exceed 4 MiB; Graph rejects larger simple uploads"
@@ -247,6 +260,18 @@ impl Config {
             return Err(Error::Config(
                 "poll_interval_secs must be non-zero and no greater than max_poll_interval_secs"
                     .into(),
+            ));
+        }
+        if self.full_scan_interval_secs == 0 {
+            return Err(Error::Config(
+                "full_scan_interval_secs must be non-zero".into(),
+            ));
+        }
+        if !self.mass_delete_fraction.is_finite()
+            || !(0.0..=1.0).contains(&self.mass_delete_fraction)
+        {
+            return Err(Error::Config(
+                "mass_delete_fraction must be between 0.0 and 1.0".into(),
             ));
         }
         Ok(())
@@ -298,26 +323,47 @@ pub fn runtime_dir() -> PathBuf {
 }
 
 fn uid() -> u32 {
-    // Avoiding a libc dependency in this crate for one number.
-    std::fs::read_to_string("/proc/self/loginuid")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .filter(|&u| u != u32::MAX)
-        .unwrap_or(1000)
+    // SAFETY: geteuid has no arguments and cannot fail. `loginuid` is an audit
+    // identity and is commonly unset in containers; using it here once made
+    // unrelated users fall back to the same predictable /tmp directory.
+    unsafe { libc::geteuid() }
 }
 
 /// Create every directory the daemon writes to, with private permissions.
 pub fn ensure_dirs() -> Result<()> {
+    // XDG_RUNTIME_DIR is normally created securely by the login manager. Its
+    // /tmp fallback needs an owned, private parent too; otherwise another uid
+    // could pre-create the predictable directory and replace children in it.
+    if dirs::runtime_dir().is_none() {
+        let fallback = PathBuf::from(format!("/tmp/gonedrive-{}", uid()));
+        ensure_private_dir(&fallback)?;
+    }
     for dir in [config_dir(), data_dir(), cache_dir(), runtime_dir()] {
-        std::fs::create_dir_all(&dir)?;
-        restrict(&dir)?;
+        ensure_private_dir(&dir)?;
     }
     Ok(())
 }
 
-fn restrict(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    std::fs::create_dir_all(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::Config(format!(
+            "{} must be a real directory, not a symlink or special file",
+            path.display()
+        )));
+    }
+    if metadata.uid() != uid() {
+        return Err(Error::Config(format!(
+            "{} belongs to uid {}, expected {}",
+            path.display(),
+            metadata.uid(),
+            uid()
+        )));
+    }
+    let mut perms = metadata.permissions();
     perms.set_mode(0o700);
     std::fs::set_permissions(path, perms)?;
     Ok(())
@@ -338,6 +384,17 @@ mod tests {
     }
 
     #[test]
+    fn private_directories_never_follow_a_final_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let link = root.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(ensure_private_dir(&link).is_err());
+    }
+
+    #[test]
     fn rejects_misaligned_chunk_size() {
         let cfg = Config {
             client_id: "test".into(),
@@ -347,6 +404,17 @@ mod tests {
             ..Config::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_graphs_maximum_chunk_size() {
+        let cfg = Config {
+            client_id: "test".into(),
+            upload_chunk_size: MAX_UPLOAD_CHUNK_SIZE,
+            ..Config::default()
+        };
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("less than 60 MiB"), "{error}");
     }
 
     #[test]
@@ -393,6 +461,30 @@ mod tests {
             ..Config::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_a_disabled_full_scan_backstop() {
+        let cfg = Config {
+            client_id: "test".into(),
+            full_scan_interval_secs: 0,
+            ..Config::default()
+        };
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("full_scan_interval_secs"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_mass_delete_fraction_that_cannot_guard() {
+        for fraction in [-0.1, 1.1, f64::NAN] {
+            let cfg = Config {
+                client_id: "test".into(),
+                mass_delete_fraction: fraction,
+                ..Config::default()
+            };
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("mass_delete_fraction"), "{error}");
+        }
     }
 
     #[test]

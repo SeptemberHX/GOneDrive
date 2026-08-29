@@ -114,6 +114,9 @@ mod tests {
             io::ErrorKind::BrokenPipe,
             io::ErrorKind::TimedOut,
             io::ErrorKind::Interrupted,
+            // Used when a local inode changes during a transfer. Retrying is
+            // required so the queue does not abandon the user's newer edit.
+            io::ErrorKind::WouldBlock,
         ] {
             assert!(
                 Error::Io(io::Error::from(kind)).is_transient(),

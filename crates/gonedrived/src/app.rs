@@ -1,7 +1,13 @@
 //! The daemon supervisor: owns the engines, the poll loop and the status.
 
+mod coordinator;
+mod hydration;
+
+#[cfg(test)]
+use coordinator::{outbound_scope, sync_barrier_ready};
+
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -9,10 +15,10 @@ use anyhow::{Context, Result};
 use gonedrive_core::config::Config;
 use gonedrive_core::db::Store;
 use gonedrive_core::graph::GraphClient;
-use gonedrive_core::sync::engine::{Direction, Engine, SyncEvent};
+use gonedrive_core::sync::engine::{Direction, Engine, SafetyStopKind, SyncEvent};
 use gonedrive_core::{Authenticator, Error, TokenStore};
 use gonedrive_ipc::reader_policy::{is_browsing_reader, is_bulk_copier};
-use gonedrive_ipc::{AccountInfo, Activity, Hydration, SyncStatus};
+use gonedrive_ipc::{AccountInfo, Hydration, SyncRequestResult, SyncStatus};
 
 /// A head-read at or below this is served as a range, not a download: it is the
 /// signature of content sniffing, and even when it is not, filling just the
@@ -79,15 +85,16 @@ fn decide_stage(
 }
 use tokio::sync::{broadcast, Mutex, Notify, OwnedMutexGuard, RwLock};
 
-/// How much the poll interval grows after a pass that found nothing.
-const IDLE_BACKOFF: f64 = 1.5;
-
 /// Anything the front ends care about.
 #[derive(Debug, Clone)]
 pub enum DaemonEvent {
     Status(SyncStatus),
     LoginCompleted(String),
     LoginFailed(String),
+    SyncRequestCompleted {
+        generation: u64,
+        result: SyncRequestResult,
+    },
     Conflict {
         original: String,
         copy: String,
@@ -150,9 +157,13 @@ pub struct App {
     pub http: reqwest::Client,
     engines: RwLock<HashMap<String, Arc<Engine>>>,
     status: Arc<RwLock<SyncStatus>>,
-    paused: AtomicBool,
+    paused: Arc<AtomicBool>,
+    approve_mass_delete_on_resume: Arc<AtomicBool>,
+    force_full_scan: AtomicBool,
     /// Wakes the poll loop early: a local change, or an explicit SyncNow.
     pub wake: Arc<Notify>,
+    next_sync_generation: AtomicU64,
+    requested_sync_generation: AtomicU64,
     /// Placeholders being filled right now, keyed by absolute path.
     hydrations: Arc<RwLock<HashMap<std::path::PathBuf, InFlight>>>,
     hydration_locks: PathLocks,
@@ -186,8 +197,12 @@ impl App {
             http: build_http_client()?,
             engines: RwLock::new(HashMap::new()),
             status: Arc::new(RwLock::new(SyncStatus::idle(0))),
-            paused: AtomicBool::new(false),
+            paused: Arc::new(AtomicBool::new(false)),
+            approve_mass_delete_on_resume: Arc::new(AtomicBool::new(false)),
+            force_full_scan: AtomicBool::new(false),
             wake: Arc::new(Notify::new()),
+            next_sync_generation: AtomicU64::new(1),
+            requested_sync_generation: AtomicU64::new(0),
             hydrations: Arc::new(RwLock::new(HashMap::new())),
             hydration_locks: PathLocks::default(),
             hsm: RwLock::new(None),
@@ -306,14 +321,18 @@ impl App {
         let shared = self.status.clone();
         let hydrations = self.hydrations.clone();
         let store = self.store.clone();
+        let paused = self.paused.clone();
+        let approve_mass_delete_on_resume = self.approve_mass_delete_on_resume.clone();
 
         tokio::spawn(async move {
             let mut current = SyncStatus::idle(0);
+            let mut active_phases = 0u64;
             loop {
                 match rx.recv().await {
                     Ok(event) => {
                         match event {
                             SyncEvent::Started => {
+                                active_phases = active_phases.saturating_add(1);
                                 current.state = "syncing".into();
                                 current.last_error.clear();
                             }
@@ -368,7 +387,11 @@ impl App {
                                     .await;
                                 let _ = sender.send(DaemonEvent::ItemFailed { name, error });
                             }
-                            SyncEvent::SafetyStop { reason } => {
+                            SyncEvent::SafetyStop { reason, kind } => {
+                                paused.store(true, Ordering::Release);
+                                if kind == SafetyStopKind::MassDelete {
+                                    approve_mass_delete_on_resume.store(true, Ordering::Release);
+                                }
                                 current.state = "paused".into();
                                 current.last_error = reason.clone();
                                 record_activity(
@@ -379,7 +402,6 @@ impl App {
                                 )
                                 .await;
                                 let _ = sender.send(DaemonEvent::SafetyStop { reason });
-                                continue;
                             }
                             SyncEvent::HydrationStarted { path, name, size } => {
                                 let hydration = Hydration {
@@ -435,6 +457,7 @@ impl App {
                                 continue;
                             }
                             SyncEvent::Finished(summary) => {
+                                active_phases = active_phases.saturating_sub(1);
                                 // One line per pass with every counter: the
                                 // log alone should answer "what did that sync
                                 // just do", without anyone reproducing it.
@@ -450,11 +473,15 @@ impl App {
                                         "sync pass finished"
                                     );
                                 }
-                                current.state = "idle".into();
+                                current.state =
+                                    phase_state(paused.load(Ordering::Acquire), active_phases)
+                                        .into();
                                 current.pending = summary.still_queued;
-                                current.current_item.clear();
-                                current.transferred = 0;
-                                current.total = 0;
+                                if active_phases == 0 {
+                                    current.current_item.clear();
+                                    current.transferred = 0;
+                                    current.total = 0;
+                                }
                             }
                         }
                         *shared.write().await = current.clone();
@@ -471,6 +498,14 @@ impl App {
 
     pub async fn status(&self) -> SyncStatus {
         self.status.read().await.clone()
+    }
+
+    pub fn request_sync(&self) -> u64 {
+        let generation = self.next_sync_generation.fetch_add(1, Ordering::Relaxed);
+        self.requested_sync_generation
+            .fetch_max(generation, Ordering::Release);
+        self.wake.notify_one();
+        generation
     }
 
     async fn set_state(&self, state: &str, error: Option<String>) {
@@ -495,6 +530,15 @@ impl App {
         if paused {
             self.set_state("paused", None).await;
         } else {
+            if self
+                .approve_mass_delete_on_resume
+                .swap(false, Ordering::AcqRel)
+            {
+                for engine in self.engines.read().await.values() {
+                    engine.approve_next_mass_delete();
+                }
+                self.force_full_scan.store(true, Ordering::Release);
+            }
             self.set_state("idle", None).await;
             self.wake.notify_one();
         }
@@ -528,506 +572,6 @@ impl App {
         self.emit(DaemonEvent::LoginFailed(message.to_string()));
     }
 
-    /// Stage what a blocked reader needs. Returns the staged path, the
-    /// placement offset, and whether it completes the file.
-    ///
-    /// Two rules decide, in order:
-    ///
-    /// * **Who is reading.** A file manager reads files to *describe* them,
-    ///   not to use them; whatever it asks for is served as a range and the
-    ///   file's state never changes. Without this, looking at a folder of
-    ///   small files flips every one of them to "downloaded" — silently
-    ///   reversing the user's explicit online-only choice, which is precisely
-    ///   the complaint that shaped this function.
-    /// * **How much is asked.** For everyone else, a small head-read is served
-    ///   as a range; anything more is a real consumer and hydrates the file,
-    ///   the way Windows does it.
-    pub async fn stage_for(
-        &self,
-        path: &std::path::Path,
-        offset: u64,
-        length: u64,
-        reader: &str,
-        is_open: bool,
-        allow_partial: bool,
-    ) -> Result<Option<(std::path::PathBuf, u64, bool)>> {
-        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let plan = decide_stage(is_open, reader, offset, length, size, allow_partial);
-        if plan == StagePlan::AllowOpen {
-            return Ok(None);
-        }
-        let cancel = self.begin_hydration(path).await;
-
-        let result = match plan {
-            // Let the open proceed untouched; the reads that follow drive
-            // hydration. Keeps a media player streaming instead of pulling the
-            // whole file just to read a header.
-            StagePlan::AllowOpen => unreachable!(),
-            // A sparse-aware copier (on open) or a consumer past the head:
-            // give it the whole file before it looks.
-            StagePlan::Full => self
-                .stage_content(path, cancel)
-                .await
-                .map(|staged| Some((staged, 0, true))),
-            // Browsing: serve the window only if it is already on disk from a
-            // real earlier read; otherwise allow the read against the sparse
-            // file with no network. The type comes from the name, as on Windows.
-            StagePlan::BrowseLocal { offset, length } => {
-                let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-                if let Some(engine) = engines.first() {
-                    if let Ok(Some(staged)) =
-                        engine.stage_range_if_local(path, offset, length).await
-                    {
-                        Ok(Some((staged, offset, false)))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    Ok(None)
-                }
-            }
-            // The first head-read of a consumer: fetch just that window.
-            StagePlan::Range { offset, length } => {
-                let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-                match engines.first() {
-                    Some(engine) => engine
-                        .stage_range(path, offset, length)
-                        .await
-                        .map(|staged| Some((staged, offset, false)))
-                        .map_err(anyhow::Error::from),
-                    None => Err(anyhow::anyhow!("no account is signed in")),
-                }
-            }
-        };
-        if result.is_err() {
-            self.hydrations.write().await.remove(path);
-        } else if let Ok(Some((staged, _, _))) = &result {
-            if let Some(entry) = self.hydrations.write().await.get_mut(path) {
-                entry.staged = Some(staged.clone());
-            }
-        }
-        result
-    }
-
-    /// Download a placeholder's content to a staging file for the helper.
-    async fn stage_content(
-        &self,
-        path: &std::path::Path,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
-    ) -> Result<std::path::PathBuf> {
-        self.show_progress_soon(path.to_path_buf());
-
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let mut last = None;
-        for engine in engines {
-            match engine.stage_content_cancellable(path, cancel.clone()).await {
-                Ok(staged) => return Ok(staged),
-                Err(Error::Other(message)) => last = Some(message),
-                Err(e) => return Err(e.into()),
-            }
-        }
-        anyhow::bail!(
-            "no account owns {}{}",
-            path.display(),
-            last.map(|m| format!(" ({m})")).unwrap_or_default()
-        )
-    }
-
-    async fn begin_hydration(&self, path: &std::path::Path) -> Arc<std::sync::atomic::AtomicBool> {
-        let guard = self.hydration_locks.acquire(path).await;
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.hydrations.write().await.insert(
-            path.to_path_buf(),
-            InFlight {
-                hydration: Hydration {
-                    path: path.to_string_lossy().into_owned(),
-                    name: path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    transferred: 0,
-                    total: 0,
-                },
-                cancel: cancel.clone(),
-                staged: None,
-                _path_guard: guard,
-            },
-        );
-        cancel
-    }
-
-    /// What was synced recently, newest first.
-    pub async fn recent_activity(&self) -> Vec<Activity> {
-        self.store
-            .recent_activity(ACTIVITY_LIMIT as i64)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|row| Activity {
-                kind: row.kind,
-                name: row.name,
-                detail: row.detail,
-                when: row.when,
-            })
-            .collect()
-    }
-
-    /// Placeholders being filled right now.
-    pub async fn active_hydrations(&self) -> Vec<Hydration> {
-        self.hydrations
-            .read()
-            .await
-            .values()
-            .map(|entry| entry.hydration.clone())
-            .collect()
-    }
-
-    /// Abandon a hydration. The blocked reader gets an I/O error.
-    pub async fn cancel_hydration(&self, path: &std::path::Path) -> bool {
-        match self.hydrations.read().await.get(path) {
-            Some(entry) => {
-                entry.cancel.store(true, Ordering::Relaxed);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Remove the exact unique hand-off file used by this request. The helper
-    /// normally removes it first; this is the daemon-side cleanup for an older
-    /// helper or a failed unlink.
-    pub async fn cleanup_hydration_staging(&self, path: &std::path::Path) {
-        let staged = self
-            .hydrations
-            .write()
-            .await
-            .get_mut(path)
-            .and_then(|entry| entry.staged.take());
-        if let Some(staged) = staged {
-            let _ = std::fs::remove_file(staged);
-        }
-    }
-
-    /// Put a progress window on screen if this hydration is still running a
-    /// moment from now.
-    ///
-    /// The delay is what keeps small files from flashing a window open and
-    /// shut: most hydrations finish before anyone could read the title.
-    fn show_progress_soon(&self, path: std::path::PathBuf) {
-        const DELAY: Duration = Duration::from_millis(400);
-        let hydrations = self.hydrations.clone();
-
-        let monitor = self.monitor.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(DELAY).await;
-            if !hydrations.read().await.contains_key(&path) {
-                return; // finished before anyone would have noticed
-            }
-            ensure_progress_window(&monitor);
-        });
-    }
-
-    /// Record that the helper finished filling a placeholder.
-    pub async fn finish_hydration(&self, path: &std::path::Path) -> Result<()> {
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let mut result = Ok(());
-        for engine in engines {
-            if let Err(error) = engine.finish_hydration(path) {
-                result = Err(error.into());
-                break;
-            }
-        }
-        self.hydrations.write().await.remove(path);
-        result
-    }
-
-    /// Release a failed per-path hydration and put its database state back to
-    /// dehydrated so a later reader can retry it.
-    pub async fn fail_hydration(&self, path: &std::path::Path) -> Result<()> {
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        for engine in engines {
-            if engine.fail_hydration(path).is_ok() {
-                break;
-            }
-        }
-        self.hydrations.write().await.remove(path);
-        Ok(())
-    }
-
-    /// Put a placeholder's mtime back after a partial range fill moved it.
-    pub async fn restore_mtime(&self, path: &std::path::Path) -> Result<()> {
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        for engine in engines {
-            if engine.restore_mtime(path).is_ok() {
-                break;
-            }
-        }
-        self.hydrations.write().await.remove(path);
-        Ok(())
-    }
-
-    /// Fill a placeholder directly (FetchNow, the CLI, the context menu).
-    ///
-    /// The file may be under a kernel watch, and the daemon's writes are not
-    /// exempt from it — writing into the holes would fire the very hook that
-    /// asks us to hydrate, and a second download would race this one over the
-    /// same bytes. So the watch comes off first; it goes back on only if the
-    /// fill fails and the file is still empty.
-    pub async fn hydrate(&self, path: &std::path::Path) -> Result<u64> {
-        let hsm = self.hsm.read().await.clone();
-        if let Some(hsm) = &hsm {
-            hsm.unwatch(path).await.with_context(|| {
-                format!("could not suspend interception for {}", path.display())
-            })?;
-        }
-
-        let result = self.hydrate_inner(path).await;
-
-        if result.is_err() {
-            if let Some(hsm) = &hsm {
-                if gonedrive_core::hydrate::Placeholder::state(path)
-                    == gonedrive_core::hydrate::PlaceholderState::Dehydrated
-                {
-                    if let Err(error) = hsm.watch(path).await {
-                        tracing::error!(path = %path.display(), %error, "could not restore interception");
-                    }
-                }
-            }
-        }
-        result
-    }
-
-    async fn hydrate_inner(&self, path: &std::path::Path) -> Result<u64> {
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        // The single-account case is the real one; report its real error
-        // rather than collapsing everything into "no account owns this".
-        if engines.len() == 1 {
-            return Ok(engines[0].hydrate(path).await?);
-        }
-        for engine in engines {
-            match engine.hydrate(path).await {
-                Ok(bytes) => return Ok(bytes),
-                Err(Error::Other(_)) => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        anyhow::bail!("no account owns {}", path.display())
-    }
-
-    pub async fn set_hsm(&self, client: Option<Arc<crate::hsm_client::HsmClient>>) {
-        if client.is_none() {
-            let mut hydrations = self.hydrations.write().await;
-            for entry in hydrations.values() {
-                entry.cancel.store(true, Ordering::Relaxed);
-            }
-            hydrations.clear();
-        }
-        *self.hsm.write().await = client;
-    }
-
-    /// Remove a dehydrated file that the helper could not mark. Leaving it on
-    /// disk would expose sparse zeroes as real content; the remote record stays
-    /// so a later successful materialisation can recreate it.
-    pub async fn discard_unwatched_placeholder(&self, path: &std::path::Path) -> Result<()> {
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        for engine in engines {
-            if engine.discard_unwatched_placeholder(path).is_ok() {
-                return Ok(());
-            }
-        }
-        anyhow::bail!("no account owns {}", path.display())
-    }
-
-    /// Present the whole drive as a browsable placeholder tree.
-    ///
-    /// Runs on a blocking thread — it can touch a hundred thousand files — and
-    /// registers every resulting placeholder with the helper. Safe to call
-    /// repeatedly: existing files are left untouched.
-    pub async fn materialize_tree(self: &Arc<Self>) -> Result<u64> {
-        let hsm = self.require_hsm().await?;
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let engine = engines
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?
-            .clone();
-
-        tracing::info!("materialising the drive as a placeholder tree");
-        let paths = tokio::task::spawn_blocking(move || {
-            engine.materialize_all(|done, total| {
-                if done % 5000 == 0 || done == total {
-                    tracing::info!(done, total, "materialising");
-                }
-                true
-            })
-        })
-        .await??;
-
-        let count = paths.len() as u64;
-        self.protect_placeholders(&hsm, &paths).await?;
-        tracing::info!(placeholders = count, "placeholder tree ready");
-        Ok(count)
-    }
-
-    /// Turn a downloaded subtree back into placeholders.
-    ///
-    /// Refused outright without the helper. A placeholder nothing is watching
-    /// reads back as zeroes — silently, with no error — and an application that
-    /// opens one and saves it destroys the real content and uploads the
-    /// wreckage. Refusing to free space is a far better outcome than that.
-    pub async fn free_space(
-        &self,
-        relative: &std::path::Path,
-    ) -> Result<gonedrive_core::sync::FreeSpaceOutcome> {
-        let hsm = self.require_hsm().await?;
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let engine = engines
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
-
-        // Install every mark before punching the first hole. The helper admits
-        // the daemon's own pid, so keeping the mark through fallocate is safe;
-        // publishing holes first and discovering fanotify_mark failed is not.
-        let candidates = engine.subtree_local_files(relative)?;
-        let mut newly_protected: Vec<(std::path::PathBuf, bool)> = Vec::new();
-        for path in &candidates {
-            let was_dehydrated = gonedrive_core::hydrate::Placeholder::state(path)
-                == gonedrive_core::hydrate::PlaceholderState::Dehydrated;
-            if let Err(error) = hsm.watch(path).await {
-                for (protected, was_dehydrated) in newly_protected {
-                    if !was_dehydrated {
-                        let _ = hsm.unwatch(&protected).await;
-                    }
-                }
-                return Err(error).with_context(|| {
-                    format!("could not protect {} before freeing it", path.display())
-                });
-            }
-            newly_protected.push((path.clone(), was_dehydrated));
-        }
-        let outcome = engine.free_space(relative)?;
-        // Files the safety checks skipped remain hydrated and should not keep a
-        // permission mark. Successfully dehydrated files retain the mark that
-        // was installed before their blocks were released.
-        for path in candidates {
-            if gonedrive_core::hydrate::Placeholder::state(&path)
-                != gonedrive_core::hydrate::PlaceholderState::Dehydrated
-            {
-                if let Err(e) = hsm.unwatch(&path).await {
-                    tracing::warn!(path = %path.display(), error = %e, "could not remove unused mark");
-                }
-            }
-        }
-        Ok(outcome)
-    }
-
-    /// Whether the files-on-demand helper is connected.
-    pub async fn on_demand_ready(&self) -> bool {
-        self.hsm.read().await.is_some()
-    }
-
-    async fn require_hsm(&self) -> Result<Arc<crate::hsm_client::HsmClient>> {
-        self.hsm.read().await.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "files on demand is not available: the helper is not running.\n\
-                 Start it with `sudo gonedrive-hsm`. Without it a placeholder \
-                 would read back as empty rather than fetching its content."
-            )
-        })
-    }
-
-    /// One level of the drive, with each entry's effective selection.
-    pub async fn list_folder(
-        &self,
-        relative: &std::path::Path,
-    ) -> Result<Vec<gonedrive_ipc::FolderEntry>> {
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let engine = engines
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
-        Ok(engine
-            .list(relative)?
-            .into_iter()
-            .map(|entry| gonedrive_ipc::FolderEntry {
-                name: entry.item.name,
-                is_folder: entry.item.is_folder,
-                selected: entry.pin.wants_content(),
-                explicit: entry.explicit,
-                bytes: entry.bytes,
-                files: entry.files,
-            })
-            .collect())
-    }
-
-    /// Choose whether a path's content is kept on this device.
-    pub async fn set_pin(
-        &self,
-        relative: &std::path::Path,
-        pin: gonedrive_core::db::PinState,
-    ) -> Result<gonedrive_core::sync::PinOutcome> {
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let engine = engines
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
-        Ok(engine.set_pin(relative, pin)?)
-    }
-
-    /// Create placeholders for never-downloaded files in a subtree.
-    pub async fn make_on_demand(
-        &self,
-        relative: &std::path::Path,
-    ) -> Result<gonedrive_core::sync::FreeSpaceOutcome> {
-        let hsm = self.require_hsm().await?;
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let engine = engines
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
-
-        let outcome = engine.make_on_demand(relative)?;
-        self.protect_placeholders(&hsm, &outcome.paths).await?;
-        Ok(outcome)
-    }
-
-    /// Protect a batch, removing every not-yet-protected placeholder if one
-    /// mark fails. A zero-readable sparse file must never outlive a partial
-    /// registration attempt.
-    async fn protect_placeholders(
-        &self,
-        hsm: &crate::hsm_client::HsmClient,
-        paths: &[std::path::PathBuf],
-    ) -> Result<()> {
-        for (index, path) in paths.iter().enumerate() {
-            if let Err(error) = hsm.watch(path).await {
-                let mut cleanup_errors = Vec::new();
-                for unprotected in &paths[index..] {
-                    if let Err(cleanup_error) =
-                        self.discard_unwatched_placeholder(unprotected).await
-                    {
-                        cleanup_errors.push(format!("{}: {cleanup_error}", unprotected.display()));
-                    }
-                }
-                let cleanup = if cleanup_errors.is_empty() {
-                    String::new()
-                } else {
-                    format!("; cleanup also failed for {}", cleanup_errors.join(", "))
-                };
-                return Err(error).with_context(|| {
-                    format!("could not protect placeholder {}{cleanup}", path.display())
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Placeholders on disk that still need intercepting.
-    pub async fn dehydrated_paths(&self) -> Result<Vec<std::path::PathBuf>> {
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let mut out = Vec::new();
-        for engine in engines {
-            out.extend(engine.dehydrated_paths()?);
-        }
-        Ok(out)
-    }
-
     /// Work through queued transfers only, skipping enumeration.
     pub async fn transfer_all(&self) -> Result<()> {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
@@ -1045,7 +589,7 @@ impl App {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         let mut did_work = false;
 
-        for engine in engines {
+        for engine in &engines {
             match engine.sync_once().await {
                 Ok(summary) => {
                     did_work |= summary.downloaded > 0
@@ -1068,15 +612,9 @@ impl App {
                 }
             }
         }
-        // Delta application may have created new dehydrated files after the
-        // helper's startup reconciliation. Register them before returning the
-        // pass; HsmClient tracks existing marks, so this is incremental even
-        // though the source of truth is scanned here.
-        if let Some(hsm) = self.hsm.read().await.clone() {
-            if let Err(error) = hsm.watch_all(self).await {
-                tracing::error!(%error, "could not register new placeholders");
-                self.set_state("error", Some(error.to_string())).await;
-            }
+        if let Err(error) = self.register_pending_placeholders(&engines).await {
+            tracing::error!(%error, "could not register new placeholders");
+            self.set_state("error", Some(error.to_string())).await;
         }
         did_work
     }
@@ -1140,49 +678,15 @@ impl App {
             }
         }
     }
+}
 
-    /// The poll loop. Runs until `shutdown` resolves.
-    ///
-    /// The interval backs off while nothing is happening so an idle client is
-    /// not hitting the service every 30 seconds all day, and snaps back to the
-    /// configured interval the moment a pass does real work.
-    pub async fn run(self: Arc<Self>, shutdown: impl std::future::Future<Output = ()>) {
-        let base = Duration::from_secs(self.config.poll_interval_secs);
-        let ceiling = Duration::from_secs(self.config.max_poll_interval_secs);
-        let mut interval = base;
-        tokio::pin!(shutdown);
-
-        loop {
-            if !self.is_paused() {
-                interval = if self.sync_all().await {
-                    base
-                } else {
-                    ceiling.min(interval.mul_f64(IDLE_BACKOFF))
-                };
-                self.auto_free_if_low().await;
-            }
-
-            tokio::select! {
-                _ = &mut shutdown => {
-                    tracing::info!("shutting down");
-                    return;
-                }
-                _ = tokio::time::sleep(interval) => {}
-                _ = self.wake.notified() => {
-                    // A local change or an explicit request: resume the tight
-                    // cadence rather than staying backed off. The extra beat
-                    // matters: a pass's own writes (deletes landing, downloads
-                    // renaming into place) re-arm the wake, and without it the
-                    // loop tail-chases itself at full speed until the queue
-                    // drains — a delta request every 700ms, observed live.
-                    tokio::time::sleep(Duration::from_millis(
-                        self.config.local_debounce_ms,
-                    ))
-                    .await;
-                    interval = base;
-                }
-            }
-        }
+fn phase_state(paused: bool, active_phases: u64) -> &'static str {
+    if paused {
+        "paused"
+    } else if active_phases == 0 {
+        "idle"
+    } else {
+        "syncing"
     }
 }
 
@@ -1234,14 +738,15 @@ fn ensure_progress_window(monitor: &Arc<std::sync::Mutex<Option<std::process::Ch
             return; // still running
         }
     }
-    let spawned = std::process::Command::new("gonedrive")
+    let Some(executable) = std::env::current_exe()
+        .ok()
+        .map(|path| path.with_file_name("gonedrive"))
+    else {
+        return;
+    };
+    let spawned = std::process::Command::new(executable)
         .arg("--hydration-monitor")
-        .spawn()
-        .or_else(|_| {
-            std::process::Command::new("./target/release/gonedrive")
-                .arg("--hydration-monitor")
-                .spawn()
-        });
+        .spawn();
     match spawned {
         Ok(child) => *slot = Some(child),
         Err(e) => tracing::debug!(error = %e, "no progress window available"),
@@ -1249,144 +754,4 @@ fn ensure_progress_window(monitor: &Arc<std::sync::Mutex<Option<std::process::Ch
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use super::{
-        decide_stage, is_browsing_reader, PathLocks, StagePlan, PARTIAL_HYDRATION_CEILING,
-    };
-
-    #[tokio::test]
-    async fn hydration_locks_cover_the_whole_request_for_one_path() {
-        let locks = Arc::new(PathLocks::default());
-        let first = locks.acquire(std::path::Path::new("/tmp/a")).await;
-        let waiting_locks = locks.clone();
-        let mut second =
-            tokio::spawn(
-                async move { waiting_locks.acquire(std::path::Path::new("/tmp/a")).await },
-            );
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut second)
-                .await
-                .is_err(),
-            "a second fill of the same path must wait"
-        );
-        drop(first);
-        tokio::time::timeout(Duration::from_secs(1), second)
-            .await
-            .expect("second request should proceed after Filled releases the first")
-            .unwrap();
-    }
-
-    #[test]
-    fn a_bulk_copier_hydrates_fully_on_open_but_others_pass_through() {
-        // cp/tar would SEEK over the holes and copy zeros, so they get the whole
-        // file on open; a normal open is allowed and its reads drive the rest.
-        assert_eq!(decide_stage(true, "cp", 0, 0, 1000, true), StagePlan::Full);
-        assert_eq!(decide_stage(true, "tar", 0, 0, 1000, true), StagePlan::Full);
-        assert_eq!(
-            decide_stage(true, "vlc", 0, 0, 1000, true),
-            StagePlan::AllowOpen
-        );
-        assert_eq!(
-            decide_stage(true, "gedit", 0, 0, 1000, true),
-            StagePlan::AllowOpen
-        );
-    }
-
-    #[test]
-    fn browsing_reads_are_served_local_or_offline_never_downloaded() {
-        // A thumbnailer sniffing a head must never reach the network.
-        assert_eq!(
-            decide_stage(false, "gdk-pixbuf-thum", 0, 4096, 1_000_000, true),
-            StagePlan::BrowseLocal {
-                offset: 0,
-                length: 4096
-            }
-        );
-        // A zero-length browse sniff still asks for at least one byte.
-        assert_eq!(
-            decide_stage(false, "nautilus", 0, 0, 1_000_000, true),
-            StagePlan::BrowseLocal {
-                offset: 0,
-                length: 1
-            }
-        );
-    }
-
-    #[test]
-    fn a_consumers_first_head_read_is_a_range_then_it_escalates() {
-        // Small head-read at offset 0: just the window.
-        assert_eq!(
-            decide_stage(false, "sha256sum", 0, 65536, 1_000_000, true),
-            StagePlan::Range {
-                offset: 0,
-                length: 65536
-            }
-        );
-        // Coming back for offset > 0 is sequential reading: hydrate fully.
-        assert_eq!(
-            decide_stage(false, "sha256sum", 65536, 65536, 1_000_000, true),
-            StagePlan::Full
-        );
-        // A head-read above the ceiling is a real read, not a sniff: full.
-        assert_eq!(
-            decide_stage(
-                false,
-                "cat",
-                0,
-                PARTIAL_HYDRATION_CEILING + 1,
-                1_000_000,
-                true
-            ),
-            StagePlan::Full
-        );
-        // A read covering the whole (small) file is full, not a range.
-        assert_eq!(
-            decide_stage(false, "cat", 0, 500, 500, true),
-            StagePlan::Full
-        );
-        // Partial hydration disabled by the helper: always full.
-        assert_eq!(
-            decide_stage(false, "cat", 0, 4096, 1_000_000, false),
-            StagePlan::Full
-        );
-    }
-
-    #[test]
-    fn thumbnailers_and_previews_browse_never_consume() {
-        // The screenshot bug: clicking one image made Nautilus thumbnail the
-        // others, downloading them. Every thumbnailer and preview helper must
-        // read as "browsing" so it is served offline, never pulling content.
-        for t in [
-            "glycin-thumbnai",
-            "gdk-pixbuf-thum",
-            "gst-video-thumb",
-            "gst-audio-thumb",
-            "heif-thumbnaile",
-            "papers-thumbnai",
-            "nautilus",
-            "sushi",
-        ] {
-            assert!(is_browsing_reader(t), "{t} must browse, not download");
-        }
-        // A real image viewer the user opened is a genuine consumer.
-        for v in ["loupe", "eog", "gimp", "gwenview"] {
-            assert!(!is_browsing_reader(v), "{v} is a real open");
-        }
-    }
-
-    #[test]
-    fn file_managers_browse_and_applications_consume() {
-        // The line this draws: looking at a file must never flip its state;
-        // using it may.
-        for browser in ["nautilus", "sushi"] {
-            assert!(is_browsing_reader(browser), "{browser}");
-        }
-        for consumer in ["cat", "gedit", "cp", "libreoffice", "md5sum", ""] {
-            assert!(!is_browsing_reader(consumer), "{consumer:?}");
-        }
-    }
-}
+mod tests;

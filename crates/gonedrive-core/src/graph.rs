@@ -20,6 +20,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde::Serialize;
 use time::OffsetDateTime;
+use url::Url;
 
 use crate::config::GRAPH_ENDPOINT;
 use crate::credentials::TokenSource;
@@ -100,11 +101,35 @@ impl GraphClient {
     pub async fn delta(&self, link: Option<&str>) -> Result<DeltaPage> {
         let base = &self.base;
         let url = match link {
-            Some(link) => link.to_string(),
+            Some(link) => self.trusted_graph_link(link)?,
             None => format!("{base}/me/drive/root/delta?$top={DELTA_PAGE_SIZE}"),
         };
         let response = self.send(|http| http.get(&url)).await?;
         Ok(response.json().await?)
+    }
+
+    /// Validate an opaque continuation URL before attaching an access token.
+    ///
+    /// Graph continuation links are server-provided, but they are still data.
+    /// Treating an arbitrary absolute URL as trusted would turn a compromised
+    /// response or state database into a bearer-token disclosure primitive.
+    fn trusted_graph_link(&self, link: &str) -> Result<String> {
+        let base = Url::parse(&self.base)
+            .map_err(|error| Error::other(format!("invalid Graph endpoint: {error}")))?;
+        let candidate = base
+            .join(link)
+            .map_err(|error| Error::other(format!("invalid Graph continuation link: {error}")))?;
+
+        if candidate.origin() != base.origin()
+            || candidate.scheme() != base.scheme()
+            || !candidate.username().is_empty()
+            || candidate.password().is_some()
+        {
+            return Err(Error::other(
+                "refusing a Graph continuation link from an untrusted origin",
+            ));
+        }
+        Ok(candidate.into())
     }
 
     /// Walk every page of a delta enumeration, returning all items plus the
@@ -277,7 +302,7 @@ impl GraphClient {
         // applied as a follow-up PATCH. Without this every uploaded file comes
         // back stamped "now" and looks remotely-modified on the next sync.
         match mtime {
-            Some(mtime) => self.set_mtime(&item.id, mtime).await,
+            Some(mtime) => self.set_mtime(&item.id, mtime, item.etag.as_deref()).await,
             None => Ok(item),
         }
     }
@@ -343,7 +368,9 @@ impl GraphClient {
                 req
             })
             .await?;
-        Ok(response.json().await?)
+        let session: UploadSession = response.json().await?;
+        self.validated_upload_url(&session.upload_url)?;
+        Ok(session)
     }
 
     /// Send one chunk to an upload session.
@@ -358,13 +385,16 @@ impl GraphClient {
         total_size: u64,
         chunk: Bytes,
     ) -> Result<ChunkOutcome> {
-        let end = offset + chunk.len() as u64 - 1;
+        let upload_url = self.validated_upload_url(upload_url)?;
+        let chunk_len = u64::try_from(chunk.len())
+            .map_err(|_| Error::other("upload chunk length does not fit in u64"))?;
+        let end = upload_range_end(offset, total_size, chunk_len)?;
         let mut attempt = 0;
         loop {
             attempt += 1;
             let response = self
                 .http
-                .put(upload_url)
+                .put(upload_url.clone())
                 .header("Content-Length", chunk.len().to_string())
                 .header(
                     "Content-Range",
@@ -378,30 +408,41 @@ impl GraphClient {
                 Ok(r) => r,
                 Err(e) if attempt < MAX_ATTEMPTS => {
                     tokio::time::sleep(backoff(attempt)).await;
-                    tracing::debug!(attempt, error = %e, "retrying upload chunk");
+                    tracing::debug!(
+                        attempt,
+                        timeout = e.is_timeout(),
+                        connect = e.is_connect(),
+                        "retrying upload chunk"
+                    );
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e.without_url().into()),
             };
 
             let status = response.status().as_u16();
             match status {
                 // 202: more chunks wanted. 200/201: the file is complete.
                 202 => {
-                    let session: UploadSession = response.json().await?;
+                    let session: UploadSession = response
+                        .json()
+                        .await
+                        .map_err(|error| Error::Http(error.without_url()))?;
                     return Ok(ChunkOutcome::Accepted {
                         next_offset: session.next_offset(),
                     });
                 }
                 200 | 201 => {
-                    let item: DriveItem = response.json().await?;
+                    let item: DriveItem = response
+                        .json()
+                        .await
+                        .map_err(|error| Error::Http(error.without_url()))?;
                     return Ok(ChunkOutcome::Completed(Box::new(item)));
                 }
                 404 | 409 | 410 => {
                     // The session is gone; the caller must start a new one
                     // rather than keep pushing bytes into a dead URL.
                     return Err(Error::UploadSessionExpired {
-                        item: upload_url.to_string(),
+                        item: "resumable upload".into(),
                         reason: format!("the service returned {status}"),
                     });
                 }
@@ -409,22 +450,59 @@ impl GraphClient {
                     let delay = retry_after(response.headers()).unwrap_or_else(|| backoff(attempt));
                     tokio::time::sleep(delay.min(MAX_RETRY_AFTER)).await;
                 }
-                _ => return Err(graph_error(status, &response.bytes().await?)),
+                _ => {
+                    let body = response
+                        .bytes()
+                        .await
+                        .map_err(|error| Error::Http(error.without_url()))?;
+                    return Err(graph_error(status, &body));
+                }
             }
         }
     }
 
     /// Cancel a resumable upload, releasing the service-side staging area.
     pub async fn cancel_upload_session(&self, upload_url: &str) -> Result<()> {
+        let upload_url = self.validated_upload_url(upload_url)?;
         // Best-effort: a session we cannot cancel expires on its own.
         let _ = self.http.delete(upload_url).send().await;
         Ok(())
     }
 
-    pub async fn delete(&self, item_id: &str) -> Result<()> {
+    /// Validate a pre-authenticated upload endpoint before sending file bytes.
+    ///
+    /// Drive upload hosts legitimately differ from the Graph API host (for
+    /// example `*.up.1drv.com`), so origin equality would reject valid sessions.
+    /// Requiring the configured endpoint's scheme still prevents production
+    /// HTTPS sessions from being downgraded, while rejecting credentials and
+    /// non-network URL schemes outright.
+    fn validated_upload_url(&self, upload_url: &str) -> Result<Url> {
+        let base = Url::parse(&self.base)
+            .map_err(|error| Error::other(format!("invalid Graph endpoint: {error}")))?;
+        let candidate = Url::parse(upload_url)
+            .map_err(|error| Error::other(format!("invalid upload session URL: {error}")))?;
+        if candidate.scheme() != base.scheme()
+            || candidate.host_str().is_none()
+            || !candidate.username().is_empty()
+            || candidate.password().is_some()
+            || candidate.fragment().is_some()
+        {
+            return Err(Error::other("refusing an unsafe upload session URL"));
+        }
+        Ok(candidate)
+    }
+
+    pub async fn delete(&self, item_id: &str, if_match: Option<&str>) -> Result<()> {
         let base = &self.base;
-        self.send(|http| http.delete(format!("{base}/me/drive/items/{item_id}")))
-            .await?;
+        let if_match = if_match.map(str::to_owned);
+        self.send(move |http| {
+            let mut request = http.delete(format!("{base}/me/drive/items/{item_id}"));
+            if let Some(tag) = &if_match {
+                request = request.header("If-Match", tag);
+            }
+            request
+        })
+        .await?;
         Ok(())
     }
 
@@ -434,6 +512,7 @@ impl GraphClient {
         item_id: &str,
         new_parent_id: Option<&str>,
         new_name: Option<&str>,
+        if_match: Option<&str>,
     ) -> Result<DriveItem> {
         #[derive(Serialize)]
         struct Patch<'a> {
@@ -452,17 +531,28 @@ impl GraphClient {
             parent_reference: new_parent_id.map(|id| Parent { id }),
         };
         let base = &self.base;
+        let if_match = if_match.map(str::to_owned);
         let response = self
-            .send(|http| {
-                http.patch(format!("{base}/me/drive/items/{item_id}"))
-                    .json(&body)
+            .send(move |http| {
+                let mut request = http
+                    .patch(format!("{base}/me/drive/items/{item_id}"))
+                    .json(&body);
+                if let Some(tag) = &if_match {
+                    request = request.header("If-Match", tag);
+                }
+                request
             })
             .await?;
         Ok(response.json().await?)
     }
 
     /// Stamp an item's client-side modification time.
-    pub async fn set_mtime(&self, item_id: &str, mtime: OffsetDateTime) -> Result<DriveItem> {
+    pub async fn set_mtime(
+        &self,
+        item_id: &str,
+        mtime: OffsetDateTime,
+        if_match: Option<&str>,
+    ) -> Result<DriveItem> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Patch {
@@ -476,10 +566,16 @@ impl GraphClient {
             },
         };
         let base = &self.base;
+        let if_match = if_match.map(str::to_owned);
         let response = self
-            .send(|http| {
-                http.patch(format!("{base}/me/drive/items/{item_id}"))
-                    .json(&body)
+            .send(move |http| {
+                let mut request = http
+                    .patch(format!("{base}/me/drive/items/{item_id}"))
+                    .json(&body);
+                if let Some(tag) = &if_match {
+                    request = request.header("If-Match", tag);
+                }
+                request
             })
             .await?;
         Ok(response.json().await?)
@@ -544,6 +640,21 @@ impl GraphClient {
             }
         }
     }
+}
+
+fn upload_range_end(offset: u64, total_size: u64, chunk_len: u64) -> Result<u64> {
+    if chunk_len == 0 {
+        return Err(Error::other("refusing to upload an empty chunk"));
+    }
+    let end_exclusive = offset
+        .checked_add(chunk_len)
+        .ok_or_else(|| Error::other("upload byte range overflow"))?;
+    if end_exclusive > total_size {
+        return Err(Error::other(format!(
+            "upload range {offset}-{end_exclusive} exceeds {total_size} bytes"
+        )));
+    }
+    Ok(end_exclusive - 1)
 }
 
 /// Turn a failed response body into a typed error.
@@ -615,58 +726,4 @@ fn urlencode_segment(name: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resync_required_gets_its_own_variant() {
-        let body = br#"{"error":{"code":"resyncRequired","message":"Resync required."}}"#;
-        assert!(matches!(graph_error(410, body), Error::ResyncRequired));
-        // A different 410 must not be mistaken for one.
-        let body = br#"{"error":{"code":"itemNotFound","message":"gone"}}"#;
-        assert!(matches!(graph_error(410, body), Error::Graph { .. }));
-    }
-
-    #[test]
-    fn unparseable_error_bodies_still_produce_an_error() {
-        let err = graph_error(500, b"<html>oops</html>");
-        match err {
-            Error::Graph {
-                status, message, ..
-            } => {
-                assert_eq!(status, 500);
-                assert!(message.contains("oops"));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn retry_after_accepts_seconds() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
-        assert_eq!(retry_after(&headers), Some(Duration::from_secs(30)));
-    }
-
-    #[test]
-    fn retry_after_is_absent_when_the_header_is_missing() {
-        assert_eq!(retry_after(&reqwest::header::HeaderMap::new()), None);
-    }
-
-    #[test]
-    fn backoff_grows_and_is_capped() {
-        assert!(backoff(1) < backoff(2));
-        assert!(backoff(20) <= MAX_RETRY_AFTER);
-    }
-
-    #[test]
-    fn segment_encoding_escapes_path_syntax_characters() {
-        assert_eq!(urlencode_segment("a b.txt"), "a%20b.txt");
-        assert_eq!(urlencode_segment("a#b"), "a%23b");
-        assert_eq!(urlencode_segment("a%b"), "a%25b");
-        // A name that would otherwise terminate the `items/{id}:/name:` form.
-        assert_eq!(urlencode_segment("a:b"), "a%3Ab");
-        // Non-ASCII stays readable as UTF-8 percent-encoding.
-        assert_eq!(urlencode_segment("报告.docx"), "%E6%8A%A5%E5%91%8A.docx");
-    }
-}
+mod tests;

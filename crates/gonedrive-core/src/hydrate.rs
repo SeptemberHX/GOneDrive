@@ -16,6 +16,8 @@
 //! reading the disk, and a file manager extension can render the right emblem
 //! with a `getxattr` instead of an IPC round trip.
 
+use std::ffi::CString;
+use std::io::{Seek, SeekFrom};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
@@ -84,14 +86,22 @@ pub struct Occupancy {
 
 impl Occupancy {
     pub fn read(path: &Path) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(path)?;
-        Ok(Self {
+        Ok(Self::from_metadata(&meta))
+    }
+
+    pub(crate) fn read_file(file: &std::fs::File) -> Result<Self> {
+        Ok(Self::from_metadata(&file.metadata()?))
+    }
+
+    fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
             apparent_size: meta.len(),
             // `st_blocks` is always in 512-byte units, whatever the filesystem's
             // own block size.
             allocated: meta.blocks() * 512,
-        })
+        }
     }
 
     /// Whether the file occupies materially less space than it claims.
@@ -138,6 +148,26 @@ impl Placeholder {
         Ok(())
     }
 
+    pub(crate) fn create_file(
+        file: &std::fs::File,
+        size: u64,
+        item_id: &str,
+        ctag: Option<&str>,
+        mtime: Option<OffsetDateTime>,
+    ) -> Result<()> {
+        file.set_len(size)?;
+        if size > 0 {
+            punch_hole(file, 0, size)?;
+        }
+        Self::write_marks_file(file, PlaceholderState::Dehydrated, item_id, ctag)?;
+        if let Some(mtime) = mtime {
+            let times =
+                std::fs::FileTimes::new().set_modified(crate::sync::plan::to_filetime(mtime));
+            file.set_times(times)?;
+        }
+        Ok(())
+    }
+
     /// Release a hydrated file's blocks, keeping the file and its size.
     ///
     /// This is "free up space". The caller is responsible for having confirmed
@@ -157,6 +187,21 @@ impl Placeholder {
         Ok(before.allocated.saturating_sub(after.allocated))
     }
 
+    pub(crate) fn dehydrate_file(
+        file: &std::fs::File,
+        item_id: &str,
+        ctag: Option<&str>,
+    ) -> Result<u64> {
+        let before = Occupancy::read_file(file)?;
+        if before.apparent_size > 0 {
+            punch_hole(file, 0, before.apparent_size)?;
+        }
+        file.sync_all()?;
+        Self::write_marks_file(file, PlaceholderState::Dehydrated, item_id, ctag)?;
+        let after = Occupancy::read_file(file)?;
+        Ok(before.allocated.saturating_sub(after.allocated))
+    }
+
     /// Write content back into a placeholder at `offset`.
     ///
     /// Writes through a positional write rather than truncating and rewriting,
@@ -166,6 +211,12 @@ impl Placeholder {
     pub fn fill(path: &Path, offset: u64, data: &[u8]) -> Result<()> {
         use std::os::unix::fs::FileExt;
         let file = std::fs::File::options().write(true).open(path)?;
+        file.write_all_at(data, offset)?;
+        Ok(())
+    }
+
+    pub(crate) fn fill_file(file: &std::fs::File, offset: u64, data: &[u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
         file.write_all_at(data, offset)?;
         Ok(())
     }
@@ -184,6 +235,22 @@ impl Placeholder {
         Ok(())
     }
 
+    pub(crate) fn mark_hydrated_file(
+        file: &std::fs::File,
+        item_id: &str,
+        ctag: Option<&str>,
+    ) -> Result<()> {
+        Self::write_marks_file(file, PlaceholderState::Hydrated, item_id, ctag)?;
+        if let Ok(mut reader) = file.try_clone() {
+            if reader.seek(SeekFrom::Start(0)).is_ok() {
+                if let Ok(hash) = crate::hash::quick_xor_reader(&mut reader) {
+                    let _ = set_xattr_file(file, XATTR_QUICKXOR, hash.as_bytes());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Read what the file itself claims about its state.
     pub fn state(path: &Path) -> PlaceholderState {
         match xattr::get(path, XATTR_STATE) {
@@ -192,9 +259,20 @@ impl Placeholder {
         }
     }
 
+    pub(crate) fn state_file(file: &std::fs::File) -> PlaceholderState {
+        match get_xattr_file(file, XATTR_STATE) {
+            Ok(Some(raw)) => PlaceholderState::parse(&raw),
+            _ => PlaceholderState::Unmanaged,
+        }
+    }
+
     pub fn item_id(path: &Path) -> Option<String> {
         let raw = xattr::get(path, XATTR_ITEM_ID).ok()??;
         String::from_utf8(raw).ok()
+    }
+
+    pub(crate) fn item_id_file(file: &std::fs::File) -> Option<String> {
+        String::from_utf8(get_xattr_file(file, XATTR_ITEM_ID).ok()??).ok()
     }
 
     pub fn ctag(path: &Path) -> Option<String> {
@@ -216,6 +294,16 @@ impl Placeholder {
         Ok(())
     }
 
+    pub(crate) fn mark_dir_file(
+        file: &std::fs::File,
+        state: PlaceholderState,
+        item_id: &str,
+    ) -> Result<()> {
+        set_xattr_file(file, XATTR_STATE, state.as_str().as_bytes())?;
+        set_xattr_file(file, XATTR_ITEM_ID, item_id.as_bytes())?;
+        Ok(())
+    }
+
     /// Record the retention choice on the file itself.
     ///
     /// Duplicating this from the database is deliberate: a file manager
@@ -226,9 +314,17 @@ impl Placeholder {
         Ok(())
     }
 
+    pub(crate) fn set_pin_file(file: &std::fs::File, pin: &str) -> Result<()> {
+        set_xattr_file(file, XATTR_PIN, pin.as_bytes())
+    }
+
     pub fn pin(path: &Path) -> Option<String> {
         let raw = xattr::get(path, XATTR_PIN).ok()??;
         String::from_utf8(raw).ok()
+    }
+
+    pub(crate) fn pin_file(file: &std::fs::File) -> Option<String> {
+        String::from_utf8(get_xattr_file(file, XATTR_PIN).ok()??).ok()
     }
 
     /// Record the content hash of the bytes we just wrote, so a later guard can
@@ -238,10 +334,18 @@ impl Placeholder {
         Ok(())
     }
 
+    pub(crate) fn set_content_hash_file(file: &std::fs::File, hash: &str) -> Result<()> {
+        set_xattr_file(file, XATTR_QUICKXOR, hash.as_bytes())
+    }
+
     /// The content hash recorded the last time we wrote this file, if any.
     pub fn content_hash(path: &Path) -> Option<String> {
         let raw = xattr::get(path, XATTR_QUICKXOR).ok()??;
         String::from_utf8(raw).ok()
+    }
+
+    pub(crate) fn content_hash_file(file: &std::fs::File) -> Option<String> {
+        String::from_utf8(get_xattr_file(file, XATTR_QUICKXOR).ok()??).ok()
     }
 
     /// Flag a file as actively transferring, so the file manager shows the
@@ -253,6 +357,14 @@ impl Placeholder {
             let _ = xattr::set(path, XATTR_SYNCING, b"1");
         } else {
             let _ = xattr::remove(path, XATTR_SYNCING);
+        }
+    }
+
+    pub(crate) fn set_syncing_file(file: &std::fs::File, syncing: bool) -> Result<()> {
+        if syncing {
+            set_xattr_file(file, XATTR_SYNCING, b"1")
+        } else {
+            remove_xattr_file(file, XATTR_SYNCING)
         }
     }
 
@@ -281,6 +393,83 @@ impl Placeholder {
             xattr::set(path, XATTR_CTAG, ctag.as_bytes())?;
         }
         Ok(())
+    }
+
+    fn write_marks_file(
+        file: &std::fs::File,
+        state: PlaceholderState,
+        item_id: &str,
+        ctag: Option<&str>,
+    ) -> Result<()> {
+        set_xattr_file(file, XATTR_STATE, state.as_str().as_bytes())?;
+        set_xattr_file(file, XATTR_ITEM_ID, item_id.as_bytes())?;
+        if let Some(ctag) = ctag {
+            set_xattr_file(file, XATTR_CTAG, ctag.as_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+fn get_xattr_file(file: &std::fs::File, name: &str) -> Result<Option<Vec<u8>>> {
+    let name = CString::new(name).expect("xattr constants contain no NUL");
+    // SAFETY: descriptor and name are valid; null buffer with size zero asks
+    // the kernel for the required allocation.
+    let size = unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENODATA) {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    let mut value = vec![0u8; size as usize];
+    // SAFETY: `value` owns exactly the capacity advertised by the first call.
+    let read = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if read < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    value.truncate(read as usize);
+    Ok(Some(value))
+}
+
+fn set_xattr_file(file: &std::fs::File, name: &str, value: &[u8]) -> Result<()> {
+    let name = CString::new(name).expect("xattr constants contain no NUL");
+    // SAFETY: all pointers are valid for the duration of the call.
+    let rc = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+fn remove_xattr_file(file: &std::fs::File, name: &str) -> Result<()> {
+    let name = CString::new(name).expect("xattr constants contain no NUL");
+    // SAFETY: the descriptor and NUL-terminated attribute name are valid.
+    let rc = unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENODATA) {
+        Ok(())
+    } else {
+        Err(error.into())
     }
 }
 

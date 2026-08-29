@@ -15,10 +15,14 @@
 # Local folder mirroring the drive root.
 sync_root = "/home/YOU/OneDrive"
 
-# Poll cadence. The client backs off from the first towards the second while
-# nothing is changing, and snaps back the moment something does.
+# Remote delta cadence. Successful polls stay at 30 seconds; only failures back
+# off towards the maximum, so remote edits have a predictable delay.
 poll_interval_secs = 30
 max_poll_interval_secs = 300
+
+# Full local-tree verification. Watcher events drive ordinary incremental
+# scans; this catches events missed while the daemon was stopped or overflowed.
+full_scan_interval_secs = 1800
 
 # Quiet period a local file must have before it is queued for upload. An
 # application saving a document writes it several times in a row; this stops
@@ -47,7 +51,7 @@ auto_free_below_bytes = 0
 download_limit_bytes_per_sec = 0
 upload_limit_bytes_per_sec = 0
 
-# 批量删除安全阀：一次扫描若判定删除的项数超过 mass_delete_min，且占全账户
+# 批量删除安全阀：静默窗口内的待删除批次累计超过 mass_delete_min，且占全账户
 # 比例超过 mass_delete_fraction，则视为疑似误删（卸载的挂载点、错误的 bind、
 # 误 rm），扣留全部删除并请用户确认，绝不直接在服务端删除。
 # mass_delete_fraction = 1.0 关闭比例判定。

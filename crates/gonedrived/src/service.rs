@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use gonedrive_ipc::{
-    AccountInfo, Activity, FolderEntry, Hydration, SyncStatus, OBJECT_PATH, SERVICE_NAME,
+    AccountInfo, Activity, FolderEntry, Hydration, SyncRequestResult, SyncStatus, OBJECT_PATH,
+    SERVICE_NAME,
 };
 use zbus::object_server::SignalEmitter;
 use zbus::{connection, interface};
@@ -40,6 +41,12 @@ fn confine_to_root(
         .map_err(|_| ConfineError::Outside)?;
     if relative.as_os_str().is_empty() {
         return Err(ConfineError::WholeRoot);
+    }
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(ConfineError::Outside);
     }
     Ok(relative.to_path_buf())
 }
@@ -144,8 +151,12 @@ impl DaemonService {
     }
 
     async fn sync_now(&self) -> zbus::fdo::Result<()> {
-        self.app.wake.notify_one();
+        let _ = self.app.request_sync();
         Ok(())
+    }
+
+    async fn request_sync(&self) -> zbus::fdo::Result<u64> {
+        Ok(self.app.request_sync())
     }
 
     async fn set_paused(&self, paused: bool) -> zbus::fdo::Result<()> {
@@ -239,14 +250,31 @@ impl DaemonService {
 
     async fn fetch_now(&self, path: &str) -> zbus::fdo::Result<u64> {
         tracing::info!(%path, "FetchNow requested");
+        let relative = self.relative(path).await?;
+        let root = self
+            .app
+            .accounts()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+            .into_iter()
+            .next()
+            .map(|account| std::path::PathBuf::from(account.root_path))
+            .ok_or_else(|| zbus::fdo::Error::Failed("no account is signed in".into()))?;
         self.app
-            .hydrate(std::path::Path::new(path))
+            .hydrate(&root.join(relative))
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
     }
 
     #[zbus(signal)]
     async fn status_changed(emitter: &SignalEmitter<'_>, status: SyncStatus) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn sync_request_completed(
+        emitter: &SignalEmitter<'_>,
+        generation: u64,
+        result: SyncRequestResult,
+    ) -> zbus::Result<()>;
 
     #[zbus(signal)]
     async fn login_completed(emitter: &SignalEmitter<'_>, account_id: &str) -> zbus::Result<()>;
@@ -321,6 +349,10 @@ pub async fn serve(app: Arc<App>) -> Result<zbus::Connection> {
                         DaemonEvent::LoginFailed(message) => {
                             DaemonService::login_failed(&emitter, &message).await
                         }
+                        DaemonEvent::SyncRequestCompleted { generation, result } => {
+                            DaemonService::sync_request_completed(&emitter, generation, result)
+                                .await
+                        }
                         DaemonEvent::Conflict { original, copy } => {
                             DaemonService::conflict_detected(&emitter, &original, &copy).await
                         }
@@ -383,6 +415,10 @@ mod tests {
         );
         assert_eq!(
             confine_to_root(Path::new(ROOT), "/home/u"),
+            Err(ConfineError::Outside)
+        );
+        assert_eq!(
+            confine_to_root(Path::new(ROOT), "/home/u/OneDrive/a/../../outside"),
             Err(ConfineError::Outside)
         );
     }
