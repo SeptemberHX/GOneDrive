@@ -28,6 +28,11 @@ jobs:
     container:
       image: ubuntu:25.04
     steps:
+      # This runs before actions/checkout on purpose: it is a plain shell step
+      # (needs no Node), and it installs the Node that the JavaScript-based
+      # actions below (checkout, cache, upload-artifact) require. ubuntu:25.04
+      # is a minimal image with no Node, so without this checkout fails with
+      # "node: command not found" (exit 127) — nektos/act issue #107.
       - name: Install system build dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
@@ -35,6 +40,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential pkg-config git curl ca-certificates \
             libgtk-4-dev libadwaita-1-dev \
+            nodejs \
             dpkg-dev jq
 
       - name: Checkout
