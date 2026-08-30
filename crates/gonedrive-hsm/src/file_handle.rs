@@ -279,7 +279,16 @@ mod tests {
     fn the_current_mount_id_resolves_to_a_directory_anchor() {
         let dir = tempfile::tempdir().unwrap();
         let file = File::open(dir.path()).unwrap();
-        let (mount_id, _) = OpaqueFileHandle::capture(&file).unwrap();
+        // Read the mount id independently of name_to_handle_at. Container
+        // filesystems commonly reject exportable handles with EOPNOTSUPP even
+        // though /proc/self/mountinfo and mount anchors work normally.
+        let fdinfo =
+            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).unwrap();
+        let mount_id = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:\t"))
+            .and_then(|id| id.parse::<i32>().ok())
+            .expect("fdinfo must identify the descriptor's mount");
         assert!(open_mount_anchor(mount_id)
             .unwrap()
             .metadata()

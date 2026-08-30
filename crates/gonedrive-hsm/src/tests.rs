@@ -248,17 +248,17 @@ fn another_users_file_is_refused() {
     // This is the whole point of the check: without it, any local user who
     // can reach the socket can make a root process install marks on files
     // they do not own.
-    let path = Path::new("/etc/shadow");
-    if !path.exists() {
-        return;
-    }
-    let err = open_authorised(path, my_uid(), libc::O_RDONLY)
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("another-users-file");
+    std::fs::write(&path, b"secret").unwrap();
+    let owner = std::fs::metadata(&path).unwrap().uid();
+    let connecting_uid = owner.wrapping_add(1);
+    let err = open_authorised(&path, connecting_uid, libc::O_RDONLY)
         .unwrap_err()
         .to_string();
-    assert!(
-        err.contains("belongs to uid") || err.contains("cannot open"),
-        "{err}"
-    );
+    assert!(err.contains("belongs to uid"), "{err}");
 }
 
 #[test]
