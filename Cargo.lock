@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "gonedrive-core"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "gonedrive-gtk"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "gonedrive-hsm"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -1113,11 +1113,12 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "xattr",
 ]
 
 [[package]]
 name = "gonedrive-ipc"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -1126,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "gonedrived"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -1138,10 +1139,12 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zbus",
 ]
 

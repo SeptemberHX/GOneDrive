@@ -44,6 +44,110 @@ async fn placeholders_can_be_created_for_files_never_downloaded() {
     // The engine can list what the helper needs to intercept.
     let watched = h.engine.dehydrated_paths().unwrap();
     assert!(watched.contains(&path));
+
+    // HSM startup must be able to build the same inventory before an
+    // Authenticator/Graph engine exists. A temporary token-endpoint outage may
+    // disable downloads, but it must never expose sparse zeroes.
+    let account = h.store.accounts().unwrap().pop().unwrap();
+    let offline = gonedrive_core::sync::dehydrated_paths_for_account(&h.store, &account).unwrap();
+    assert_eq!(offline, watched);
+}
+
+#[tokio::test]
+async fn a_missing_placeholder_is_rebuilt_from_local_state() {
+    use gonedrive_core::sync::{
+        materialise_placeholder_for_account, placeholder_inventory_for_account,
+    };
+
+    let h = Harness::metadata_only().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "Docs"),
+            file(
+                "F1",
+                "D1",
+                "restored.bin",
+                "c1",
+                8192,
+                "2026-08-21T10:00:00Z",
+            ),
+        ],
+        "v1",
+    )
+    .await;
+    assert_eq!(h.sync().await.failed, 0);
+
+    let account = h.store.accounts().unwrap().pop().unwrap();
+    let before = placeholder_inventory_for_account(&h.store, &account).unwrap();
+    assert!(before.existing.is_empty());
+    assert_eq!(before.missing, vec!["F1"]);
+
+    let path = materialise_placeholder_for_account(&h.store, &account, "F1").unwrap();
+    assert_eq!(path, h.path("Docs/restored.bin"));
+    assert_eq!(
+        materialise_placeholder_for_account(&h.store, &account, "F1").unwrap(),
+        path,
+        "recovery must be idempotent"
+    );
+    let ready = placeholder_inventory_for_account(&h.store, &account).unwrap();
+    assert_eq!(ready.existing, vec![path.clone()]);
+    assert!(ready.missing.is_empty());
+}
+
+#[tokio::test]
+async fn a_mark_failure_keeps_a_locked_placeholder_in_the_reconnect_inventory() {
+    use gonedrive_core::sync::{
+        lock_unwatched_placeholder_for_account, materialise_placeholder_for_account,
+        placeholder_inventory_for_account,
+    };
+    use std::os::unix::fs::MetadataExt;
+
+    let h = Harness::metadata_only().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "Docs"),
+            file(
+                "F1",
+                "D1",
+                "visible.bin",
+                "c1",
+                8192,
+                "2026-08-21T10:00:00Z",
+            ),
+        ],
+        "v1",
+    )
+    .await;
+    assert_eq!(h.sync().await.failed, 0);
+
+    let account = h.store.accounts().unwrap().pop().unwrap();
+    let path = materialise_placeholder_for_account(&h.store, &account, "F1").unwrap();
+    lock_unwatched_placeholder_for_account(&h.store, &account, &path).unwrap();
+
+    assert!(path.exists(), "the namespace must remain browsable");
+    assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, 0);
+    let inventory = placeholder_inventory_for_account(&h.store, &account).unwrap();
+    assert_eq!(inventory.existing, vec![path.clone()]);
+    assert!(inventory.missing.is_empty());
+
+    let discovery = h.engine.discover_local_changes().unwrap();
+    assert!(discovery.dirty_paths.is_empty());
+    assert!(discovery
+        .placeholders
+        .iter()
+        .any(|(candidate, _, _)| candidate == &path));
+
+    let mut summary = gonedrive_core::sync::SyncSummary::default();
+    h.engine.scan_local(&mut summary).unwrap();
+    assert_eq!(
+        h.store.pending_count(ACCOUNT).unwrap(),
+        0,
+        "a safety-locked placeholder must never be queued as an upload"
+    );
 }
 
 #[tokio::test]
@@ -169,6 +273,75 @@ async fn a_hydrated_file_is_not_offered_for_interception() {
 }
 
 #[tokio::test]
+async fn on_demand_hydration_retires_the_same_queued_download() {
+    use gonedrive_core::db::OpKind;
+
+    const CONTENT: &[u8] = &[0x31; 128 * 1024];
+    let h = harness_with_a_downloaded_file(CONTENT).await;
+    let path = h.path("Docs/big.bin");
+    h.engine.free_space(Path::new("Docs")).unwrap();
+    h.store
+        .enqueue(ACCOUNT, OpKind::Download, Some("F1"), Some(&path), None)
+        .unwrap();
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 1);
+
+    h.server.reset().await;
+    h.mock_download("F1", CONTENT).await;
+    h.engine.hydrate(&path).await.unwrap();
+
+    assert_eq!(
+        h.store.pending_count(ACCOUNT).unwrap(),
+        0,
+        "content already delivered on demand must not be downloaded again"
+    );
+}
+
+#[tokio::test]
+async fn helper_finished_hydration_retires_the_same_queued_download() {
+    use gonedrive_core::db::OpKind;
+    use gonedrive_core::hydrate::Placeholder;
+
+    const CONTENT: &[u8] = &[0x32; 128 * 1024];
+    let h = harness_with_a_downloaded_file(CONTENT).await;
+    let path = h.path("Docs/big.bin");
+    h.engine.free_space(Path::new("Docs")).unwrap();
+    h.store
+        .enqueue(ACCOUNT, OpKind::Download, Some("F1"), Some(&path), None)
+        .unwrap();
+
+    Placeholder::fill(&path, 0, CONTENT).unwrap();
+    h.engine.finish_hydration(&path).unwrap();
+
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 0);
+    assert_eq!(std::fs::read(path).unwrap(), CONTENT);
+}
+
+#[tokio::test]
+async fn stale_completed_download_is_retired_without_network_or_replacement() {
+    use std::os::unix::fs::MetadataExt;
+
+    use gonedrive_core::db::OpKind;
+
+    const CONTENT: &[u8] = &[0x33; 128 * 1024];
+    let h = harness_with_a_downloaded_file(CONTENT).await;
+    let path = h.path("Docs/big.bin");
+    let before = std::fs::metadata(&path).unwrap();
+    h.store
+        .enqueue(ACCOUNT, OpKind::Download, Some("F1"), Some(&path), None)
+        .unwrap();
+    h.server.reset().await;
+
+    let summary = h.engine.transfer_only().await.unwrap();
+
+    assert_eq!(summary.downloaded, 0);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 0);
+    assert_eq!(std::fs::read(&path).unwrap(), CONTENT);
+    assert_eq!(std::fs::metadata(&path).unwrap().ino(), before.ino());
+    assert!(h.server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn a_placeholder_is_never_uploaded_even_when_its_mtime_drifts() {
     // The scan judges "locally modified" by size+mtime. A hydration in
     // progress moves the mtime, and a crashed one leaves it moved — but the
@@ -243,6 +416,36 @@ async fn a_stale_hydrating_record_is_repaired_from_the_file_itself() {
         h.store.item("F1").unwrap().unwrap().state,
         ItemState::Synced
     );
+}
+
+#[tokio::test]
+async fn the_helper_close_write_cannot_upload_a_hydration_in_transition() {
+    use gonedrive_core::db::ItemState;
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+
+    // The helper has filled the inode and is about to notify the daemon. Its
+    // pwrite moved mtime to now, while SQLite still describes the sparse
+    // placeholder. A close-write scan can observe exactly this state.
+    let content = b"remote content that must never be re-uploaded on open";
+    let h = harness_with_a_downloaded_file(content).await;
+    let path = h.path("Docs/big.bin");
+    h.engine.free_space(Path::new("Docs")).unwrap();
+    h.store.set_item_state("F1", ItemState::Hydrating).unwrap();
+    Placeholder::fill(&path, 0, content).unwrap();
+    // This is the helper's source-first marker. The database transition is the
+    // authoritative sign that finalisation has not restored mtime yet.
+    Placeholder::mark_hydrated(&path, "F1", Some("c1")).unwrap();
+    assert_eq!(Placeholder::state(&path), PlaceholderState::Hydrated);
+
+    let completed = std::collections::HashSet::from([path.clone()]);
+    let summary = h
+        .engine
+        .sync_local_change_batch(std::slice::from_ref(&path), &completed)
+        .unwrap();
+
+    assert_eq!(summary.still_queued, 0);
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 0);
+    assert_eq!(Placeholder::state(&path), PlaceholderState::Hydrated);
 }
 
 #[tokio::test]
@@ -400,7 +603,12 @@ async fn a_range_stage_fetches_only_the_window_and_changes_nothing() {
         .await;
 
     let mut events = h.engine.subscribe();
-    let staged = h.engine.stage_range(&path, 0, 16384).await.unwrap();
+    let staged = h
+        .engine
+        .stage_range(&path, 0, 16384)
+        .await
+        .unwrap()
+        .unwrap();
 
     // The staged sibling holds exactly the window.
     assert_eq!(std::fs::read(&staged).unwrap(), &CONTENT[..16384]);
@@ -430,6 +638,18 @@ async fn a_range_stage_fetches_only_the_window_and_changes_nothing() {
         "a range stage must not emit sync events"
     );
     let _ = std::fs::remove_file(&staged);
+
+    // Simulate the helper placing the first response in the placeholder. A
+    // repeated Nautilus sniff now reads that exact range directly: with no
+    // remaining mock, any accidental second network request fails the test.
+    Placeholder::fill(&path, 0, &CONTENT[..16384]).unwrap();
+    h.server.reset().await;
+    assert!(h
+        .engine
+        .stage_range(&path, 0, 16384)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -468,4 +688,186 @@ async fn a_browsed_placeholder_can_still_be_freed() {
     let outcome = h.engine.free_space(Path::new("Docs")).unwrap();
     assert_eq!(outcome.files, 0);
     assert_eq!(outcome.skipped.len(), 1);
+}
+
+#[tokio::test]
+async fn freeing_a_pinned_file_clears_its_retention_choice() {
+    use gonedrive_core::db::PinState;
+    use gonedrive_core::hydrate::Placeholder;
+
+    const CONTENT: &[u8] = &[0x31; 64 * 1024];
+    let h = harness_with_a_downloaded_file(CONTENT).await;
+    let path = h.path("Docs/big.bin");
+    h.engine
+        .set_pin(Path::new("Docs/big.bin"), PinState::Pinned)
+        .unwrap();
+    Placeholder::set_pin(&path, PinState::Pinned.as_str()).unwrap();
+    h.store
+        .enqueue(ACCOUNT, OpKind::Download, Some("F1"), Some(&path), None)
+        .unwrap();
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 1);
+
+    let outcome = h.engine.free_space(Path::new("Docs/big.bin")).unwrap();
+
+    assert_eq!(outcome.files, 1, "skipped: {:?}", outcome.skipped);
+    assert_eq!(
+        h.store.item("F1").unwrap().unwrap().pin_state,
+        PinState::Unpinned,
+        "a released file must not be downloaded again by its stale pin"
+    );
+    assert_eq!(
+        Placeholder::pin(&path).as_deref(),
+        Some(PinState::Unpinned.as_str()),
+        "the file-manager emblem must agree with the durable choice"
+    );
+    assert_eq!(
+        h.store.pending_count(ACCOUNT).unwrap(),
+        0,
+        "release must cancel a stale download for the same file"
+    );
+}
+
+#[tokio::test]
+async fn a_file_skipped_by_free_space_keeps_its_pin() {
+    use gonedrive_core::db::PinState;
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+
+    const CONTENT: &[u8] = &[0x32; 64 * 1024];
+    let h = harness_with_a_downloaded_file(CONTENT).await;
+    let path = h.path("Docs/big.bin");
+    h.engine
+        .set_pin(Path::new("Docs/big.bin"), PinState::Pinned)
+        .unwrap();
+    Placeholder::set_pin(&path, PinState::Pinned.as_str()).unwrap();
+    std::fs::write(&path, b"unsaved local edit").unwrap();
+
+    let outcome = h.engine.free_space(Path::new("Docs/big.bin")).unwrap();
+
+    assert_eq!(outcome.files, 0);
+    assert_eq!(outcome.skipped.len(), 1);
+    assert_eq!(Placeholder::state(&path), PlaceholderState::Hydrated);
+    assert_eq!(
+        h.store.item("F1").unwrap().unwrap().pin_state,
+        PinState::Pinned
+    );
+    assert_eq!(
+        Placeholder::pin(&path).as_deref(),
+        Some(PinState::Pinned.as_str())
+    );
+}
+
+#[tokio::test]
+async fn freeing_a_folder_clears_the_folder_policy_and_badge() {
+    use gonedrive_core::db::PinState;
+    use gonedrive_core::hydrate::Placeholder;
+
+    const CONTENT: &[u8] = &[0x33; 64 * 1024];
+    let h = harness_with_a_downloaded_file(CONTENT).await;
+    let folder = h.path("Docs");
+    h.engine
+        .set_pin(Path::new("Docs"), PinState::Pinned)
+        .unwrap();
+    assert_eq!(Placeholder::pin(&folder).as_deref(), Some("pinned"));
+
+    let outcome = h.engine.free_space(Path::new("Docs")).unwrap();
+
+    assert_eq!(outcome.files, 1, "skipped: {:?}", outcome.skipped);
+    assert_eq!(
+        h.store.item("D1").unwrap().unwrap().pin_state,
+        PinState::Unpinned
+    );
+    assert_eq!(Placeholder::pin(&folder).as_deref(), Some("unpinned"));
+    assert_eq!(
+        h.store.effective_pin("F1", PinState::Pinned).unwrap(),
+        PinState::Unpinned,
+        "new or restored children must not be pulled back by the old folder pin"
+    );
+}
+
+#[tokio::test]
+async fn pinning_an_already_local_file_updates_its_badge_without_a_download() {
+    use gonedrive_core::db::PinState;
+    use gonedrive_core::hydrate::Placeholder;
+
+    let h = harness_with_a_downloaded_file(b"local content").await;
+    let path = h.path("Docs/big.bin");
+    h.engine
+        .set_pin(Path::new("Docs/big.bin"), PinState::Unpinned)
+        .unwrap();
+    assert_eq!(Placeholder::pin(&path).as_deref(), Some("unpinned"));
+
+    let outcome = h
+        .engine
+        .set_pin(Path::new("Docs/big.bin"), PinState::Pinned)
+        .unwrap();
+
+    assert_eq!(outcome.files, 0, "the bytes are already local");
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 0);
+    assert_eq!(Placeholder::pin(&path).as_deref(), Some("pinned"));
+}
+
+#[tokio::test]
+async fn a_complete_copy_with_cloned_placeholder_marks_becomes_a_new_file() {
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState, XATTR_STATE};
+
+    const CONTENT: &[u8] = &[23u8; 128 * 1024];
+    let h = harness_with_a_downloaded_file(CONTENT).await;
+    let source = h.path("Docs/big.bin");
+    let copy = h.path("Docs/big copy.bin");
+    std::fs::copy(&source, &copy).unwrap();
+    // GIO copies these attributes after the bytes. Reproduce the live failure:
+    // a fully populated destination still claims to be the source placeholder.
+    Placeholder::mark_hydrated(&copy, "F1", Some("c1")).unwrap();
+    xattr::set(&copy, XATTR_STATE, b"dehydrated").unwrap();
+
+    let summary = h
+        .engine
+        .sync_local_paths(std::slice::from_ref(&copy))
+        .unwrap();
+
+    assert_eq!(summary.still_queued, 1);
+    assert_eq!(Placeholder::state(&copy), PlaceholderState::Unmanaged);
+    assert_eq!(Placeholder::item_id(&copy), None);
+    assert_eq!(std::fs::read(&copy).unwrap(), CONTENT);
+    assert_eq!(std::fs::read(&source).unwrap(), CONTENT);
+}
+
+#[tokio::test]
+async fn a_sparse_copy_that_only_cloned_placeholder_marks_is_never_uploaded() {
+    use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
+
+    const CONTENT: &[u8] = &[41u8; 128 * 1024];
+    let h = harness_with_a_downloaded_file(CONTENT).await;
+    let copy = h.path("Docs/incomplete copy.bin");
+    Placeholder::create(&copy, CONTENT.len() as u64, "F1", Some("c1"), None).unwrap();
+    let completed = std::collections::HashSet::from([copy.clone()]);
+
+    let summary = h
+        .engine
+        .sync_local_change_batch(std::slice::from_ref(&copy), &completed)
+        .unwrap();
+
+    assert_eq!(summary.still_queued, 0, "sparse holes must not enter upload");
+    assert_eq!(Placeholder::state(&copy), PlaceholderState::Dehydrated);
+    assert!(Occupancy::read(&copy).unwrap().is_sparse());
+}
+
+#[tokio::test]
+async fn a_finished_edited_copy_is_detached_after_close_write() {
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+
+    let h = harness_with_a_downloaded_file(b"source content").await;
+    let copy = h.path("Docs/edited copy.bin");
+    std::fs::write(&copy, b"a different finished document").unwrap();
+    Placeholder::mark_hydrated(&copy, "F1", Some("c1")).unwrap();
+    let completed = std::collections::HashSet::from([copy.clone()]);
+
+    let summary = h
+        .engine
+        .sync_local_change_batch(std::slice::from_ref(&copy), &completed)
+        .unwrap();
+
+    assert_eq!(summary.still_queued, 1);
+    assert_eq!(Placeholder::state(&copy), PlaceholderState::Unmanaged);
+    assert_eq!(std::fs::read(&copy).unwrap(), b"a different finished document");
 }

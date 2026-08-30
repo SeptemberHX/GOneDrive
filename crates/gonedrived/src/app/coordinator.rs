@@ -26,14 +26,11 @@ struct LocalScanBatch {
 }
 
 struct FullScanBatch {
-    remote_epoch: u64,
     result: Result<Vec<(Arc<Engine>, FullScanReport)>>,
 }
 
 struct ExplicitSync {
     target_generation: u64,
-    required_remote_epoch: u64,
-    full_scan_done: bool,
     result: SyncRequestResult,
 }
 
@@ -73,7 +70,7 @@ impl App {
                 placeholders = report.placeholders.len(),
                 "full local verification finished"
             );
-            if let Err(error) = self.reconcile_placeholder_report(&report).await {
+            if let Err(error) = self.reconcile_placeholder_report(report.placeholders).await {
                 tracing::warn!(%error, "placeholder reconciliation failed");
             }
             found_dirty |= !report.dirty_paths.is_empty();
@@ -136,6 +133,7 @@ impl App {
     pub async fn run(
         self: Arc<Self>,
         mut local_changes: Option<tokio::sync::mpsc::Receiver<crate::watcher::LocalChangeBatch>>,
+        open_writes: crate::watcher::OpenWrites,
         shutdown: impl std::future::Future<Output = ()>,
     ) {
         let base = Duration::from_secs(self.config.poll_interval_secs);
@@ -147,6 +145,7 @@ impl App {
         let mut force_remote = false;
         let mut remote_required_for_local = false;
         let mut dirty_paths = HashSet::new();
+        let mut completed_writes = HashSet::new();
         let mut download_work = false;
         let mut queue_work = false;
         let mut discovery_running = false;
@@ -156,7 +155,6 @@ impl App {
         let mut outbound_transfer_running = false;
         let mut local_scan_running = false;
         let mut completed_generation = 0u64;
-        let mut remote_epoch = 0u64;
         let mut explicit_sync: Option<ExplicitSync> = None;
         let (discovery_tx, mut discovery_rx) = tokio::sync::mpsc::channel::<FullScanBatch>(1);
         let (transfer_tx, mut transfer_rx) = tokio::sync::mpsc::channel(2);
@@ -201,13 +199,6 @@ impl App {
                     Some(batch) = discovery_rx.recv(), if discovery_running => {
                         discovery_running = false;
                         let verification = self.consume_full_scan(batch.result, &mut dirty_paths).await;
-                        if verification.is_some() {
-                            if let Some(explicit) = explicit_sync.as_mut() {
-                                if batch.remote_epoch >= explicit.required_remote_epoch {
-                                    explicit.full_scan_done = true;
-                                }
-                            }
-                        }
                         delete_verification_ready = verification.is_some();
                         if verification == Some(true) {
                             remote_required_for_local = true;
@@ -254,6 +245,7 @@ impl App {
                         match batch {
                             Some(batch) => {
                                 dirty_paths.extend(batch.paths);
+                                completed_writes.extend(batch.completed_writes);
                                 remote_required_for_local = true;
                                 force_remote = true;
                                 if batch.force_full {
@@ -275,10 +267,12 @@ impl App {
                 continue;
             }
 
-            let explicit_quiescent = explicit_sync.as_ref().is_some_and(|explicit| {
-                sync_barrier_ready(
-                    explicit.full_scan_done,
-                    discovery_running,
+            // SyncNow is a remote freshness request, not a request to walk the
+            // whole local tree. It drains work already reported by the watcher
+            // and the fresh delta; startup, the periodic verifier, and watcher
+            // overflow retain ownership of full discovery.
+            let explicit_quiescent = explicit_sync.is_some()
+                && sync_barrier_ready(
                     local_scan_running,
                     download_transfer_running,
                     outbound_transfer_running,
@@ -286,8 +280,7 @@ impl App {
                     !dirty_paths.is_empty(),
                     download_work,
                     queue_work,
-                )
-            });
+                );
             if explicit_quiescent {
                 let pending = self.store.accounts().and_then(|accounts| {
                     accounts.into_iter().try_fold(0u64, |total, account| {
@@ -327,17 +320,31 @@ impl App {
             // Remote is the highest-priority mutation. Any local work waits
             // for a successful fresh delta, preserving the pull-before-upload
             // invariant; If-Match remains the final race guard at Graph.
-            if force_remote || Instant::now() >= next_remote {
+            //
+            // Let an already-started outbound slice publish its Graph result
+            // before pulling again. A resumable create becomes visible in
+            // delta just before run_upload commits the returned item locally;
+            // observing our own half-committed upload in that window used to
+            // manufacture a conflict copy. The scheduler yields at five-second
+            // chunk boundaries; an in-flight HTTP chunk may overrun that target,
+            // but polling resumes immediately after its result is durable.
+            let remote_due = force_remote || Instant::now() >= next_remote;
+            if remote_poll_ready(remote_due, outbound_transfer_running) {
                 let mut changes = 0u64;
                 let mut queued = 0u64;
                 let mut failure = None;
 
-                // Startup can leave a configured account unattached when the
-                // keyring is locked. Do not prompt on every timer tick; retry
-                // only after an explicit wake (SyncNow or a local change).
-                if force_remote {
+                // A transient token-endpoint failure must recover on the
+                // ordinary remote timer. A locked keyring is different: retry
+                // that only after an explicit wake, otherwise Secret Service
+                // can prompt the user on every timer tick.
+                let retry_missing = {
+                    let status = self.status.read().await;
+                    missing_account_retry_due(force_remote, &status.state)
+                };
+                if retry_missing {
                     if let Err(error) = self.attach_missing_accounts().await {
-                        tracing::warn!(%error, "could not restore configured account");
+                        tracing::warn!(error = ?error, "could not restore configured account");
                         failure = Some(self.report_anyhow_error(&error).await);
                     }
                 }
@@ -364,7 +371,6 @@ impl App {
 
                 let success = failure.is_none();
                 if success {
-                    remote_epoch = remote_epoch.saturating_add(1);
                     retry_interval = base;
                     next_remote = Instant::now() + base;
                     remote_required_for_local = false;
@@ -404,15 +410,8 @@ impl App {
                     if success {
                         explicit_sync = Some(ExplicitSync {
                             target_generation: target,
-                            required_remote_epoch: remote_epoch,
-                            full_scan_done: false,
                             result,
                         });
-                        if discovery_running {
-                            discovery_again = true;
-                        } else {
-                            next_full = Instant::now();
-                        }
                     } else {
                         self.complete_explicit_sync(&mut completed_generation, target, result);
                     }
@@ -430,10 +429,9 @@ impl App {
                 continue;
             }
 
-            if !discovery_running && Instant::now() >= next_full {
+            if !discovery_running && open_writes.is_idle() && Instant::now() >= next_full {
                 let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
                 let tx = discovery_tx.clone();
-                let scan_epoch = remote_epoch;
                 discovery_running = true;
                 next_full = Instant::now() + full_interval;
                 tokio::spawn(async move {
@@ -448,12 +446,7 @@ impl App {
                     .await
                     .map_err(anyhow::Error::from)
                     .and_then(|result| result);
-                    let _ = tx
-                        .send(FullScanBatch {
-                            remote_epoch: scan_epoch,
-                            result,
-                        })
-                        .await;
+                    let _ = tx.send(FullScanBatch { result }).await;
                 });
                 continue;
             }
@@ -480,8 +473,13 @@ impl App {
                 continue;
             }
 
-            if !dirty_paths.is_empty() && !remote_required_for_local && !local_scan_running {
+            if !dirty_paths.is_empty()
+                && !remote_required_for_local
+                && !local_scan_running
+                && !open_writes.blocks(&dirty_paths)
+            {
                 let paths: Vec<_> = dirty_paths.drain().collect();
+                let completed_writes = std::mem::take(&mut completed_writes);
                 let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
                 let tx = local_scan_tx.clone();
                 local_scan_running = true;
@@ -489,7 +487,7 @@ impl App {
                     let result = tokio::task::spawn_blocking(move || {
                         let results = engines
                             .iter()
-                            .map(|engine| engine.sync_local_paths(&paths))
+                            .map(|engine| engine.sync_local_change_batch(&paths, &completed_writes))
                             .collect();
                         LocalScanBatch { engines, results }
                     })
@@ -530,28 +528,23 @@ impl App {
                 continue;
             }
 
-            let timer = if discovery_running {
+            let timer = if discovery_running || !open_writes.is_idle() {
                 next_remote
             } else {
                 next_remote.min(next_full)
             };
+            let remote_due = force_remote || Instant::now() >= next_remote;
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
                     tracing::info!("shutting down");
                     return;
                 }
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(timer)) => {}
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(timer)),
+                    if !remote_due || !outbound_transfer_running => {}
                 Some(batch) = discovery_rx.recv(), if discovery_running => {
                     discovery_running = false;
                     let verification = self.consume_full_scan(batch.result, &mut dirty_paths).await;
-                    if verification.is_some() {
-                        if let Some(explicit) = explicit_sync.as_mut() {
-                            if batch.remote_epoch >= explicit.required_remote_epoch {
-                                explicit.full_scan_done = true;
-                            }
-                        }
-                    }
                     delete_verification_ready = verification.is_some();
                     if verification == Some(true) {
                         remote_required_for_local = true;
@@ -598,6 +591,7 @@ impl App {
                     match batch {
                         Some(batch) => {
                             dirty_paths.extend(batch.paths);
+                            completed_writes.extend(batch.completed_writes);
                             remote_required_for_local = true;
                             force_remote = true;
                             if batch.force_full {
@@ -620,6 +614,19 @@ impl App {
     }
 }
 
+/// Decide whether an unattached account may be retried without user input.
+/// Only `offline` is self-healing. A locked keyring could repeatedly display
+/// an unlock prompt, and a rejected refresh token needs a real sign-in.
+pub(super) fn missing_account_retry_due(force_remote: bool, state: &str) -> bool {
+    force_remote || state == "offline"
+}
+
+/// A delta must not observe a remote mutation that an outbound worker has
+/// completed at Graph but has not committed to the local store yet.
+pub(super) fn remote_poll_ready(remote_due: bool, outbound_running: bool) -> bool {
+    remote_due && !outbound_running
+}
+
 pub(super) fn outbound_scope(
     discovery_running: bool,
     local_scan_running: bool,
@@ -632,10 +639,7 @@ pub(super) fn outbound_scope(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn sync_barrier_ready(
-    full_scan_done: bool,
-    discovery_running: bool,
     local_scan_running: bool,
     download_running: bool,
     outbound_running: bool,
@@ -644,9 +648,7 @@ pub(super) fn sync_barrier_ready(
     download_work: bool,
     queue_work: bool,
 ) -> bool {
-    full_scan_done
-        && !discovery_running
-        && !local_scan_running
+    !local_scan_running
         && !download_running
         && !outbound_running
         && !remote_required

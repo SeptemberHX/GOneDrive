@@ -1,13 +1,108 @@
 //! Descriptor-bound path authorization and fanotify mark ownership.
 
+use std::collections::HashMap;
+use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
+use crate::fanotify::descriptor_path;
+use crate::file_handle::{object_is_gone, ReopenableFile};
 use crate::{FileIdentity, MarkEntry, Shared};
+
+/// Both lookup directions live under one lock so registration, replacement,
+/// event validation, and explicit unwatch always observe one coherent set.
+/// The reverse index avoids scanning every existing mark for each new path,
+/// which made a cold registration of a large drive quadratic.
+#[derive(Default)]
+pub(super) struct MarkRegistry {
+    by_identity: HashMap<FileIdentity, MarkEntry>,
+    by_path: HashMap<u32, HashMap<Arc<Path>, Vec<FileIdentity>>>,
+}
+
+impl MarkRegistry {
+    pub(super) fn get(&self, identity: &FileIdentity) -> Option<&MarkEntry> {
+        self.by_identity.get(identity)
+    }
+
+    fn insert(&mut self, identity: FileIdentity, entry: MarkEntry) {
+        if let Some(previous) = self.by_identity.remove(&identity) {
+            self.remove_path_identity(previous.uid, &previous.path, identity);
+        }
+        self.by_path
+            .entry(entry.uid)
+            .or_default()
+            .entry(entry.path.clone())
+            .or_default()
+            .push(identity);
+        self.by_identity.insert(identity, entry);
+    }
+
+    fn remove(&mut self, identity: &FileIdentity) -> Option<MarkEntry> {
+        let entry = self.by_identity.remove(identity)?;
+        self.remove_path_identity(entry.uid, &entry.path, *identity);
+        Some(entry)
+    }
+
+    /// Refresh the pathname attached to an inode mark that already exists.
+    /// fanotify marks follow the inode across a rename; both indexes must make
+    /// the same transition so a later unwatch cannot leave the moved mark
+    /// behind under its old name.
+    fn refresh(
+        &mut self,
+        identity: FileIdentity,
+        uid: u32,
+        path: &Path,
+        sweep: Option<u64>,
+    ) -> bool {
+        let Some(mut entry) = self.remove(&identity) else {
+            return false;
+        };
+        entry.uid = uid;
+        entry.path = Arc::from(path);
+        if let Some(sweep) = sweep {
+            entry.sweep = sweep;
+        }
+        self.insert(identity, entry);
+        true
+    }
+
+    fn remove_path_identity(&mut self, uid: u32, path: &Path, identity: FileIdentity) {
+        let Some(paths) = self.by_path.get_mut(&uid) else {
+            return;
+        };
+        let remove_path = paths.get_mut(path).is_some_and(|identities| {
+            identities.retain(|candidate| *candidate != identity);
+            identities.is_empty()
+        });
+        if remove_path {
+            paths.remove(path);
+        }
+        if paths.is_empty() {
+            self.by_path.remove(&uid);
+        }
+    }
+
+    fn identities_for_path(&self, uid: u32, path: &Path) -> Vec<FileIdentity> {
+        self.by_path
+            .get(&uid)
+            .and_then(|paths| paths.get(path))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn stale_identities(&self, uid: u32, sweep: u64) -> Vec<FileIdentity> {
+        self.by_identity
+            .iter()
+            .filter(|(_, entry)| entry.uid == uid && entry.sweep != sweep)
+            .map(|(identity, _)| *identity)
+            .collect()
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct AuthorisedFile {
@@ -88,72 +183,374 @@ pub(super) fn open_authorised(path: &Path, uid: u32, access: i32) -> Result<Auth
 
 pub(super) fn install_mark(shared: &Arc<Shared>, path: &Path, uid: u32) -> Result<FileIdentity> {
     let target = open_authorised(path, uid, libc::O_PATH)?;
-    {
-        let marks = shared.marks.lock().unwrap();
-        if marks
-            .get(&target.identity)
-            .is_some_and(|entry| entry.uid == uid && entry.path == path)
-        {
-            return Ok(target.identity);
+    let sweep = shared.sweeps.lock().unwrap().get(&uid).copied();
+    let existing_stale = {
+        let mut marks = shared.marks.lock().unwrap();
+        if marks.refresh(target.identity, uid, path, sweep) {
+            // Inode marks survive a rename. Refresh the path without another
+            // syscall so watcher reconciliation naturally follows the inode.
+            let stale = marks
+                .identities_for_path(uid, path)
+                .into_iter()
+                .filter(|identity| *identity != target.identity)
+                .filter_map(|identity| marks.remove(&identity).map(|entry| (identity, entry)))
+                .collect();
+            Some(stale)
+        } else {
+            None
         }
+    };
+    if let Some(stale) = existing_stale {
+        retire_stale_marks(shared, stale);
+        restore_locked_placeholder(&target.file)
+            .with_context(|| format!("could not unlock protected {}", path.display()))?;
+        return Ok(target.identity);
     }
 
+    // Open a safety-locked placeholder before installing its permission mark.
+    // Reopening it afterwards would itself block on the new mark before the
+    // registry entry exists. The descriptor remains bound to this exact inode.
+    let locked = LockedPlaceholder::prepare(&target.file)
+        .with_context(|| format!("could not inspect safety lock on {}", path.display()))?;
     shared
         .fan
         .watch_fd(target.file.as_raw_fd())
         .with_context(|| format!("could not watch {}", path.display()))?;
+    if let Some(locked) = locked {
+        if let Err(error) = locked.restore() {
+            let _ = shared.fan.unwatch_fd(target.file.as_raw_fd());
+            return Err(error)
+                .with_context(|| format!("could not unlock protected {}", path.display()));
+        }
+    }
+    let (file, fallback_error) = ReopenableFile::capture(target.file, &shared.mounts);
+    if let Some(error) = fallback_error {
+        let fallbacks = shared.descriptor_fallbacks.fetch_add(1, Ordering::Relaxed) + 1;
+        if fallbacks == 1 {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "filesystem cannot reopen persistent file handles; retaining one descriptor per placeholder on this filesystem"
+            );
+        }
+    }
 
     let stale = {
         let mut marks = shared.marks.lock().unwrap();
-        let stale_ids: Vec<_> = marks
-            .iter()
-            .filter(|(identity, entry)| {
-                **identity != target.identity && entry.uid == uid && entry.path == path
-            })
-            .map(|(identity, _)| *identity)
-            .collect();
-        let stale = stale_ids
-            .into_iter()
-            .filter_map(|identity| marks.remove(&identity))
-            .collect::<Vec<_>>();
-        marks.insert(
-            target.identity,
-            MarkEntry {
-                uid,
-                path: path.to_path_buf(),
-                file: target.file,
-            },
-        );
-        stale
-    };
-    for entry in stale {
-        if let Err(error) = shared.fan.unwatch_fd(entry.file.as_raw_fd()) {
-            tracing::debug!(path = %entry.path.display(), %error, "could not remove stale mark");
+        // Another connection may have installed the same inode while the
+        // persistent handle was captured. Reuse its entry and drop ours.
+        if !marks.refresh(target.identity, uid, path, sweep) {
+            marks.insert(
+                target.identity,
+                MarkEntry {
+                    uid,
+                    path: Arc::from(path),
+                    file,
+                    sweep: sweep.unwrap_or(0),
+                },
+            );
         }
-    }
+        marks
+            .identities_for_path(uid, path)
+            .into_iter()
+            .filter(|identity| *identity != target.identity)
+            .filter_map(|identity| marks.remove(&identity).map(|entry| (identity, entry)))
+            .collect::<Vec<_>>()
+    };
+    // A concurrent registration may have won after fanotify_mark. Adding the
+    // same inode mark is idempotent; dropping our duplicate handle is enough.
+    retire_stale_marks(shared, stale);
     tracing::debug!(path = %path.display(), uid, "watching");
     Ok(target.identity)
 }
 
-pub(super) fn remove_marks_for_path(shared: &Arc<Shared>, path: &Path, uid: u32) -> Result<()> {
-    validate_path(path)?;
-    let removed = {
-        let mut marks = shared.marks.lock().unwrap();
-        let identities: Vec<_> = marks
-            .iter()
-            .filter(|(_, entry)| entry.uid == uid && entry.path == path)
-            .map(|(identity, _)| *identity)
-            .collect();
-        identities
-            .into_iter()
-            .filter_map(|identity| marks.remove(&identity))
-            .collect::<Vec<_>>()
-    };
-    for entry in removed {
-        shared
-            .fan
-            .unwatch_fd(entry.file.as_raw_fd())
-            .with_context(|| format!("could not unwatch {}", path.display()))?;
+const XATTR_SAFETY_MODE: &[u8] = b"user.gonedrive.safety_mode\0";
+
+struct LockedPlaceholder {
+    path_file: File,
+    mode: libc::mode_t,
+}
+
+impl LockedPlaceholder {
+    fn prepare(path_file: &File) -> std::io::Result<Option<Self>> {
+        if path_file.metadata()?.mode() & 0o7777 != 0 {
+            return Ok(None);
+        }
+        let target = descriptor_path(path_file.as_raw_fd());
+        let mut raw = [0u8; std::mem::size_of::<u32>()];
+        // Read through the helper-owned O_PATH descriptor's procfs magic link.
+        // Reopening it O_RDONLY can itself block on an existing fanotify mark,
+        // deadlocking registration if the event loop is the component being
+        // recovered. The live descriptor still binds every operation below to
+        // this exact authorised inode.
+        let size = unsafe {
+            libc::getxattr(
+                target.as_ptr(),
+                XATTR_SAFETY_MODE.as_ptr().cast(),
+                raw.as_mut_ptr().cast(),
+                raw.len(),
+            )
+        };
+        if size < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENODATA) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        if size as usize != raw.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid saved placeholder mode",
+            ));
+        }
+        let mode = u32::from_le_bytes(raw) as libc::mode_t;
+        if mode & !0o7777 != 0 || mode == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "saved placeholder mode is outside the permission bits",
+            ));
+        }
+        Ok(Some(Self {
+            path_file: path_file.try_clone()?,
+            mode,
+        }))
+    }
+
+    fn restore(self) -> std::io::Result<()> {
+        let target = descriptor_path(self.path_file.as_raw_fd());
+        // chmod follows the helper's own immutable descriptor link, not the
+        // user-supplied path. The saved mode was range-checked above.
+        if unsafe { libc::chmod(target.as_ptr(), self.mode) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // The file is already accessible and protected by fanotify. A stale
+        // private xattr is harmless, so do not turn successful recovery into a
+        // failed registration solely because its cleanup was refused.
+        let rc = unsafe { libc::removexattr(target.as_ptr(), XATTR_SAFETY_MODE.as_ptr().cast()) };
+        if rc != 0 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "could not remove a restored placeholder safety marker"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn restore_locked_placeholder(path_file: &File) -> std::io::Result<()> {
+    if let Some(locked) = LockedPlaceholder::prepare(path_file)? {
+        locked.restore()?;
     }
     Ok(())
+}
+
+fn retire_stale_marks(shared: &Arc<Shared>, stale: Vec<(FileIdentity, MarkEntry)>) {
+    for (identity, entry) in stale {
+        if let Err(error) = unwatch_entry(shared, &entry) {
+            tracing::warn!(path = %entry.path.display(), %error, "could not remove stale mark");
+            shared.marks.lock().unwrap().insert(identity, entry);
+        }
+    }
+}
+
+pub(super) fn remove_marks_for_path(shared: &Arc<Shared>, path: &Path, uid: u32) -> Result<()> {
+    validate_path(path)?;
+    let identities = shared.marks.lock().unwrap().identities_for_path(uid, path);
+    let mut failures = Vec::new();
+    for identity in identities {
+        match remove_mark_by_identity(shared, identity) {
+            Some(Ok(())) => {}
+            Some(Err(error)) => failures.push(error),
+            None => {}
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "could not unwatch {}: {}",
+            path.display(),
+            failures
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    }
+}
+
+pub(super) fn begin_mark_sweep(shared: &Arc<Shared>, uid: u32) {
+    let sweep = shared.next_sweep.fetch_add(1, Ordering::Relaxed);
+    shared.sweeps.lock().unwrap().insert(uid, sweep);
+}
+
+pub(super) fn cancel_mark_sweep(shared: &Arc<Shared>, uid: u32) {
+    shared.sweeps.lock().unwrap().remove(&uid);
+}
+
+pub(super) fn commit_mark_sweep(shared: &Arc<Shared>, uid: u32) -> Result<usize> {
+    let sweep = shared
+        .sweeps
+        .lock()
+        .unwrap()
+        .remove(&uid)
+        .ok_or_else(|| anyhow::anyhow!("no mark sweep is active for uid {uid}"))?;
+    let stale = shared.marks.lock().unwrap().stale_identities(uid, sweep);
+    let mut removed = 0usize;
+    let mut failures = Vec::new();
+    for identity in stale {
+        match remove_mark_by_identity(shared, identity) {
+            Some(Ok(())) => removed += 1,
+            Some(Err(error)) => failures.push(error),
+            None => {}
+        }
+    }
+    if failures.is_empty() {
+        Ok(removed)
+    } else {
+        bail!(
+            "could not retire {} stale mark(s): {}",
+            failures.len(),
+            failures
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    }
+}
+
+pub(super) fn remove_mark_by_event_fd(
+    shared: &Arc<Shared>,
+    identity: FileIdentity,
+    fd: std::os::fd::RawFd,
+) -> std::io::Result<()> {
+    match shared.fan.unwatch_fd(fd) {
+        Ok(()) => {
+            shared.marks.lock().unwrap().remove(&identity);
+            Ok(())
+        }
+        Err(error) if object_is_gone(&error) => {
+            shared.marks.lock().unwrap().remove(&identity);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn unwatch_entry(shared: &Arc<Shared>, entry: &MarkEntry) -> std::io::Result<()> {
+    match entry.file.with_fd(|fd| shared.fan.unwatch_fd(fd)) {
+        Ok(()) => Ok(()),
+        Err(error) if object_is_gone(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_mark_by_identity(
+    shared: &Arc<Shared>,
+    identity: FileIdentity,
+) -> Option<std::io::Result<()>> {
+    let mut marks = shared.marks.lock().unwrap();
+    let result = marks
+        .get(&identity)
+        .map(|entry| unwatch_entry(shared, entry));
+    if result.as_ref().is_some_and(|result| result.is_ok()) {
+        marks.remove(&identity);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(uid: u32, path: &str, sweep: u64) -> MarkEntry {
+        MarkEntry {
+            uid,
+            path: Arc::from(Path::new(path)),
+            file: ReopenableFile::Descriptor(tempfile::tempfile().unwrap()),
+            sweep,
+        }
+    }
+
+    #[test]
+    fn a_committed_sweep_retires_only_unseen_marks_for_its_uid() {
+        let current = FileIdentity { dev: 1, ino: 1 };
+        let stale = FileIdentity { dev: 1, ino: 2 };
+        let other_user = FileIdentity { dev: 1, ino: 3 };
+        let mut marks = MarkRegistry::default();
+        marks.insert(current, entry(1000, "/tmp/current", 7));
+        marks.insert(stale, entry(1000, "/tmp/stale", 6));
+        marks.insert(other_user, entry(1001, "/tmp/other", 0));
+
+        assert_eq!(marks.stale_identities(1000, 7), vec![stale]);
+    }
+
+    #[test]
+    fn reverse_path_index_tracks_replacements_and_removals() {
+        let first = FileIdentity { dev: 1, ino: 1 };
+        let replacement = FileIdentity { dev: 1, ino: 2 };
+        let path = Path::new("/tmp/placeholder");
+        let mut marks = MarkRegistry::default();
+        marks.insert(first, entry(1000, "/tmp/placeholder", 1));
+        marks.insert(replacement, entry(1000, "/tmp/placeholder", 1));
+
+        let mut identities = marks.identities_for_path(1000, path);
+        identities.sort_by_key(|identity| identity.ino);
+        assert_eq!(identities, vec![first, replacement]);
+
+        marks.remove(&first);
+        assert_eq!(marks.identities_for_path(1000, path), vec![replacement]);
+        marks.remove(&replacement);
+        assert!(marks.identities_for_path(1000, path).is_empty());
+    }
+
+    #[test]
+    fn refreshing_a_renamed_inode_moves_the_reverse_index() {
+        let identity = FileIdentity { dev: 1, ino: 7 };
+        let old = Path::new("/tmp/Todo/2025");
+        let new = Path::new("/tmp/Done/2025");
+        let mut marks = MarkRegistry::default();
+        marks.insert(identity, entry(1000, old.to_str().unwrap(), 3));
+
+        assert!(marks.refresh(identity, 1000, new, Some(4)));
+        assert!(marks.identities_for_path(1000, old).is_empty());
+        assert_eq!(marks.identities_for_path(1000, new), vec![identity]);
+        let refreshed = marks.get(&identity).unwrap();
+        assert_eq!(refreshed.path.as_ref(), new);
+        assert_eq!(refreshed.sweep, 4);
+    }
+
+    #[test]
+    fn a_safety_locked_inode_is_restored_without_a_read_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("placeholder");
+        std::fs::write(&path, []).unwrap();
+        xattr::set(&path, "user.gonedrive.safety_mode", &0o640u32.to_le_bytes()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+
+        let uid = unsafe { libc::geteuid() };
+        let path_file = open_authorised(&path, uid, libc::O_PATH).unwrap().file;
+        // `prepare` reads a mode-000 inode's xattr and intentionally requires
+        // the production helper's CAP_DAC_OVERRIDE. Exercise the descriptor-
+        // bound restore path here without making the test suite run as root.
+        LockedPlaceholder {
+            path_file,
+            mode: 0o640,
+        }
+        .restore()
+        .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+        assert_eq!(
+            xattr::get(&path, "user.gonedrive.safety_mode").unwrap(),
+            None
+        );
+    }
 }

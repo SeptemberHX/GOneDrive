@@ -32,6 +32,7 @@ impl Engine {
             Err(e) => {
                 self.emit(SyncEvent::Failed {
                     name: "delta".into(),
+                    path: None,
                     error: e.to_string(),
                 });
                 return Err(e);
@@ -370,11 +371,21 @@ impl Engine {
 
         match action {
             RemoteAction::CreateDirectory => {
-                // Only inside a selected subtree. Building the full folder
-                // structure for a drive the user has not chosen leaves tens of
-                // thousands of empty directories behind for no benefit.
-                if self.wants_content(known.as_ref(), parent_id)? {
-                    self.rooted(account)?.ensure_dir(&path)?;
+                // Selective sync creates only chosen directories. Once the user
+                // materialises the drive, every later remote folder (including
+                // an empty or restored one) belongs in the browsable tree.
+                let on_demand = self.on_demand_enabled();
+                if on_demand || self.wants_content(known.as_ref(), parent_id)? {
+                    let rooted = self.rooted(account)?;
+                    rooted.ensure_dir(&path)?;
+                    if on_demand {
+                        let dir = rooted.open_read(&path)?;
+                        let _ = Placeholder::mark_dir_file(
+                            &dir,
+                            PlaceholderState::Dehydrated,
+                            &remote.id,
+                        );
+                    }
                     self.mark_dir(&remote.id)?;
                 } else {
                     summary.not_downloaded += 1;
@@ -419,7 +430,7 @@ impl Engine {
                     // the file is not materialised, so `create` (which
                     // is exclusive) cannot overwrite a local file that appears
                     // after discovery.
-                    if self.config.on_demand {
+                    if self.on_demand_enabled() {
                         self.create_placeholder_at(
                             account,
                             &path,
@@ -449,6 +460,7 @@ impl Engine {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned(),
+                    path: path.clone(),
                 });
                 // The preserved copy goes up as a new file; the remote version
                 // comes down under the original name. Neither is lost.
@@ -731,6 +743,7 @@ impl Engine {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .into_owned(),
+                        path: new_path.to_path_buf(),
                     });
                 }
                 Err(error) => return Err(error),

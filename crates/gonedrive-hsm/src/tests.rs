@@ -1,8 +1,81 @@
 use super::*;
 
+const SYSTEM_UNIT: &str = include_str!("../../../data/gonedrive-hsm.service");
+
 fn my_uid() -> u32 {
     // SAFETY: getuid cannot fail and takes no arguments.
     unsafe { libc::getuid() }
+}
+
+#[test]
+fn helper_unit_keeps_capacity_for_safe_filesystem_fallback() {
+    let limit = SYSTEM_UNIT
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("LimitNOFILE="))
+        .and_then(|value| value.parse::<usize>().ok())
+        .expect("the helper service must set LimitNOFILE");
+    assert!(limit >= 262_144, "LimitNOFILE={limit} is too small");
+}
+
+#[test]
+fn helper_unit_keeps_home_writable_for_hydration() {
+    assert!(
+        !SYSTEM_UNIT
+            .lines()
+            .any(|line| line.trim_start().starts_with("ProtectHome=")),
+        "the helper must be able to hydrate and restore authorized home files"
+    );
+    assert!(SYSTEM_UNIT.contains("PrivateNetwork=true"));
+    assert!(SYSTEM_UNIT.contains("RestrictAddressFamilies=AF_UNIX"));
+}
+
+#[test]
+fn a_nautilus_copy_is_bound_to_its_writable_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("source");
+    let destination_dir = dir.path().join("destination");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::create_dir_all(&destination_dir).unwrap();
+    let source = source_dir.join("report.docx");
+    let destination = destination_dir.join("report.docx");
+    std::fs::write(&source, b"remote bytes").unwrap();
+
+    assert_ne!(
+        hydration_reader(std::process::id() as i32, &source),
+        gonedrive_ipc::reader_policy::FILE_MANAGER_COPY_READER,
+        "an ordinary read has no writable destination"
+    );
+
+    let _destination = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .unwrap();
+    // The test process is not named Nautilus, so exercise the descriptor half
+    // directly; reader-name matching is covered in gonedrive-ipc.
+    assert_eq!(
+        super::worker::writable_copy_destination(std::process::id() as i32, &source),
+        Some(destination)
+    );
+}
+
+#[test]
+fn batch_error_text_stays_bounded_on_utf8_boundaries() {
+    let message = "错".repeat(MARK_ERROR_BYTES);
+    let truncated = truncate_mark_error(message);
+    assert!(truncated.is_char_boundary(truncated.len()));
+    assert!(truncated.len() <= MARK_ERROR_BYTES + 3);
+    assert!(truncated.ends_with("..."));
+}
+
+#[test]
+fn parallel_watch_work_preserves_request_order() {
+    let items: Vec<_> = (0..257).collect();
+    let results = parallel_map_ordered(&items, 4, |item| item * 3);
+    assert_eq!(
+        results,
+        items.iter().map(|item| item * 3).collect::<Vec<_>>()
+    );
 }
 
 // fill_from is the byte-writing core: it pwrites fetched content into the
@@ -62,6 +135,54 @@ fn fill_from_lands_a_range_at_its_offset_and_leaves_the_rest() {
         "bytes after the range are untouched"
     );
     assert_eq!(got.len(), 32, "the file was not grown past its size");
+}
+
+#[test]
+fn a_materialized_range_is_allowed_without_restaging_it() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("partial.bin");
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .unwrap();
+    file.set_len(16 * 1024).unwrap();
+
+    assert!(!requested_range_is_materialized(file.as_raw_fd(), 0, 1, 16 * 1024).unwrap());
+    file.write_all_at(&[0x42; 4096], 0).unwrap();
+    assert!(requested_range_is_materialized(file.as_raw_fd(), 0, 4096, 16 * 1024).unwrap());
+    assert!(!requested_range_is_materialized(file.as_raw_fd(), 8192, 4096, 16 * 1024).unwrap());
+    file.write_all_at(&[0x42; 12 * 1024], 4096).unwrap();
+    assert!(
+        requested_range_is_materialized(file.as_raw_fd(), 0, 16 * 1024, 16 * 1024).unwrap(),
+        "the final progressive range should promote the whole inode to hydrated"
+    );
+}
+
+#[test]
+fn a_full_fill_is_marked_hydrated_before_the_reader_resumes() {
+    use std::os::fd::AsRawFd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("placeholder");
+    std::fs::write(&path, b"real bytes").unwrap();
+    xattr::set(&path, "user.gonedrive.state", b"dehydrated").unwrap();
+
+    // fanotify supplies a read-only event descriptor. The helper runs as root
+    // in production, but an owner may update a user xattr through that same fd.
+    let file = std::fs::File::open(&path).unwrap();
+    mark_hydrated(file.as_raw_fd()).unwrap();
+
+    assert_eq!(
+        xattr::get(&path, "user.gonedrive.state")
+            .unwrap()
+            .as_deref(),
+        Some(b"hydrated".as_slice())
+    );
 }
 
 #[test]

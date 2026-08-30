@@ -2,12 +2,92 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::db::ItemState;
+use time::OffsetDateTime;
+
+use crate::db::{Account, ItemState, PinState, Store};
 use crate::error::{Error, Result};
 use crate::hydrate::{Placeholder, PlaceholderState};
+use crate::sync::plan::LocalStat;
 
 use super::super::engine::{Engine, FreeSpaceOutcome};
+use super::super::rooted_fs::RootedFs;
 use super::super::transfer;
+
+/// Local files-on-demand state derived without a live Graph client.
+#[derive(Debug, Default)]
+pub struct PlaceholderInventory {
+    /// Sparse files that exist and need a kernel interception mark.
+    pub existing: Vec<PathBuf>,
+    /// Remote item ids whose placeholder is absent or whose creation stopped
+    /// before it became visible.
+    pub missing: Vec<String>,
+}
+
+/// Discover every on-disk placeholder that needs kernel interception without
+/// requiring a live Graph client. HSM protection is a local safety property:
+/// it must come up even when the token endpoint or the login keyring is
+/// temporarily unavailable.
+pub fn dehydrated_paths_for_account(store: &Store, account: &Account) -> Result<Vec<PathBuf>> {
+    Ok(placeholder_inventory_for_account(store, account)?.existing)
+}
+
+/// Inventory existing and missing placeholders in one database/path pass.
+/// Startup already has to inspect these records to rebuild ephemeral fanotify
+/// marks; carrying missing ids out of that pass avoids a second whole-drive
+/// traversal when an earlier mark failure removed an unsafe sparse file.
+pub fn placeholder_inventory_for_account(
+    store: &Store,
+    account: &Account,
+) -> Result<PlaceholderInventory> {
+    let rooted = RootedFs::open(&account.root_local_path)?;
+    let mut inventory = PlaceholderInventory::default();
+
+    // The database narrows the search; the file's own xattr decides. A
+    // hydration interrupted by a crash leaves the record saying `Hydrating`
+    // while the file on disk is still empty, and trusting the record there
+    // would leave that file unwatched and silently readable as zeroes.
+    for state in [
+        ItemState::Dehydrated,
+        ItemState::Hydrating,
+        ItemState::Error,
+    ] {
+        for record in store.items_in_state(&account.id, state)? {
+            if record.is_folder {
+                continue;
+            }
+            let Some(path) = store.local_path(account, &record.id)? else {
+                continue;
+            };
+            let file = match rooted.open_read(&path) {
+                Ok(file) => file,
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    inventory.missing.push(record.id);
+                    continue;
+                }
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    use std::os::unix::fs::MetadataExt;
+                    let path_file = rooted.open_path(&path)?;
+                    if path_file.metadata()?.mode() & 0o7777 == 0 {
+                        inventory.existing.push(path);
+                        continue;
+                    }
+                    return Err(Error::Io(error));
+                }
+                Err(error) => return Err(error),
+            };
+            if Placeholder::item_id_file(&file).as_deref() == Some(&record.id)
+                && Placeholder::state_file(&file) == PlaceholderState::Dehydrated
+            {
+                inventory.existing.push(path);
+            }
+        }
+    }
+    inventory.existing.sort();
+    inventory.existing.dedup();
+    inventory.missing.sort();
+    inventory.missing.dedup();
+    Ok(inventory)
+}
 
 impl Engine {
     /// Files under a path that exist locally right now.
@@ -61,11 +141,20 @@ impl Engine {
             .item_at_path(&self.account_id, &root_id, relative)?
             .ok_or_else(|| Error::other(format!("no such path: {}", relative.display())))?;
 
-        let files = if target.is_folder {
+        let releasing_folder = target.is_folder;
+        let files = if releasing_folder {
             self.store.files_in_subtree(&target.id)?
         } else {
             vec![target]
         };
+
+        // Releasing a folder is also a standing choice for content discovered
+        // under it later. Clear the folder pin once, canceling its queued
+        // downloads, then let every successfully dehydrated child inherit that
+        // choice. A single-file request records the exclusion on that file.
+        if releasing_folder {
+            self.set_pin(relative, PinState::Unpinned)?;
+        }
 
         let mut outcome = FreeSpaceOutcome::default();
         for file in files {
@@ -75,7 +164,12 @@ impl Engine {
             if rooted.metadata(&path)?.is_none() {
                 continue;
             }
-            match self.dehydrate(&path) {
+            let released = if releasing_folder {
+                self.dehydrate(&path)
+            } else {
+                self.release_space(&path)
+            };
+            match released {
                 Ok(freed) => {
                     outcome.freed += freed;
                     outcome.files += 1;
@@ -346,7 +440,17 @@ impl Engine {
                     continue;
                 }
                 Ok(file) if Placeholder::state_file(&file) == PlaceholderState::Hydrated => {
-                    ItemState::Synced
+                    let local = LocalStat::from_metadata(&file.metadata()?);
+                    self.store.commit_hydration(
+                        &account.id,
+                        &record.id,
+                        OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
+                        Some(local.size),
+                        Some(local.ino),
+                    )?;
+                    repaired += 1;
+                    tracing::info!(path = %path.display(), state = ?ItemState::Synced, "repaired a stale hydrating record");
+                    continue;
                 }
                 Ok(_) => ItemState::Dehydrated,
                 Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -487,38 +591,6 @@ impl Engine {
     /// the privileged helper at start-up.
     pub fn dehydrated_paths(&self) -> Result<Vec<PathBuf>> {
         let account = self.account()?;
-        let rooted = self.rooted(&account)?;
-        let mut out = Vec::new();
-
-        // The database narrows the search; the file's own xattr decides. A
-        // hydration interrupted by a crash leaves the record saying
-        // `Hydrating` while the file on disk is still empty, and trusting the
-        // record there would leave that file unwatched — readable as zeroes,
-        // silently, forever.
-        for state in [
-            ItemState::Dehydrated,
-            ItemState::Hydrating,
-            ItemState::Error,
-        ] {
-            for record in self.store.items_in_state(&self.account_id, state)? {
-                if record.is_folder {
-                    continue;
-                }
-                let Some(path) = self.store.local_path(&account, &record.id)? else {
-                    continue;
-                };
-                let Ok(file) = rooted.open_read(&path) else {
-                    continue;
-                };
-                if Placeholder::item_id_file(&file).as_deref() == Some(&record.id)
-                    && Placeholder::state_file(&file) == PlaceholderState::Dehydrated
-                {
-                    out.push(path);
-                }
-            }
-        }
-        out.sort();
-        out.dedup();
-        Ok(out)
+        dehydrated_paths_for_account(&self.store, &account)
     }
 }

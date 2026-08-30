@@ -14,6 +14,7 @@ Two decisions keep this fast enough to run on every file Nautilus draws:
 """
 
 import os
+import tomllib
 
 import gi
 
@@ -36,6 +37,43 @@ EMBLEM_SYNCING = "gonedrive-syncing"
 EMBLEM_ERROR = "gonedrive-error"
 
 
+def configured_roots():
+    """Return the local sync roots without contacting the daemon.
+
+    File managers preserve user xattrs when copying a file.  The attributes
+    therefore identify a placeholder only *inside* the configured sync tree;
+    treating them as globally authoritative would put cloud badges and actions
+    on an ordinary copy in Downloads.  Reading the small config file once when
+    Nautilus loads the provider keeps status rendering offline and syscall-only.
+    """
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if not config_home:
+        config_home = os.path.join(os.path.expanduser("~"), ".config")
+    config_path = os.path.join(config_home, "gonedrive", "config.toml")
+    default_root = os.path.join(os.path.expanduser("~"), "OneDrive")
+    try:
+        with open(config_path, "rb") as handle:
+            root = tomllib.load(handle).get("sync_root", default_root)
+    except (OSError, tomllib.TOMLDecodeError):
+        root = default_root
+    if not isinstance(root, str) or not root.strip():
+        root = default_root
+    return (os.path.abspath(os.path.expanduser(root)),)
+
+
+def is_in_sync_root(path, roots):
+    """Use component boundaries, so ``OneDrive-old`` is not in ``OneDrive``."""
+    absolute = os.path.abspath(path)
+    for root in roots:
+        try:
+            if os.path.commonpath((absolute, root)) == root:
+                return True
+        except ValueError:
+            # Different drives on platforms where paths can name a drive.
+            continue
+    return False
+
+
 def describe_scope(managed):
     """Human words for exactly what a menu action will touch."""
     if len(managed) == 1:
@@ -43,6 +81,17 @@ def describe_scope(managed):
         name = os.path.basename(path)
         return f"整个文件夹「{name}」" if file.is_directory() else f"「{name}」"
     return f"选中的 {len(managed)} 项"
+
+
+def menu_item_name(namespace, action):
+    """Return a Nautilus action id unique to its selection scope.
+
+    Nautilus installs both the selected-item and folder-background menus in
+    the same action map. Reusing an id lets the later background action replace
+    the selected-file callback, which can turn "free this file" into "free the
+    whole folder".
+    """
+    return f"GOnedrive::{namespace}::{action}"
 
 
 def _xattr(path, name):
@@ -77,7 +126,7 @@ FOLDER_PINNED = Status(EMBLEM_PINNED, "始终保留在此设备")
 
 
 def status_of(path, is_dir=False):
-    """Classify a path, or return None if GOnedrive does not manage it."""
+    """Classify a path already known to be inside a GOnedrive sync root."""
     state = _xattr(path, XATTR_STATE)
     if state is None:
         return None
@@ -109,6 +158,7 @@ class GOnedriveExtension(
     def __init__(self):
         super().__init__()
         self._bus = None
+        self._roots = configured_roots()
 
     # ---- status ---------------------------------------------------------
 
@@ -144,6 +194,11 @@ class GOnedriveExtension(
         if not managed:
             return []
 
+        return self._build_menu(managed, "selection")
+
+    def _build_menu(self, managed, namespace):
+        """Build one menu bound to exactly the paths in ``managed``."""
+
         statuses = [status_of(p, f.is_directory()) for f, p in managed]
         # A folder carries no status of its own but still has contents worth
         # acting on, so it counts as actionable when it is inside the tree.
@@ -161,7 +216,7 @@ class GOnedriveExtension(
 
         if any(s in (ONLINE_ONLY, AVAILABLE) for s in statuses) or folders:
             keep = Nautilus.MenuItem(
-                name="GOnedrive::pin",
+                name=menu_item_name(namespace, "pin"),
                 label=f"始终保留{scope}",
                 tip="下载并保留，之后新增的内容也会自动下载",
             )
@@ -170,7 +225,7 @@ class GOnedriveExtension(
 
         if any(s in (AVAILABLE, ALWAYS_KEEP) for s in statuses) or folders:
             free = Nautilus.MenuItem(
-                name="GOnedrive::free",
+                name=menu_item_name(namespace, "free"),
                 label=f"释放{scope}的空间",
                 tip="移除本机内容，文件保留，打开时自动重新下载",
             )
@@ -179,7 +234,7 @@ class GOnedriveExtension(
 
         if any(s is ONLINE_ONLY for s in statuses):
             fetch = Nautilus.MenuItem(
-                name="GOnedrive::fetch",
+                name=menu_item_name(namespace, "fetch"),
                 label=f"立即下载{scope}",
                 tip="现在就把内容取回本机",
             )
@@ -189,7 +244,9 @@ class GOnedriveExtension(
         if not items:
             return []
 
-        top = Nautilus.MenuItem(name="GOnedrive::menu", label="GOnedrive")
+        top = Nautilus.MenuItem(
+            name=menu_item_name(namespace, "menu"), label="GOnedrive"
+        )
         submenu = Nautilus.Menu()
         for item in items:
             submenu.append_item(item)
@@ -201,9 +258,12 @@ class GOnedriveExtension(
         path = self._path_of(folder)
         if path is None:
             return []
-        # `get_file_items` takes a list; the background callback hands over a
-        # single folder.
-        return self.get_file_items([folder]) if folder.is_directory() else []
+        if not folder.is_directory():
+            return []
+        # Keep this construction independent from `get_file_items`: both
+        # providers coexist in Nautilus, but their callbacks must never share an
+        # action id or capture each other's paths.
+        return self._build_menu([(folder, path)], "background")
 
     # ---- daemon ---------------------------------------------------------
 
@@ -252,9 +312,10 @@ class GOnedriveExtension(
 
     # ---- helpers --------------------------------------------------------
 
-    @staticmethod
-    def _path_of(file):
+    def _path_of(self, file):
         if file.get_uri_scheme() != "file":
             return None
         path = Gio.File.new_for_uri(file.get_uri()).get_path()
-        return path if path and os.path.lexists(path) else None
+        if not path or not os.path.lexists(path):
+            return None
+        return path if is_in_sync_root(path, self._roots) else None

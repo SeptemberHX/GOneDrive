@@ -250,9 +250,35 @@ impl UploadSession {
     /// `nextExpectedRanges` describes which bytes are *missing*, not how large
     /// the next chunk should be, so only its start offset is meaningful here.
     pub fn next_offset(&self) -> Option<u64> {
-        let range = self.next_expected_ranges.first()?;
-        range.split('-').next()?.trim().parse().ok()
+        next_upload_offset(&self.next_expected_ranges)
     }
+}
+
+/// Progress returned after a fragment write or an upload-session status query.
+///
+/// Unlike the response that creates a session, Graph's documented `202`
+/// fragment response does not contain `uploadUrl`. Keeping this as a separate
+/// wire type prevents a valid large-file upload from being rejected as a JSON
+/// decode failure.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadStatus {
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub expiration_date_time: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub next_expected_ranges: Vec<String>,
+}
+
+impl UploadStatus {
+    /// First byte the service still wants.
+    pub fn next_offset(&self) -> Option<u64> {
+        next_upload_offset(&self.next_expected_ranges)
+    }
+}
+
+fn next_upload_offset(ranges: &[String]) -> Option<u64> {
+    let range = ranges.first()?;
+    range.split('-').next()?.trim().parse().ok()
 }
 
 /// The error envelope Graph returns on failure.
@@ -333,6 +359,16 @@ mod tests {
             ..session
         };
         assert_eq!(empty.next_offset(), None);
+    }
+
+    #[test]
+    fn fragment_progress_does_not_require_an_upload_url() {
+        let status: UploadStatus = serde_json::from_str(
+            r#"{"expirationDateTime":"2030-01-01T00:00:00Z",
+                 "nextExpectedRanges":["327680-"]}"#,
+        )
+        .unwrap();
+        assert_eq!(status.next_offset(), Some(327_680));
     }
 
     #[test]

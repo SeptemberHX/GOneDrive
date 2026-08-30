@@ -4,6 +4,7 @@
 //! so they are defined here against `linux/fanotify.h`. Everything unsafe in
 //! this crate is confined to this file.
 
+use std::ffi::CString;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
@@ -11,6 +12,10 @@ use std::path::PathBuf;
 /// Notification class that can fill content before it is read.
 /// Requires `CAP_SYS_ADMIN`.
 pub const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
+/// Report a per-event descriptor open error in `EventMetadata::fd` instead of
+/// failing the read of the whole fanotify queue. Linux automatically denies a
+/// permission event whose descriptor could not be opened.
+const FAN_REPORT_FD_ERROR: u32 = 0x0000_2000;
 /// A read is about to happen; the listener may fill the range first.
 pub const FAN_PRE_ACCESS: u64 = 0x0010_0000;
 /// A file is being opened. Fires before the opener does anything — crucially,
@@ -30,6 +35,8 @@ const FAN_EVENT_INFO_TYPE_RANGE: u8 = 6;
 
 const FAN_CLOEXEC: u32 = 0x0000_0001;
 const FAN_NONBLOCK: u32 = 0x0000_0002;
+const FAN_INIT_FLAGS: u32 =
+    FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC | FAN_NONBLOCK | FAN_REPORT_FD_ERROR;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -91,10 +98,7 @@ impl Fanotify {
     pub fn open() -> io::Result<Self> {
         // SAFETY: a plain syscall with no pointer arguments.
         let fd = unsafe {
-            libc::fanotify_init(
-                FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC | FAN_NONBLOCK,
-                (libc::O_RDWR | libc::O_LARGEFILE) as u32,
-            )
+            libc::fanotify_init(FAN_INIT_FLAGS, (libc::O_RDWR | libc::O_LARGEFILE) as u32)
         };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -125,20 +129,26 @@ impl Fanotify {
 
     /// Mark the exact object already opened by the caller.
     ///
-    /// A pathname-based mark would reopen the path after the privileged helper
-    /// checked its owner. A rename between those two operations could make the
-    /// mark land on an unrelated root-owned inode. Linux accepts a NULL path
-    /// here and then treats `dirfd` itself as the object to mark.
+    /// The user-supplied pathname must not be reopened after authorisation: a
+    /// rename in between could make the mark land on a different inode. Resolve
+    /// the helper's own live descriptor through procfs instead. That magic link
+    /// is bound to this descriptor, not to the original pathname, and the
+    /// owning `File` remains alive for the whole syscall.
+    ///
+    /// In particular, do not pass an `O_PATH` descriptor with a NULL pathname.
+    /// Although newer upstream kernels accept that form, deployed HSM-enabled
+    /// kernels can reject it with `EBADF`.
     fn mark_fd(&self, flags: u32, fd: RawFd) -> io::Result<()> {
-        // SAFETY: both descriptors are valid and a NULL path tells the kernel
-        // to mark `fd` itself.
+        let target = descriptor_path(fd);
+        // SAFETY: the fanotify descriptor and C string remain valid throughout
+        // the call. `target` names the exact descriptor borrowed by the caller.
         let rc = unsafe {
             libc::fanotify_mark(
                 self.fd.as_raw_fd(),
                 flags,
                 FAN_PRE_ACCESS | FAN_OPEN_PERM,
-                fd,
-                std::ptr::null(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
             )
         };
         if rc != 0 {
@@ -186,6 +196,14 @@ impl Fanotify {
                 break;
             }
             if meta.fd < 0 {
+                // With FAN_REPORT_FD_ERROR the kernel has already denied this
+                // permission event. Skipping only this record keeps the group
+                // alive for every other placeholder.
+                tracing::debug!(
+                    pid = meta.pid,
+                    error = -meta.fd,
+                    "fanotify could not open an event target"
+                );
                 cursor += event_len;
                 continue;
             }
@@ -236,6 +254,11 @@ impl Fanotify {
         }
         Ok(())
     }
+}
+
+pub(super) fn descriptor_path(fd: RawFd) -> CString {
+    CString::new(format!("/proc/self/fd/{fd}"))
+        .expect("a decimal file descriptor cannot contain a NUL byte")
 }
 
 /// Pull the range record out of an event's trailing info records.
@@ -321,5 +344,19 @@ mod tests {
             len: 0,
         };
         assert_eq!(read_range(&as_bytes(&zero)), None);
+    }
+
+    #[test]
+    fn mark_targets_are_bound_to_the_helpers_live_descriptor() {
+        assert_eq!(
+            descriptor_path(42).to_bytes(),
+            b"/proc/self/fd/42",
+            "never regress to O_PATH plus a NULL fanotify pathname"
+        );
+    }
+
+    #[test]
+    fn descriptor_open_failures_are_scoped_to_one_event() {
+        assert_ne!(FAN_INIT_FLAGS & FAN_REPORT_FD_ERROR, 0);
     }
 }

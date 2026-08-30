@@ -1,6 +1,6 @@
 //! Files-on-demand and local storage management commands.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -80,7 +80,7 @@ pub(crate) async fn materialize() -> Result<()> {
 
 /// Report what each file under a path actually costs on disk.
 pub(crate) fn storage(path: PathBuf) -> Result<()> {
-    use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
+    use gonedrive_core::hydrate::PlaceholderState;
 
     // A path argument is relative to the sync root, the same way `ls` and
     // `pin` take it — an absolute path is accepted too, for scripting.
@@ -102,13 +102,13 @@ pub(crate) fn storage(path: PathBuf) -> Result<()> {
         anyhow::bail!("{} is not on disk", root.display());
     }
 
-    let mut placeholders = 0u64;
-    let mut hydrated = 0u64;
-    let mut apparent = 0u64;
-    let mut allocated = 0u64;
-
-    let mut stack = vec![root.clone()];
     let mut rows = Vec::new();
+    let mut stack = Vec::new();
+    if root.is_dir() {
+        stack.push(root.clone());
+    } else if let Some(row) = storage_row(&root) {
+        rows.push(row);
+    }
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -119,21 +119,26 @@ pub(crate) fn storage(path: PathBuf) -> Result<()> {
                 stack.push(p);
                 continue;
             }
-            let Ok(occupancy) = Occupancy::read(&p) else {
-                continue;
-            };
-            apparent += occupancy.apparent_size;
-            allocated += occupancy.allocated;
-            let state = Placeholder::state(&p);
-            match state {
-                PlaceholderState::Dehydrated => placeholders += 1,
-                _ => hydrated += 1,
+            if let Some(row) = storage_row(&p) {
+                rows.push(row);
             }
-            rows.push((p, occupancy, state));
         }
     }
 
     rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let placeholders = rows
+        .iter()
+        .filter(|(_, _, state)| *state == PlaceholderState::Dehydrated)
+        .count() as u64;
+    let hydrated = rows.len() as u64 - placeholders;
+    let apparent = rows
+        .iter()
+        .map(|(_, occupancy, _)| occupancy.apparent_size)
+        .sum::<u64>();
+    let allocated = rows
+        .iter()
+        .map(|(_, occupancy, _)| occupancy.allocated)
+        .sum::<u64>();
     for (p, occupancy, state) in &rows {
         let mark = match state {
             PlaceholderState::Dehydrated => "☁",
@@ -144,7 +149,7 @@ pub(crate) fn storage(path: PathBuf) -> Result<()> {
             "  {mark} {:>10} on disk  {:>10} apparent  {}",
             human_bytes(occupancy.allocated),
             human_bytes(occupancy.apparent_size),
-            p.strip_prefix(&root).unwrap_or(p).display()
+            storage_display_path(p, &root).display()
         );
     }
 
@@ -162,6 +167,28 @@ pub(crate) fn storage(path: PathBuf) -> Result<()> {
         human_bytes(allocated)
     );
     Ok(())
+}
+
+fn storage_row(
+    path: &Path,
+) -> Option<(
+    PathBuf,
+    gonedrive_core::hydrate::Occupancy,
+    gonedrive_core::hydrate::PlaceholderState,
+)> {
+    let occupancy = gonedrive_core::hydrate::Occupancy::read(path).ok()?;
+    Some((
+        path.to_path_buf(),
+        occupancy,
+        gonedrive_core::hydrate::Placeholder::state(path),
+    ))
+}
+
+fn storage_display_path<'a>(path: &'a Path, root: &'a Path) -> &'a Path {
+    match path.strip_prefix(root) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative,
+        _ => path,
+    }
 }
 
 /// Hydrate a placeholder explicitly.
@@ -290,4 +317,21 @@ pub(crate) fn indexer(include: bool) -> Result<()> {
     // The setting is read per directory as it is walked, so nothing needs
     // restarting — but a pass already under way will finish first.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_single_file_is_included_in_the_storage_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("one.bin");
+        std::fs::write(&file, b"content").unwrap();
+
+        let row = storage_row(&file).expect("a file is a valid storage target");
+        assert_eq!(row.0, file);
+        assert_eq!(row.1.apparent_size, 7);
+        assert_eq!(storage_display_path(&row.0, &row.0), row.0);
+    }
 }

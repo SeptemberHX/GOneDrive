@@ -221,6 +221,87 @@ async fn a_preview_reports_the_cost_without_changing_anything() {
 }
 
 #[tokio::test]
+async fn folder_listing_counts_only_the_next_level() {
+    let h = Harness::metadata_only().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "A"),
+            file(
+                "F1",
+                "D1",
+                "direct.bin",
+                "c1",
+                10,
+                "2026-08-20T10:00:00Z",
+            ),
+            folder("D2", "D1", "B"),
+            file(
+                "F2",
+                "D2",
+                "nested.bin",
+                "c1",
+                20,
+                "2026-08-20T10:00:00Z",
+            ),
+            folder("D3", "D2", "C"),
+            file(
+                "F3",
+                "D3",
+                "deep.bin",
+                "c1",
+                30,
+                "2026-08-20T10:00:00Z",
+            ),
+        ],
+        "v1",
+    )
+    .await;
+    assert_eq!(h.sync().await.failed, 0);
+
+    let root = h.engine.list(Path::new("")).unwrap();
+    let a = root.iter().find(|entry| entry.item.name == "A").unwrap();
+    assert_eq!(a.items, 2, "A contains direct.bin and B directly");
+    assert_eq!(a.bytes, 10, "deep file bytes are not scanned for a listing");
+
+    let a_children = h.engine.list(Path::new("A")).unwrap();
+    let b = a_children
+        .iter()
+        .find(|entry| entry.item.name == "B")
+        .unwrap();
+    assert_eq!(b.items, 2, "B contains nested.bin and C directly");
+    assert_eq!(b.bytes, 20);
+
+    // Explicit pin/download preview still traverses the full subtree because
+    // that operation genuinely needs its complete transfer cost.
+    let selection = gonedrive_core::sync::selection::Selection::new(
+        h.store.clone(),
+        h.config.clone(),
+        ACCOUNT.into(),
+    );
+    let preview = selection.preview(Path::new("A")).unwrap();
+    assert_eq!(preview.files, 3);
+    assert_eq!(preview.bytes, 60);
+}
+
+#[tokio::test]
+async fn a_preview_does_not_charge_for_an_already_local_file() {
+    let h = harness_with_a_downloaded_file(b"already here").await;
+    let selection = gonedrive_core::sync::selection::Selection::new(
+        h.store.clone(),
+        h.config.clone(),
+        ACCOUNT.into(),
+    );
+
+    let preview = selection.preview(Path::new("Docs/big.bin")).unwrap();
+
+    assert_eq!(preview.files, 1);
+    assert_eq!(preview.bytes, 0);
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 0);
+}
+
+#[tokio::test]
 async fn the_drive_root_is_never_born_pinned() {
     // The root's pin decides every descendant's pin. A `Pinned` root silently
     // converts "download nothing by default" into "download the entire drive"
@@ -523,6 +604,8 @@ async fn a_queued_download_never_follows_an_ancestor_symlink() {
 
 #[tokio::test]
 async fn a_brand_new_file_is_uploaded_by_name_and_refuses_to_clobber() {
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+
     // The other half: a file the service has never seen has no id to address,
     // so it goes to parent+name — and must not overwrite anything already
     // sitting under that name.
@@ -557,6 +640,46 @@ async fn a_brand_new_file_is_uploaded_by_name_and_refuses_to_clobber() {
     assert_eq!(summary.uploaded, 1);
     assert_eq!(summary.failed, 0);
     assert_eq!(h.store.item("NEW").unwrap().unwrap().name, "fresh.txt");
+    let uploaded = h.path("fresh.txt");
+    assert_eq!(Placeholder::state(&uploaded), PlaceholderState::Hydrated);
+    assert_eq!(Placeholder::item_id(&uploaded).as_deref(), Some("NEW"));
+    assert_eq!(Placeholder::ctag(&uploaded).as_deref(), Some("cn"));
+    assert_eq!(Placeholder::pin(&uploaded).as_deref(), Some("pinned"));
+    assert!(Placeholder::content_hash(&uploaded).is_some());
+}
+
+#[tokio::test]
+async fn an_empty_file_upload_has_an_explicit_zero_content_length() {
+    let h = Harness::new().await;
+    h.mock_delta(None, vec![root_item()], "v1").await;
+    h.sync().await;
+    std::fs::write(h.path("empty.txt"), b"").unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    let created = json!({
+        "id": "EMPTY", "name": "empty.txt", "size": 0,
+        "cTag": "ce", "eTag": "ee",
+        "file": {"mimeType": "text/plain"},
+        "parentReference": {"driveId": "drive1", "id": ROOT},
+        "fileSystemInfo": {"lastModifiedDateTime": "2026-08-22T10:00:00Z"}
+    });
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/me/drive/items/[^/]+:/empty\.txt:/content$"))
+        .and(header("Content-Length", "0"))
+        .and(body_bytes(Vec::<u8>::new()))
+        .respond_with(ResponseTemplate::new(201).set_body_json(created.clone()))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/EMPTY"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(created))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.uploaded, 1);
+    assert_eq!(summary.failed, 0);
 }
 
 #[tokio::test]

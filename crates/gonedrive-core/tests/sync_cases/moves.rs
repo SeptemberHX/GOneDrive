@@ -47,7 +47,7 @@ async fn a_cross_directory_rename_is_one_move_not_delete_plus_upload() {
     let summary = h.sync().await;
     let mut failures = Vec::new();
     while let Ok(event) = events.try_recv() {
-        if let gonedrive_core::sync::engine::SyncEvent::Failed { name, error } = event {
+        if let gonedrive_core::sync::engine::SyncEvent::Failed { name, error, .. } = event {
             failures.push(format!("{name}: {error}"));
         }
     }
@@ -62,6 +62,178 @@ async fn a_cross_directory_rename_is_one_move_not_delete_plus_upload() {
     assert_eq!(record.name, "改名.txt");
     assert_eq!(record.parent_id.as_deref(), Some("D9"));
     assert_eq!(record.state, ItemState::Synced);
+}
+
+#[tokio::test]
+async fn a_folder_move_is_one_patch_even_when_watcher_halves_are_split() {
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+    use std::time::{Duration, Instant};
+
+    // This is the live failure shape: an online-only subtree was renamed from
+    // Todo into Done. The source-side watcher batch first queued a delete, then
+    // the destination-side batch mistook every directory and placeholder for
+    // new content. The result was an empty directory tree followed by deletion
+    // of the original remote subtree.
+    let h = Harness::new().await;
+    let mut expense = folder("EXPENSE", "TODO", "2025 报销");
+    expense["eTag"] = json!("e-expense");
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("TODO", ROOT, "Todo"),
+            folder("DONE", ROOT, "Done"),
+            folder("YEAR", "DONE", "2025"),
+            expense,
+            folder("NESTED", "EXPENSE", "票据"),
+            file(
+                "LOCAL",
+                "NESTED",
+                "已下载.txt",
+                "c-local",
+                5,
+                "2026-08-20T10:00:00Z",
+            ),
+            file(
+                "ONLINE",
+                "NESTED",
+                "仅联机.pdf",
+                "c-online",
+                6,
+                "2026-08-20T10:00:00Z",
+            ),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("LOCAL", b"local").await;
+    h.mock_download("ONLINE", b"online").await;
+    assert_eq!(h.sync().await.failed, 0);
+
+    let old_root = h.path("Todo/2025 报销");
+    let new_root = h.path("Done/2025/2025 报销");
+    let old_online = old_root.join("票据/仅联机.pdf");
+    let new_online = new_root.join("票据/仅联机.pdf");
+    h.engine
+        .free_space(Path::new("Todo/2025 报销/票据/仅联机.pdf"))
+        .unwrap();
+    assert_eq!(Placeholder::state(&old_online), PlaceholderState::Dehydrated);
+
+    // Existing download work must follow the directory instead of retaining a
+    // stale absolute path after the metadata move.
+    h.store
+        .enqueue(
+            ACCOUNT,
+            OpKind::Download,
+            Some("ONLINE"),
+            Some(&old_online),
+            None,
+        )
+        .unwrap();
+    std::fs::rename(&old_root, &new_root).unwrap();
+
+    // inotify may deliver these in separate debounce windows. Source first is
+    // the dangerous order because it has already recorded a delayed delete.
+    h.engine
+        .sync_local_paths(&[h.path("Todo")])
+        .expect("source watcher batch");
+    // A later source-side watcher batch may independently have classified a
+    // descendant as gone. Recognising the moved directory must withdraw every
+    // destructive operation in its subtree, not only the root delete.
+    h.store
+        .enqueue_conditional(
+            ACCOUNT,
+            OpKind::DeleteRemote,
+            "ONLINE",
+            None,
+            None,
+            Some("c-online"),
+        )
+        .unwrap();
+    h.engine
+        .sync_local_paths(&[h.path("Done/2025")])
+        .expect("destination watcher batch");
+
+    let refreshed_marks = h.engine.take_placeholder_marks();
+    assert_eq!(
+        refreshed_marks,
+        vec![new_online.clone()],
+        "the moved online-only subtree must refresh HSM without a whole-tree scan"
+    );
+
+    let queued = h.store.due_ops(ACCOUNT, 20).unwrap();
+    assert_eq!(
+        h.store.pending_count(ACCOUNT).unwrap(),
+        queued.len() as u64,
+        "no delayed source-side delete may survive the move transaction"
+    );
+    assert_eq!(
+        queued
+            .iter()
+            .filter(|op| op.kind == OpKind::MoveRemote)
+            .count(),
+        1,
+        "the folder identity must become one metadata move"
+    );
+    assert!(
+        queued.iter().all(|op| op.kind != OpKind::DeleteRemote),
+        "recognising the destination must withdraw the source-side delete"
+    );
+    assert!(
+        queued
+            .iter()
+            .all(|op| op.kind != OpKind::CreateRemoteFolder && op.kind != OpKind::Upload),
+        "a folder move must not recreate or re-upload its descendants"
+    );
+    assert_eq!(
+        queued
+            .iter()
+            .find(|op| op.kind == OpKind::Download)
+            .and_then(|op| op.local_path.as_deref()),
+        Some(new_online.as_path()),
+        "pre-existing descendant work must be rebased atomically"
+    );
+
+    h.server.reset().await;
+    let moved = json!({
+        "id": "EXPENSE", "name": "2025 报销", "eTag": "e-moved",
+        "folder": {"childCount": 1},
+        "parentReference": {"driveId": "drive1", "id": "YEAR"}
+    });
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/EXPENSE"))
+        .and(header("If-Match", "e-expense"))
+        .and(body_partial_json(json!({
+            "name": "2025 报销",
+            "parentReference": {"id": "YEAR"}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(moved))
+        .expect(1)
+        .mount(&h.server)
+        .await;
+
+    let summary = h
+        .engine
+        .transfer_slice(
+            Instant::now() + Duration::from_secs(5),
+            gonedrive_core::sync::engine::QueueScope::Outbound,
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.uploaded, 1);
+    assert_eq!(summary.deleted_remote, 0);
+    assert_eq!(
+        h.store.item("EXPENSE").unwrap().unwrap().parent_id.as_deref(),
+        Some("YEAR")
+    );
+    assert_eq!(
+        h.store.item("ONLINE").unwrap().unwrap().parent_id.as_deref(),
+        Some("NESTED"),
+        "descendant identities must survive the folder move"
+    );
+    assert_eq!(Placeholder::state(&new_online), PlaceholderState::Dehydrated);
+    assert_eq!(Placeholder::item_id(&new_online).as_deref(), Some("ONLINE"));
 }
 
 #[tokio::test]

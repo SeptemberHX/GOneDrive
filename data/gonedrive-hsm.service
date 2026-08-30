@@ -16,13 +16,23 @@ Type=simple
 ExecStart=/usr/local/bin/gonedrive-hsm
 Restart=on-failure
 RestartSec=5
+# Exportable filesystems use persistent inode handles and one anchor descriptor
+# per mount. Keep a high ceiling for the safety-preserving descriptor fallback
+# on filesystems that cannot reopen handles; the ceiling itself allocates no fd.
+LimitNOFILE=524288
 
-# Runs as root for CAP_SYS_ADMIN (fanotify pre-content), with everything else
-# stripped away.
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+# Runs as root for CAP_SYS_ADMIN (fanotify pre-content). CAP_FOWNER is needed
+# only to restore a user's placeholder mode after a replacement mark succeeds.
+# The socket still restricts every operation to files owned by its peer uid.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=read-only
+# ProtectHome must remain unset: hydration, xattr updates, and safety-mode
+# restoration intentionally mutate peer-authorized files below the sync root.
+# The helper still has no credentials or network access, validates peer UID and
+# inode ownership, and only operates on descriptors authorized by fanotify.
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
 RuntimeDirectory=gonedrive
 PrivateTmp=true
 ProtectKernelModules=true

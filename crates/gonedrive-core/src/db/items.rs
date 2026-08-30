@@ -127,6 +127,42 @@ impl Store {
         })
     }
 
+    /// Direct item count and direct-file bytes for every folder immediately
+    /// below `parent_id`.
+    ///
+    /// Folder browsing deliberately stops at two levels: callers list the
+    /// parent's children, then use this aggregate to annotate those child
+    /// folders. A recursive subtree query here makes opening a top-level folder
+    /// proportional to the size of the entire drive.
+    pub fn direct_child_summaries(
+        &self,
+        account_id: &str,
+        parent_id: &str,
+    ) -> Result<std::collections::HashMap<String, (u64, u64)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT folder.id,
+                        COUNT(child.id),
+                        COALESCE(SUM(CASE WHEN child.is_folder = 0 THEN child.size ELSE 0 END), 0)
+                   FROM items folder
+                   LEFT JOIN items child
+                     ON child.account_id = folder.account_id
+                    AND child.parent_id = folder.id
+                  WHERE folder.account_id = ?1
+                    AND folder.parent_id = ?2
+                    AND folder.is_folder = 1
+                  GROUP BY folder.id",
+            )?;
+            let rows = stmt.query_map(params![account_id, parent_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, i64>(2)? as u64, row.get::<_, i64>(1)? as u64),
+                ))
+            })?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
     pub fn items_in_state(&self, account_id: &str, state: ItemState) -> Result<Vec<ItemRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(&format!(
@@ -180,6 +216,68 @@ impl Store {
                 "UPDATE items SET pin_state = ?2, updated_at = ?3 WHERE id = ?1",
                 params![id, pin.as_str(), now()],
             )?;
+            Ok(())
+        })
+    }
+
+    /// Commit a successful user-requested space release.
+    ///
+    /// The item state, retention choice, and any stale download request are one
+    /// durable decision. Leaving any one of them behind can make the next sync
+    /// download a file whose blocks the user just released.
+    pub fn commit_space_release(&self, account_id: &str, id: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE items
+                    SET state = 'dehydrated', pin_state = 'unpinned', updated_at = ?3
+                  WHERE id = ?1 AND account_id = ?2",
+                params![id, account_id, now()],
+            )?;
+            tx.execute(
+                "DELETE FROM pending_ops
+                  WHERE account_id = ?1 AND item_id = ?2 AND kind = 'download'",
+                params![account_id, id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Commit content that has arrived through either a queued download or an
+    /// on-demand read. Once the item is `synced`, another download for the same
+    /// remote version is stale; retiring it in the same transaction prevents a
+    /// crash or concurrent hydration from downloading the file twice.
+    pub fn commit_hydration(
+        &self,
+        account_id: &str,
+        id: &str,
+        mtime: Option<OffsetDateTime>,
+        size: Option<u64>,
+        ino: Option<u64>,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE items
+                    SET local_mtime = ?3, local_size = ?4, local_ino = ?5,
+                        state = 'synced', updated_at = ?6
+                  WHERE id = ?1 AND account_id = ?2",
+                params![
+                    id,
+                    account_id,
+                    mtime.map(|t| t.unix_timestamp()),
+                    size.map(|v| v as i64),
+                    ino.map(|v| v as i64),
+                    now()
+                ],
+            )?;
+            tx.execute(
+                "DELETE FROM pending_ops
+                  WHERE account_id = ?1 AND item_id = ?2 AND kind = 'download'",
+                params![account_id, id],
+            )?;
+            tx.commit()?;
             Ok(())
         })
     }

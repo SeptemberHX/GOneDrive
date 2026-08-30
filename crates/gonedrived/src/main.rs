@@ -2,8 +2,11 @@
 
 mod app;
 mod commands;
+mod failure_summary;
 mod hsm_client;
 mod login;
+mod open_intent;
+mod placeholder_reports;
 mod runtime;
 mod service;
 mod watcher;

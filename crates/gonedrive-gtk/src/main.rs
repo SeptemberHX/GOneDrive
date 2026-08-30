@@ -130,6 +130,8 @@ fn build_ui(app: &adw::Application) {
                     let _ = tray_commands.send_blocking(Command::Refresh);
                 }
                 tray::TrayAction::OpenFolder => open_sync_folder(&tray_window),
+                tray::TrayAction::RestartDaemon => restart_daemon_service(),
+                tray::TrayAction::RestartFilesOnDemand => restart_files_on_demand_service(),
                 tray::TrayAction::Quit => {
                     tray_app.quit();
                     return;
@@ -265,6 +267,55 @@ fn open_sync_folder(parent: &adw::ApplicationWindow) {
     let home = glib::home_dir().join("OneDrive");
     let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&home)));
     launcher.launch(Some(parent), None::<&gio::Cancellable>, |_| {});
+}
+
+/// Restart only the per-user sync daemon. The GTK/tray process stays alive and
+/// its backend reconnect loop picks the daemon back up, so this remains usable
+/// even when the current D-Bus connection is already broken.
+fn restart_daemon_service() {
+    spawn_service_restart("gonedrive-daemon-restart", false);
+}
+
+/// Restart the privileged fanotify helper through systemd/Polkit, then restart
+/// the user daemon so it immediately reconnects and re-registers placeholders.
+fn restart_files_on_demand_service() {
+    spawn_service_restart("gonedrive-hsm-restart", true);
+}
+
+fn spawn_service_restart(thread_name: &str, restart_hsm: bool) {
+    let _ = std::thread::Builder::new()
+        .name(thread_name.into())
+        .spawn(move || {
+            if restart_hsm
+                && !run_systemctl(
+                    &["restart", "gonedrive-hsm.service"],
+                    "files-on-demand helper",
+                )
+            {
+                return;
+            }
+            let _ = run_systemctl(&["--user", "restart", "gonedrived.service"], "sync daemon");
+        });
+}
+
+fn run_systemctl(arguments: &[&str], service: &str) -> bool {
+    match std::process::Command::new("/usr/bin/systemctl")
+        .args(arguments)
+        .status()
+    {
+        Ok(status) if status.success() => {
+            tracing::info!(service, "service restarted");
+            true
+        }
+        Ok(status) => {
+            tracing::error!(service, %status, "could not restart service");
+            false
+        }
+        Err(error) => {
+            tracing::error!(service, %error, "could not launch systemctl");
+            false
+        }
+    }
 }
 
 fn register_actions(

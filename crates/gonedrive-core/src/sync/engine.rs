@@ -79,17 +79,20 @@ pub enum SyncEvent {
     },
     ItemDone {
         name: String,
+        path: PathBuf,
         direction: Direction,
     },
     /// An item was deleted — a local deletion propagated to the cloud, or a
     /// remote deletion applied locally.
     Deleted {
         name: String,
+        path: Option<PathBuf>,
     },
     /// Both sides changed; the local copy was preserved under a new name.
     Conflict {
         original: String,
         copy: String,
+        path: PathBuf,
     },
     Skipped {
         name: String,
@@ -97,6 +100,7 @@ pub enum SyncEvent {
     },
     Failed {
         name: String,
+        path: Option<PathBuf>,
         error: String,
     },
     /// A destructive step was refused because it looked like data loss rather
@@ -182,9 +186,53 @@ pub struct Engine {
     /// Exact paths created as new placeholders since the last coordinator
     /// pass. This avoids re-enumerating every dehydrated record after delta.
     pub(super) placeholder_marks: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    /// Runtime copy of the persistent files-on-demand mode. Materialising the
+    /// tree can enable it while the daemon is already running; later deltas must
+    /// see that change without waiting for a restart.
+    pub(super) on_demand: std::sync::atomic::AtomicBool,
     /// Set only after the user resumes a mass-deletion safety stop. It permits
     /// one fresh scan to requeue the confirmed wave and is never persisted.
     pub(super) mass_delete_approval: std::sync::atomic::AtomicBool,
+}
+
+/// Balances every [`SyncEvent::Started`] even when a phase exits through `?`.
+/// A leaked phase count leaves the UI permanently showing stale progress after
+/// the actual operation has failed and left the durable queue.
+pub(super) struct SyncPhase<'a> {
+    engine: &'a Engine,
+    finished: bool,
+}
+
+impl<'a> SyncPhase<'a> {
+    pub(super) fn start(engine: &'a Engine) -> Self {
+        engine.emit(SyncEvent::Started);
+        Self {
+            engine,
+            finished: false,
+        }
+    }
+
+    pub(super) fn finish(mut self, summary: &SyncSummary) {
+        self.finished = true;
+        self.engine.emit(SyncEvent::Finished(summary.clone()));
+    }
+}
+
+impl Drop for SyncPhase<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let still_queued = self
+            .engine
+            .store
+            .pending_count(&self.engine.account_id)
+            .unwrap_or_default();
+        self.engine.emit(SyncEvent::Finished(SyncSummary {
+            still_queued,
+            ..SyncSummary::default()
+        }));
+    }
 }
 
 impl Engine {
@@ -195,6 +243,7 @@ impl Engine {
         account_id: String,
     ) -> Self {
         let (events, _) = broadcast::channel(256);
+        let on_demand = config.on_demand;
         Self {
             store,
             graph,
@@ -205,8 +254,19 @@ impl Engine {
             reported_skips: std::sync::Mutex::new(std::collections::HashSet::new()),
             dir_stamps: std::sync::Mutex::new(std::collections::HashSet::new()),
             placeholder_marks: std::sync::Mutex::new(std::collections::HashSet::new()),
+            on_demand: std::sync::atomic::AtomicBool::new(on_demand),
             mass_delete_approval: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Keep a materialised placeholder tree current for subsequent deltas.
+    pub fn enable_on_demand(&self) {
+        self.on_demand
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn on_demand_enabled(&self) -> bool {
+        self.on_demand.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SyncEvent> {
@@ -293,7 +353,7 @@ impl Engine {
     /// possible remote state, which keeps a file changed on both sides from
     /// being uploaded before we know the remote also moved.
     pub async fn sync_once(&self) -> Result<SyncSummary> {
-        self.emit(SyncEvent::Started);
+        let phase = SyncPhase::start(self);
         let mut summary = SyncSummary::default();
 
         self.remote_phase(&mut summary).await?;
@@ -302,7 +362,7 @@ impl Engine {
         self.stamp_directories(&self.account()?)?;
 
         summary.still_queued = self.store.pending_count(&self.account_id)?;
-        self.emit(SyncEvent::Finished(summary.clone()));
+        phase.finish(&summary);
         Ok(summary)
     }
 
@@ -310,12 +370,12 @@ impl Engine {
     /// the durable queue so the daemon coordinator can run them in short slices
     /// and give the next delta deadline priority.
     pub async fn sync_remote(&self) -> Result<SyncSummary> {
-        self.emit(SyncEvent::Started);
+        let phase = SyncPhase::start(self);
         let mut summary = SyncSummary::default();
         self.remote_phase(&mut summary).await?;
         self.stamp_directories(&self.account()?)?;
         summary.still_queued = self.store.pending_count(&self.account_id)?;
-        self.emit(SyncEvent::Finished(summary.clone()));
+        phase.finish(&summary);
         Ok(summary)
     }
 

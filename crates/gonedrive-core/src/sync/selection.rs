@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::db::{Account, ItemRecord, ItemState, OpKind, PinState, Store};
 use crate::error::{Error, Result};
+use crate::hydrate::Placeholder;
 
 use super::rooted_fs::RootedFs;
 
@@ -21,9 +22,10 @@ pub struct Listing {
     pub pin: PinState,
     /// Whether the pin was set on this item rather than inherited.
     pub explicit: bool,
-    /// Total bytes of the subtree (or the file's own size).
+    /// Bytes in direct file children (or the file's own size).
     pub bytes: u64,
-    pub files: u64,
+    /// Direct children for a folder, or one for a file.
+    pub items: u64,
 }
 
 /// What a pin is about to cost.
@@ -68,8 +70,8 @@ impl Selection {
 
     /// One entry of a browsable listing.
     ///
-    /// Carries the *effective* pin and the subtree's total size so the caller
-    /// can show what a choice would cost before it is made.
+    /// Carries the *effective* pin and a bounded, one-level summary. Listing A
+    /// reads A+1 and aggregates A+2; it never walks a child's full subtree.
     pub fn list(&self, relative: &Path) -> Result<Vec<Listing>> {
         let account = self.account()?;
         let root_id = account.root_item_id.clone().ok_or_else(|| {
@@ -81,10 +83,14 @@ impl Selection {
             .ok_or_else(|| Error::other(format!("no such folder: {}", relative.display())))?;
 
         let default = self.config.download_new.default_pin();
-        let mut out = Vec::new();
-        for child in self.store.children(&self.account_id, &parent.id)? {
-            let (bytes, files) = if child.is_folder {
-                self.store.subtree_size(&child.id)?
+        let children = self.store.children(&self.account_id, &parent.id)?;
+        let summaries = self
+            .store
+            .direct_child_summaries(&self.account_id, &parent.id)?;
+        let mut out = Vec::with_capacity(children.len());
+        for child in children {
+            let (bytes, items) = if child.is_folder {
+                summaries.get(&child.id).copied().unwrap_or_default()
             } else {
                 (child.size, 1)
             };
@@ -92,7 +98,7 @@ impl Selection {
                 pin: self.store.effective_pin(&child.id, default)?,
                 explicit: child.pin_state != PinState::Inherit,
                 bytes,
-                files,
+                items,
                 item: child,
             });
         }
@@ -120,6 +126,8 @@ impl Selection {
                 .filter(|f| f.state == ItemState::Synced && f.local_ino.is_some())
                 .map(|f| f.size)
                 .sum()
+        } else if target.state == ItemState::Synced && target.local_ino.is_some() {
+            target.size
         } else {
             0
         };
@@ -177,6 +185,22 @@ impl Selection {
         // Persist the preference only after all filesystem preconditions have
         // succeeded, so a failed pin cannot be reported while remaining set.
         self.store.set_pin_state(&target.id, pin)?;
+
+        // Nautilus deliberately reads this choice from the inode rather than
+        // making one D-Bus call per row. Keep an already-local file's badge in
+        // step immediately; queued downloads stamp the same value when they
+        // publish their content.
+        if !target.is_folder {
+            if let Some(path) = self.store.local_path(&account, &target.id)? {
+                let rooted = RootedFs::open(&account.root_local_path)?;
+                if let Ok(file) = rooted.open_read(&path) {
+                    let effective = self
+                        .store
+                        .effective_pin(&target.id, self.config.download_new.default_pin())?;
+                    let _ = Placeholder::set_pin_file(&file, effective.as_str());
+                }
+            }
+        }
 
         let mut outcome = PinOutcome::default();
         if !pin.wants_content() {

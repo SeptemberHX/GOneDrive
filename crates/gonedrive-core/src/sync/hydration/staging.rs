@@ -65,13 +65,13 @@ impl Engine {
             file.set_times(times)?;
         }
         let local = LocalStat::from_metadata(&file.metadata()?);
-        self.store.set_local_stat(
+        self.store.commit_hydration(
+            &account.id,
             &item_id,
             OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
             Some(local.size),
             Some(local.ino),
         )?;
-        self.store.set_item_state(&item_id, ItemState::Synced)?;
         let _ = self.refresh_folder_ancestors(&account, &item_id);
         Ok(offset)
     }
@@ -170,28 +170,23 @@ impl Engine {
     /// range is fetched, nothing else changes — no state transition, no
     /// progress events, no activity entry — and the kernel watch stays armed
     /// so a reader that continues past the window comes back for the rest.
-    pub async fn stage_range(&self, path: &Path, offset: u64, length: u64) -> Result<PathBuf> {
+    pub async fn stage_range(
+        &self,
+        path: &Path,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<PathBuf>> {
         let (account, record, file) = self.open_owned_placeholder(path, false)?;
         let item_id = record.id;
         let rooted = self.rooted(&account)?;
 
         let staged = transfer::hydration_staging_sibling(path);
 
-        // A range that is already real data on disk — a window some earlier
-        // sniff filled — is served from the file itself. Browsing the same
-        // folder twice must not fetch the same 16 KiB from the cloud twice.
-        if let Some(bytes) = read_if_materialized_file(&file, offset, length)? {
-            let mut staged_file = tokio::fs::File::from_std(rooted.create_file(&staged, true)?);
-            use tokio::io::AsyncWriteExt;
-            staged_file.write_all(&bytes).await?;
-            staged_file.sync_all().await?;
-            tracing::info!(
-                path = %path.display(),
-                offset,
-                bytes = bytes.len(),
-                "staged range from local data"
-            );
-            return Ok(staged);
+        // The reader is blocked on this same inode. Once this window is real
+        // data, allowing the read serves those bytes directly. Restaging and
+        // fsyncing them for every Nautilus sniff caused a tight CPU/I/O loop.
+        if range_is_materialized_file(&file, offset, length)? {
+            return Ok(None);
         }
 
         let response = self
@@ -209,32 +204,6 @@ impl Engine {
             bytes = bytes.len(),
             "staged range"
         );
-        Ok(staged)
-    }
-
-    /// Stage a byte range only if it is already real data on disk, never
-    /// fetching. Returns `None` if any of the window is still a hole.
-    ///
-    /// This is what keeps folder browsing offline: a sniff of a window that was
-    /// filled by an earlier real read is served locally; a sniff of an
-    /// untouched placeholder returns `None`, and the caller lets the read see
-    /// zeros rather than reaching for the network.
-    pub async fn stage_range_if_local(
-        &self,
-        path: &Path,
-        offset: u64,
-        length: u64,
-    ) -> Result<Option<PathBuf>> {
-        let (account, _record, file) = self.open_owned_placeholder(path, false)?;
-        let Some(bytes) = read_if_materialized_file(&file, offset, length)? else {
-            return Ok(None);
-        };
-        let staged = transfer::hydration_staging_sibling(path);
-        let rooted = self.rooted(&account)?;
-        let mut staged_file = tokio::fs::File::from_std(rooted.create_file(&staged, true)?);
-        use tokio::io::AsyncWriteExt;
-        staged_file.write_all(&bytes).await?;
-        staged_file.sync_all().await?;
         Ok(Some(staged))
     }
 
@@ -321,33 +290,20 @@ impl Engine {
     }
 }
 
-/// The requested window, if every byte of it is already data rather than hole.
-///
-/// `SEEK_DATA`/`SEEK_HOLE` ask the filesystem directly which parts of a sparse
-/// file are materialized, so this needs no bookkeeping of past fills.
-fn read_if_materialized_file(
-    file: &std::fs::File,
-    offset: u64,
-    length: u64,
-) -> Result<Option<Vec<u8>>> {
-    use std::os::unix::fs::FileExt;
+/// Whether every requested byte is already data rather than a sparse hole.
+fn range_is_materialized_file(file: &std::fs::File, offset: u64, length: u64) -> Result<bool> {
     use std::os::unix::io::AsRawFd;
 
     let size = file.metadata()?.len();
-    let end = (offset + length).min(size);
+    let end = offset.saturating_add(length).min(size);
     if offset >= end {
-        return Ok(None);
+        return Ok(false);
     }
-
-    // SAFETY: valid fd; lseek with SEEK_HOLE finds the next hole at or after
-    // `offset`. If that hole starts at or beyond `end`, the window is data.
-    let next_hole =
-        unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, libc::SEEK_HOLE) };
-    if next_hole < 0 || (next_hole as u64) < end {
-        return Ok(None);
-    }
-
-    let mut buf = vec![0u8; (end - offset) as usize];
-    file.read_exact_at(&mut buf, offset)?;
-    Ok(Some(buf))
+    let Ok(seek_offset) = libc::off_t::try_from(offset) else {
+        return Ok(false);
+    };
+    // SAFETY: `file` owns a valid descriptor. SEEK_HOLE inspects extent
+    // metadata only and cannot fault placeholder content into memory.
+    let next_hole = unsafe { libc::lseek(file.as_raw_fd(), seek_offset, libc::SEEK_HOLE) };
+    Ok(next_hole >= 0 && next_hole as u64 >= end)
 }

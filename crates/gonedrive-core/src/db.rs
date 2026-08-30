@@ -24,7 +24,7 @@ mod items;
 mod pending;
 mod uploads;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 const ACTIVITY_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS activity (
@@ -64,6 +64,7 @@ CREATE INDEX IF NOT EXISTS delta_staging_order
 pub struct ActivityRow {
     pub kind: String,
     pub name: String,
+    pub path: String,
     pub detail: String,
     pub when: i64,
 }
@@ -289,6 +290,7 @@ pub struct PendingOp {
     /// protection.
     pub precondition: Option<String>,
     pub attempts: u32,
+    pub next_attempt_at: i64,
     pub last_error: Option<String>,
 }
 
@@ -462,6 +464,9 @@ impl Store {
                      DROP TABLE upload_sessions_v8;",
                 )?;
             }
+            if version < 10 {
+                tx.execute_batch("ALTER TABLE activity ADD COLUMN path TEXT NOT NULL DEFAULT '';")?;
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
             Ok(())
@@ -545,14 +550,16 @@ impl Store {
         &self,
         kind: &str,
         name: &str,
+        path: &str,
         detail: &str,
         when: i64,
         keep: i64,
     ) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO activity (kind, name, detail, when_ts) VALUES (?1, ?2, ?3, ?4)",
-                params![kind, name, detail, when],
+                "INSERT INTO activity (kind, name, path, detail, when_ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![kind, name, path, detail, when],
             )?;
             conn.execute(
                 "DELETE FROM activity WHERE id NOT IN
@@ -567,14 +574,16 @@ impl Store {
     pub fn recent_activity(&self, limit: i64) -> Result<Vec<ActivityRow>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT kind, name, detail, when_ts FROM activity ORDER BY id DESC LIMIT ?1",
+                "SELECT kind, name, path, detail, when_ts
+                   FROM activity ORDER BY id DESC LIMIT ?1",
             )?;
             let rows = stmt.query_map(params![limit], |row| {
                 Ok(ActivityRow {
                     kind: row.get(0)?,
                     name: row.get(1)?,
-                    detail: row.get(2)?,
-                    when: row.get(3)?,
+                    path: row.get(2)?,
+                    detail: row.get(3)?,
+                    when: row.get(4)?,
                 })
             })?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

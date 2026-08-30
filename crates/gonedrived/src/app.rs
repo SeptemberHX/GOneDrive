@@ -3,8 +3,12 @@
 mod coordinator;
 mod hydration;
 
+pub(crate) use hydration::{HydrationCapabilities, StageOutcome};
+
 #[cfg(test)]
-use coordinator::{outbound_scope, sync_barrier_ready};
+use coordinator::{
+    missing_account_retry_due, outbound_scope, remote_poll_ready, sync_barrier_ready,
+};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,8 +21,13 @@ use gonedrive_core::db::Store;
 use gonedrive_core::graph::GraphClient;
 use gonedrive_core::sync::engine::{Direction, Engine, SafetyStopKind, SyncEvent};
 use gonedrive_core::{Authenticator, Error, TokenStore};
-use gonedrive_ipc::reader_policy::{is_browsing_reader, is_bulk_copier};
-use gonedrive_ipc::{AccountInfo, Hydration, SyncRequestResult, SyncStatus};
+use gonedrive_ipc::reader_policy::{
+    is_browsing_reader, is_bulk_copier, is_file_manager_copy_reader, is_file_manager_reader,
+    is_progressive_reader,
+};
+use gonedrive_ipc::{AccountInfo, Hydration, PendingItem, SyncRequestResult, SyncStatus};
+
+use crate::placeholder_reports::PendingPlaceholderReports;
 
 /// A head-read at or below this is served as a range, not a download: it is the
 /// signature of content sniffing, and even when it is not, filling just the
@@ -40,13 +49,24 @@ enum StagePlan {
     BrowseLocal { offset: u64, length: u64 },
     /// Fetch just `[offset, offset+length)`.
     Range { offset: u64, length: u64 },
+    /// Fail a speculative file-manager read without exposing sparse zeroes.
+    DenyBrowse,
+}
+
+impl StagePlan {
+    fn shows_progress(&self) -> bool {
+        matches!(self, Self::Full)
+    }
 }
 
 /// The staging policy, as a pure function of the request.
 ///
 /// - On open: a sparse-aware bulk copier is hydrated fully (it would otherwise
 ///   SEEK over the holes and copy zeros); everything else is allowed through.
-/// - A browser/thumbnailer never touches the network: local-or-offline.
+/// - A dedicated thumbnailer's sniff never touches the network. A negotiated
+///   helper distinguishes a real Nautilus copy from speculative content sniffing:
+///   the copy hydrates fully and the sniff is denied without exposing sparse
+///   zeroes. Older helpers retain the conservative range/full fallback.
 /// - A consumer's first head-read (offset 0, small, smaller than the file) is a
 ///   range; coming back for offset > 0 is sequential reading and escalates to a
 ///   full hydration rather than dozens of round-trips.
@@ -57,7 +77,11 @@ fn decide_stage(
     length: u64,
     size: u64,
     allow_partial: bool,
+    file_manager_copy_detection: bool,
 ) -> StagePlan {
+    if is_file_manager_copy_reader(reader) {
+        return StagePlan::Full;
+    }
     if is_open {
         return if is_bulk_copier(reader) {
             StagePlan::Full
@@ -66,9 +90,35 @@ fn decide_stage(
         };
     }
     if is_browsing_reader(reader) {
+        if is_file_manager_reader(reader) {
+            if file_manager_copy_detection {
+                return StagePlan::DenyBrowse;
+            }
+            let partial = allow_partial
+                && size > 0
+                && length > 0
+                && offset == 0
+                && length <= PARTIAL_HYDRATION_CEILING;
+            return if partial {
+                StagePlan::Range {
+                    offset,
+                    length: length.min(size.saturating_sub(offset)).max(1),
+                }
+            } else {
+                StagePlan::Full
+            };
+        }
         return StagePlan::BrowseLocal {
             offset,
             length: length.max(1),
+        };
+    }
+    if is_progressive_reader(reader) && allow_partial && size > 0 && length > 0 && offset < size {
+        let length = length.min(size - offset);
+        return if offset == 0 && length == size {
+            StagePlan::Full
+        } else {
+            StagePlan::Range { offset, length }
         };
     }
     let partial = allow_partial
@@ -90,9 +140,26 @@ fn core_error_status(error: &Error) -> (&'static str, String) {
     match error {
         Error::AuthRequired(message) => ("signed_out", message.clone()),
         Error::KeyringLocked(_) => ("keyring_locked", KEYRING_LOCKED_MESSAGE.into()),
-        error if error.is_transient() => ("offline", error.to_string()),
-        error => ("error", error.to_string()),
+        error if error.is_transient() => ("offline", detailed_error(error)),
+        error => ("error", detailed_error(error)),
     }
+}
+
+/// Preserve the causal chain that `reqwest` attaches to transport failures.
+/// Its top-level Display text only says that sending the request failed, which
+/// hides the useful DNS, TLS, timeout, or connection-refused cause from both
+/// the UI and logs.
+fn detailed_error(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut messages = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if messages.last() != Some(&message) {
+            messages.push(message);
+        }
+        source = cause.source();
+    }
+    messages.join(": ")
 }
 use tokio::sync::{broadcast, Mutex, Notify, OwnedMutexGuard, RwLock};
 
@@ -130,6 +197,10 @@ pub enum DaemonEvent {
 /// A placeholder currently being filled.
 struct InFlight {
     hydration: Hydration,
+    /// Only whole-file fills represent an operation the user is waiting for.
+    /// Range fills are quiet file-manager reads and must never appear in the
+    /// download monitor if it happens to connect while they are in flight.
+    visible: bool,
     /// Set to abandon the transfer.
     cancel: Arc<std::sync::atomic::AtomicBool>,
     staged: Option<std::path::PathBuf>,
@@ -182,6 +253,13 @@ pub struct App {
     /// The privileged helper, when files-on-demand is available. Without it a
     /// placeholder is just a file full of zeroes that nothing will ever fill.
     hsm: RwLock<Option<Arc<crate::hsm_client::HsmClient>>>,
+    /// A full local scan may beat HSM startup. Retain its actual inode paths
+    /// until the helper can reconcile them instead of waiting for the next
+    /// low-frequency verification pass.
+    pending_placeholder_reports: Mutex<PendingPlaceholderReports>,
+    /// Exact desktop Open requests, used to separate a gallery's selected file
+    /// from speculative reads of neighbouring files in the same process.
+    open_intents: Arc<crate::open_intent::OpenIntents>,
     /// The single progress window, if one is up. Guarded so a burst of
     /// hydrations does not stack three windows (as it did once). `Arc` so a
     /// spawned task can hold it without borrowing the whole `App`.
@@ -201,13 +279,18 @@ impl App {
         );
         let (events, _) = broadcast::channel(256);
 
+        let (initial_pending, initial_pending_items) = pending_snapshot(&store).unwrap_or_default();
+        let mut initial_status = SyncStatus::idle(initial_pending);
+        initial_status.pending_items = initial_pending_items;
+        let open_intents = crate::open_intent::OpenIntents::new(config.sync_root.clone());
+
         let app = Arc::new(Self {
             config: Arc::new(config),
             store,
             tokens,
             http: build_http_client()?,
             engines: RwLock::new(HashMap::new()),
-            status: Arc::new(RwLock::new(SyncStatus::idle(0))),
+            status: Arc::new(RwLock::new(initial_status)),
             paused: Arc::new(AtomicBool::new(false)),
             approve_mass_delete_on_resume: Arc::new(AtomicBool::new(false)),
             force_full_scan: AtomicBool::new(false),
@@ -217,10 +300,16 @@ impl App {
             hydrations: Arc::new(RwLock::new(HashMap::new())),
             hydration_locks: PathLocks::default(),
             hsm: RwLock::new(None),
+            pending_placeholder_reports: Mutex::new(PendingPlaceholderReports::default()),
+            open_intents,
             monitor: Arc::new(std::sync::Mutex::new(None)),
             events,
         });
         Ok(app)
+    }
+
+    pub(crate) fn start_open_intent_monitor(&self) {
+        tokio::spawn(self.open_intents.clone().supervise());
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
@@ -254,7 +343,7 @@ impl App {
             match self.attach_account(&account.id).await {
                 Ok(()) => loaded += 1,
                 Err(e) => {
-                    tracing::error!(account = %account.id, error = %e, "could not sign in");
+                    tracing::error!(account = %account.id, error = ?e, "could not sign in");
                     self.report_anyhow_error(&e).await;
                 }
             }
@@ -355,14 +444,18 @@ impl App {
         tokio::spawn(async move {
             let mut current = SyncStatus::idle(0);
             let mut active_phases = 0u64;
+            let mut cycle_failed = false;
             loop {
                 match rx.recv().await {
                     Ok(event) => {
                         match event {
                             SyncEvent::Started => {
+                                if active_phases == 0 {
+                                    cycle_failed = false;
+                                    current.last_error.clear();
+                                }
                                 active_phases = active_phases.saturating_add(1);
                                 current.state = "syncing".into();
-                                current.last_error.clear();
                             }
                             SyncEvent::Enumerating { items, pages } => {
                                 current.state = "enumerating".into();
@@ -385,7 +478,11 @@ impl App {
                                 current.transferred = transferred;
                                 current.total = total.unwrap_or(0);
                             }
-                            SyncEvent::ItemDone { name, direction } => {
+                            SyncEvent::ItemDone {
+                                name,
+                                path,
+                                direction,
+                            } => {
                                 current.current_item.clear();
                                 current.transferred = 0;
                                 current.total = 0;
@@ -396,23 +493,52 @@ impl App {
                                         Direction::Upload => "uploaded",
                                     },
                                     name,
+                                    onedrive_path(&store, &path),
                                     String::new(),
                                 )
                                 .await;
                             }
-                            SyncEvent::Deleted { name } => {
-                                record_activity(&store, "deleted", name, String::new()).await;
+                            SyncEvent::Deleted { name, path } => {
+                                record_activity(
+                                    &store,
+                                    "deleted",
+                                    name,
+                                    path.as_deref()
+                                        .map(|path| onedrive_path(&store, path))
+                                        .unwrap_or_default(),
+                                    String::new(),
+                                )
+                                .await;
                             }
-                            SyncEvent::Conflict { original, copy } => {
-                                record_activity(&store, "conflict", original.clone(), copy.clone())
-                                    .await;
+                            SyncEvent::Conflict {
+                                original,
+                                copy,
+                                path,
+                            } => {
+                                record_activity(
+                                    &store,
+                                    "conflict",
+                                    original.clone(),
+                                    onedrive_path(&store, &path),
+                                    copy.clone(),
+                                )
+                                .await;
                                 let _ = sender.send(DaemonEvent::Conflict { original, copy });
                                 continue;
                             }
-                            SyncEvent::Failed { name, error } => {
+                            SyncEvent::Failed { name, path, error } => {
+                                cycle_failed = true;
                                 current.last_error = error.clone();
-                                record_activity(&store, "failed", name.clone(), error.clone())
-                                    .await;
+                                record_activity(
+                                    &store,
+                                    "failed",
+                                    name.clone(),
+                                    path.as_deref()
+                                        .map(|path| onedrive_path(&store, path))
+                                        .unwrap_or_default(),
+                                    error.clone(),
+                                )
+                                .await;
                                 let _ = sender.send(DaemonEvent::ItemFailed { name, error });
                             }
                             SyncEvent::SafetyStop { reason, kind } => {
@@ -426,6 +552,7 @@ impl App {
                                     &store,
                                     "safety-stop",
                                     reason.clone(),
+                                    String::new(),
                                     String::new(),
                                 )
                                 .await;
@@ -471,8 +598,15 @@ impl App {
                                         .unwrap_or_default()
                                         .to_string_lossy()
                                         .into_owned();
-                                    record_activity(&store, "downloaded", name, "按需".into())
-                                        .await;
+                                    let activity_path = onedrive_path(&store, &path);
+                                    record_activity(
+                                        &store,
+                                        "downloaded",
+                                        name,
+                                        activity_path,
+                                        "按需".into(),
+                                    )
+                                    .await;
                                 }
                                 let _ = sender.send(DaemonEvent::HydrationFinished {
                                     path: path.to_string_lossy().into_owned(),
@@ -485,6 +619,7 @@ impl App {
                                 continue;
                             }
                             SyncEvent::Finished(summary) => {
+                                cycle_failed |= summary.failed > 0;
                                 active_phases = active_phases.saturating_sub(1);
                                 // One line per pass with every counter: the
                                 // log alone should answer "what did that sync
@@ -501,10 +636,17 @@ impl App {
                                         "sync pass finished"
                                     );
                                 }
-                                current.state =
-                                    phase_state(paused.load(Ordering::Acquire), active_phases)
-                                        .into();
-                                current.pending = summary.still_queued;
+                                current.state = phase_completion_state(
+                                    paused.load(Ordering::Acquire),
+                                    active_phases,
+                                    cycle_failed,
+                                )
+                                .into();
+                                if let Err(error) = update_pending_status(&store, &mut current) {
+                                    tracing::warn!(%error, "could not read the durable queue snapshot");
+                                    current.pending = summary.still_queued;
+                                    current.pending_items.clear();
+                                }
                                 if active_phases == 0 {
                                     current.current_item.clear();
                                     current.transferred = 0;
@@ -525,7 +667,29 @@ impl App {
     }
 
     pub async fn status(&self) -> SyncStatus {
-        self.status.read().await.clone()
+        let mut status = self.status.read().await.clone();
+        if let Err(error) = update_pending_status(&self.store, &mut status) {
+            tracing::warn!(%error, "could not refresh the durable queue for Status");
+        }
+        status
+    }
+
+    /// Publish the authoritative durable queue after a direct UI mutation.
+    /// These changes can happen while the coordinator is paused, when no
+    /// engine phase will emit a `Finished` event to refresh the shared status.
+    async fn refresh_pending_status(&self) {
+        let pending = pending_snapshot(&self.store);
+        let mut status = self.status.write().await;
+        match pending {
+            Ok(snapshot) => apply_pending_snapshot(&mut status, snapshot),
+            Err(error) => {
+                tracing::warn!(%error, "could not publish the durable queue snapshot");
+                return;
+            }
+        }
+        let snapshot = status.clone();
+        drop(status);
+        self.emit(DaemonEvent::Status(snapshot));
     }
 
     pub fn request_sync(&self) -> u64 {
@@ -537,10 +701,17 @@ impl App {
     }
 
     async fn set_state(&self, state: &str, error: Option<String>) {
+        let pending = pending_snapshot(&self.store);
         let mut status = self.status.write().await;
         status.state = state.to_string();
         if let Some(error) = error {
             status.last_error = error;
+        }
+        match pending {
+            Ok(snapshot) => apply_pending_snapshot(&mut status, snapshot),
+            Err(error) => {
+                tracing::warn!(%error, "could not refresh the durable queue while changing state");
+            }
         }
         let snapshot = status.clone();
         drop(status);
@@ -557,7 +728,7 @@ impl App {
         if let Some(error) = error.downcast_ref::<Error>() {
             self.report_core_error(error).await
         } else {
-            let message = error.to_string();
+            let message = format!("{error:#}");
             self.set_state("error", Some(message.clone())).await;
             message
         }
@@ -726,6 +897,14 @@ fn phase_state(paused: bool, active_phases: u64) -> &'static str {
     }
 }
 
+fn phase_completion_state(paused: bool, active_phases: u64, cycle_failed: bool) -> &'static str {
+    if !paused && active_phases == 0 && cycle_failed {
+        "error"
+    } else {
+        phase_state(paused, active_phases)
+    }
+}
+
 fn build_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("GOnedrive/", env!("CARGO_PKG_VERSION")))
@@ -748,11 +927,77 @@ fn build_http_client() -> Result<reqwest::Client> {
 /// How many finished items the activity list keeps.
 const ACTIVITY_LIMIT: usize = 100;
 
-async fn record_activity(store: &Store, kind: &str, name: String, detail: String) {
+async fn record_activity(store: &Store, kind: &str, name: String, path: String, detail: String) {
     let when = time::OffsetDateTime::now_utc().unix_timestamp();
-    if let Err(e) = store.push_activity(kind, &name, &detail, when, ACTIVITY_LIMIT as i64) {
+    if let Err(e) = store.push_activity(kind, &name, &path, &detail, when, ACTIVITY_LIMIT as i64) {
         tracing::debug!(error = %e, "could not record activity");
     }
+}
+
+/// Read one coherent preview of the durable queue. A phase summary describes
+/// only that phase and can be stale when pull/local workers overlap; SQLite is
+/// the authority for both the count and the paths shown to the user.
+fn pending_snapshot(store: &Store) -> gonedrive_core::Result<(u64, Vec<PendingItem>)> {
+    const PREVIEW_LIMIT: usize = 5;
+
+    let accounts = store.accounts()?;
+    let mut total = 0u64;
+    let mut preview = Vec::new();
+    for account in &accounts {
+        total = total.saturating_add(store.pending_count(&account.id)?);
+        if preview.len() >= PREVIEW_LIMIT {
+            continue;
+        }
+        for op in store.pending_ops(&account.id, PREVIEW_LIMIT - preview.len())? {
+            let path = op
+                .local_path
+                .clone()
+                .or_else(|| {
+                    op.item_id
+                        .as_deref()
+                        .and_then(|id| store.local_path(account, id).ok().flatten())
+                })
+                .map(|path| onedrive_path(store, &path))
+                .unwrap_or_else(|| {
+                    op.item_id
+                        .as_deref()
+                        .and_then(|id| store.item(id).ok().flatten())
+                        .map(|item| format!("OneDrive/{}", item.name))
+                        .unwrap_or_else(|| "OneDrive/（路径不可用）".into())
+                });
+            preview.push(PendingItem {
+                kind: op.kind.as_str().into(),
+                path,
+                attempts: op.attempts,
+                retry_at: op.next_attempt_at,
+                last_error: op.last_error.unwrap_or_default(),
+            });
+        }
+    }
+    Ok((total, preview))
+}
+
+fn update_pending_status(store: &Store, status: &mut SyncStatus) -> gonedrive_core::Result<()> {
+    let snapshot = pending_snapshot(store)?;
+    apply_pending_snapshot(status, snapshot);
+    Ok(())
+}
+
+fn apply_pending_snapshot(status: &mut SyncStatus, (pending, items): (u64, Vec<PendingItem>)) {
+    status.pending = pending;
+    status.pending_items = items;
+}
+
+fn onedrive_path(store: &Store, path: &std::path::Path) -> String {
+    for account in store.accounts().unwrap_or_default() {
+        if let Ok(relative) = path.strip_prefix(&account.root_local_path) {
+            if relative.as_os_str().is_empty() {
+                return "OneDrive".into();
+            }
+            return format!("OneDrive/{}", relative.display());
+        }
+    }
+    path.display().to_string()
 }
 
 /// Processes that read files in order to *describe* them — type sniffing,

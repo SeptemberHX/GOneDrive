@@ -42,6 +42,16 @@ impl RootedFs {
     }
 
     pub(crate) fn open_read(&self, path: &Path) -> Result<File> {
+        // The sync root is a valid read-only directory target when folder
+        // emblems are recomputed up to the top. Reuse the already verified,
+        // O_NOFOLLOW root descriptor; mutation helpers still reject an empty
+        // relative path through `parent()` below.
+        if path == self.root {
+            return self
+                .root_fd
+                .try_clone()
+                .map_err(|error| path_error(path, error));
+        }
         self.open_file(path, libc::O_RDONLY, 0)
     }
 

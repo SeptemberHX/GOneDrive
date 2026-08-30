@@ -149,12 +149,16 @@ impl Ui {
             "syncing" => ("正在同步…", "emblem-synchronizing-symbolic"),
             "downloading" => ("正在下载", "emblem-synchronizing-symbolic"),
             "uploading" => ("正在上传", "emblem-synchronizing-symbolic"),
+            "paused" if status.pending > 0 => return self.apply_pending(status),
             "paused" => ("已暂停", "media-playback-pause-symbolic"),
             "offline" => ("离线，稍后重试", "network-offline-symbolic"),
             "keyring_locked" => ("请解锁钥匙环", "dialog-password-symbolic"),
             "signed_out" => ("需要重新登录", "dialog-warning-symbolic"),
             "error" => ("同步出错", "dialog-error-symbolic"),
             _ if status.pending > 0 => return self.apply_pending(status),
+            // Be defensive across upgrades and event races: an error message
+            // must never be presented under a green "up to date" title.
+            _ if !status.last_error.is_empty() => ("同步出错", "dialog-error-symbolic"),
             _ => ("已是最新", "emblem-ok-symbolic"),
         };
         self.status_title
@@ -181,7 +185,10 @@ impl Ui {
             ));
         }
 
-        let paused = status.state == "paused";
+        self.set_pause_switch(status.state == "paused");
+    }
+
+    fn set_pause_switch(&self, paused: bool) {
         if self.pause_switch.is_active() != paused {
             self.suppress.set(true);
             self.pause_switch.set_active(paused);
@@ -190,14 +197,36 @@ impl Ui {
     }
 
     fn apply_pending(&self, status: &SyncStatus) {
-        self.spinner.set_visible(true);
-        self.status_icon.set_visible(false);
-        self.status_title.set_markup(&format!(
-            "<b>{}</b>",
-            glib::markup_escape_text(&format!("等待处理 {} 项", status.pending))
-        ));
-        self.status_sub.set_visible(false);
+        let paused = status.state == "paused";
+        self.spinner.set_visible(!paused);
+        self.status_icon.set_visible(paused);
+        if paused {
+            self.status_icon
+                .set_icon_name(Some("media-playback-pause-symbolic"));
+        }
+        let title = if paused {
+            format!("已暂停 · 等待处理 {} 项", status.pending)
+        } else {
+            format!("等待处理 {} 项", status.pending)
+        };
+        self.status_title
+            .set_markup(&format!("<b>{}</b>", glib::markup_escape_text(&title)));
+        let mut lines = status
+            .pending_items
+            .iter()
+            .map(format_pending_item)
+            .collect::<Vec<_>>();
+        let hidden = status.pending.saturating_sub(lines.len() as u64);
+        if hidden > 0 {
+            lines.push(format!("另有 {hidden} 项"));
+        }
+        if lines.is_empty() {
+            lines.push("正在等待下一轮同步".into());
+        }
+        self.status_sub.set_text(&lines.join("\n"));
+        self.status_sub.set_visible(true);
         self.transfer_box.set_visible(false);
+        self.set_pause_switch(paused);
     }
 
     fn show_folders(&self, path: &str, entries: &[FolderEntry]) {
@@ -232,17 +261,14 @@ impl Ui {
                 ("<span foreground='#4aa3e8'>☁</span>", "仅在线", "")
             };
             let size = if entry.is_folder {
-                format!(
-                    "{dot} {word}{extra} · {} 项 · {}",
-                    entry.files,
-                    human(entry.bytes)
-                )
+                format!("{dot} {word}{extra} · {} 项", entry.items)
             } else {
                 format!("{dot} {word}{extra} · {}", human(entry.bytes))
             };
 
+            let title = glib::markup_escape_text(&entry.name);
             let row = adw::ActionRow::builder()
-                .title(&entry.name)
+                .title(title)
                 .title_lines(1)
                 .subtitle(&size)
                 .activatable(entry.is_folder)
@@ -353,19 +379,46 @@ fn activity_row(item: &Activity) -> adw::ActionRow {
         "conflict" => ("dialog-warning-symbolic", "od-tile-amber", "冲突已保留两份"),
         _ => ("dialog-error-symbolic", "od-tile-red", "失败"),
     };
-    let subtitle = if item.detail.is_empty() {
+    let event = if item.detail.is_empty() {
         format!("{verb} · {}", relative_time(item.when))
     } else {
         format!("{verb} · {} · {}", relative_time(item.when), item.detail)
     };
+    let path = if item.path.is_empty() {
+        "OneDrive/（旧记录未保存路径）"
+    } else {
+        &item.path
+    };
+    let subtitle = format!("{path}\n{event}");
+    // GObject may apply builder properties in canonical property order rather
+    // than call order. Build without untrusted strings, then disable markup
+    // before assigning either field so Graph/HTML errors are never parsed.
     let row = adw::ActionRow::builder()
-        .title(&item.name)
         .title_lines(1)
-        .subtitle(&subtitle)
-        .subtitle_lines(1)
+        .subtitle_lines(2)
         .build();
+    row.set_use_markup(false);
+    row.set_title(&item.name);
+    row.set_subtitle(&subtitle);
+    row.set_tooltip_text(Some(path));
     row.add_prefix(&tile(icon, variant));
     row
+}
+
+fn format_pending_item(item: &gonedrive_ipc::PendingItem) -> String {
+    let verb = match item.kind.as_str() {
+        "download" => "下载",
+        "upload" => "上传",
+        "create_remote_folder" => "新建云端文件夹",
+        "delete_remote" => "删除云端项目",
+        "move_remote" => "移动云端项目",
+        _ => "同步",
+    };
+    if item.attempts == 0 {
+        format!("{verb} · {}", item.path)
+    } else {
+        format!("{verb} · {} · 已重试 {} 次", item.path, item.attempts)
+    }
 }
 
 fn relative_time(when: i64) -> String {
@@ -397,5 +450,60 @@ pub fn human(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gtk::glib::{self, LogLevels};
+
+    use super::*;
+
+    #[test]
+    fn activity_rows_are_safe_to_refresh_in_realized_lists() {
+        if gtk::init().is_err() {
+            // Headless package builders still compile the GTK crate.
+            return;
+        }
+
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .build();
+        let window = gtk::Window::new();
+        window.set_child(Some(&list));
+        window.present();
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+
+        let previous_fatal =
+            glib::log_set_always_fatal(LogLevels::LEVEL_WARNING | LogLevels::LEVEL_CRITICAL);
+        let detail = "graph error 411: <!DOCTYPE HTML><HTML><HEAD><META></HEAD></HTML>";
+        let row = activity_row(&Activity {
+            kind: "failed".into(),
+            name: "remote-error.html".into(),
+            path: "OneDrive/Test/remote-error.html".into(),
+            detail: detail.into(),
+            when: 0,
+        });
+        list.append(&row);
+        while context.pending() {
+            context.iteration(false);
+        }
+        list.remove(&row);
+        list.append(&row);
+        while context.pending() {
+            context.iteration(false);
+        }
+        glib::log_set_always_fatal(previous_fatal);
+
+        assert!(!row.uses_markup());
+        assert!(!row.is_subtitle_selectable());
+        assert_eq!(row.title(), "remote-error.html");
+        let subtitle = row.subtitle().expect("activity subtitle");
+        assert!(subtitle.contains("OneDrive/Test/remote-error.html"));
+        assert!(subtitle.contains(detail));
+        window.close();
     }
 }

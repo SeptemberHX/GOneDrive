@@ -1,6 +1,6 @@
 //! Local discovery and reconciliation, including cumulative delete safety.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -8,10 +8,11 @@ use time::OffsetDateTime;
 
 use crate::db::{Account, ItemRecord, ItemState, OpKind};
 use crate::error::{Error, Result};
-use crate::hydrate::{Placeholder, PlaceholderState};
+use crate::hydrate::{Occupancy, Placeholder, PlaceholderState};
 use crate::sync::plan::{decide_local, LocalAction, LocalStat};
 
-use super::engine::{Engine, FullScanReport, SafetyStopKind, SyncEvent, SyncSummary};
+use super::engine::{Engine, FullScanReport, SafetyStopKind, SyncEvent, SyncPhase, SyncSummary};
+use super::rooted_fs::RootedFs;
 
 /// Watcher batches from one deletion wave are not guaranteed to arrive
 /// together. Keep scoped deletes non-executable until the tree has been quiet
@@ -44,7 +45,7 @@ impl Engine {
     /// stopped or while inotify overflowed. The daemon runs it at startup and
     /// then at a low cadence; ordinary edits use [`Self::scan_local_paths`].
     pub fn scan_local(&self, summary: &mut SyncSummary) -> Result<()> {
-        self.scan_local_scopes(summary, None)
+        self.scan_local_scopes(summary, None, None)
     }
 
     /// Reconcile only directories touched by the filesystem watcher.
@@ -53,16 +54,34 @@ impl Engine {
     /// widened to their nearest known ancestor so a newly-created subtree is
     /// still discovered, while existing sibling subtrees are never walked.
     pub fn scan_local_paths(&self, paths: &[PathBuf], summary: &mut SyncSummary) -> Result<()> {
-        self.scan_local_scopes(summary, Some(paths))
+        self.scan_local_scopes(summary, Some(paths), None)
     }
 
     pub fn sync_local_paths(&self, paths: &[PathBuf]) -> Result<SyncSummary> {
-        self.emit(SyncEvent::Started);
+        let phase = SyncPhase::start(self);
         let mut summary = SyncSummary::default();
         self.scan_local_paths(paths, &mut summary)?;
         self.stamp_directories(&self.account()?)?;
         summary.still_queued = self.store.pending_count(&self.account_id)?;
-        self.emit(SyncEvent::Finished(summary.clone()));
+        phase.finish(&summary);
+        Ok(summary)
+    }
+
+    /// Reconcile a watcher batch, retaining which exact files reached
+    /// close-write. A copied placeholder may inherit the source's xattrs; only
+    /// a completed write (or a full matching content hash) proves its bytes are
+    /// a real new file rather than sparse placeholder holes.
+    pub fn sync_local_change_batch(
+        &self,
+        paths: &[PathBuf],
+        completed_writes: &HashSet<PathBuf>,
+    ) -> Result<SyncSummary> {
+        let phase = SyncPhase::start(self);
+        let mut summary = SyncSummary::default();
+        self.scan_local_scopes(&mut summary, Some(paths), Some(completed_writes))?;
+        self.stamp_directories(&self.account()?)?;
+        summary.still_queued = self.store.pending_count(&self.account_id)?;
+        phase.finish(&summary);
         Ok(summary)
     }
 
@@ -128,6 +147,12 @@ impl Engine {
             for (name, stat) in entries {
                 let relative = relative_dir.join(&name);
                 seen.insert(relative.clone());
+                // Desktop-generated markers are outside the sync contract.
+                // Keep a known one visible in `seen` so it is never mistaken
+                // for a user deletion, but neither upload nor recurse into it.
+                if INTERNAL_NAMES.contains(&name.as_str()) {
+                    continue;
+                }
                 if stat.is_dir {
                     directories.push(relative.clone());
                 }
@@ -200,10 +225,40 @@ impl Engine {
         }
     }
 
+    /// Rebase the known online-only descendants of a moved directory for HSM.
+    /// The inode marks already survive the rename; refreshing their paths here
+    /// keeps reconnects and explicit unwatch operations correct without walking
+    /// unrelated parts of a large sync tree.
+    fn note_moved_placeholder_subtree(
+        &self,
+        account: &Account,
+        rooted: &RootedFs,
+        folder_id: &str,
+        old_root: &Path,
+        new_root: &Path,
+    ) -> Result<()> {
+        for record in self.store.files_in_subtree(folder_id)? {
+            let Some(old_path) = self.store.local_path(account, &record.id)? else {
+                continue;
+            };
+            let Ok(relative) = old_path.strip_prefix(old_root) else {
+                continue;
+            };
+            let new_path = new_root.join(relative);
+            if owned_placeholder_state(rooted, &new_path, &record.id)
+                == Some(PlaceholderState::Dehydrated)
+            {
+                self.note_placeholder(&new_path);
+            }
+        }
+        Ok(())
+    }
+
     fn scan_local_scopes(
         &self,
         summary: &mut SyncSummary,
         requested_paths: Option<&[PathBuf]>,
+        completed_writes: Option<&HashSet<PathBuf>>,
     ) -> Result<()> {
         let account = self.account()?;
         let Some(root_id) = account.root_item_id.clone() else {
@@ -267,6 +322,8 @@ impl Engine {
         // early turns a move into a remote delete plus a full re-upload.
         let mut appeared: Vec<(std::path::PathBuf, LocalStat)> = Vec::new();
         let mut vanished: Vec<ItemRecord> = Vec::new();
+        let by_inode = self.store.items_by_inode(&self.account_id)?;
+        let mut moved_ids = std::collections::HashSet::new();
 
         while let Some((parent_id, dir)) = stack.pop() {
             let entries = match read_dir(&dir, &rooted) {
@@ -292,13 +349,23 @@ impl Engine {
                     self.store
                         .cancel_pending_delete(&self.account_id, &record.id)?;
                 }
+                // Unknown indexer markers are not uploaded; known ones are
+                // still counted in `entries`/`on_disk`, so they are not
+                // repeatedly queued as remote deletions either.
+                if INTERNAL_NAMES.contains(&name.as_str()) {
+                    continue;
+                }
 
-                // Delta has already claimed this file and queued its newer
-                // remote content. The download path performs the conflict-copy
-                // check immediately before overwrite; queueing an upload here
-                // would let both directions mutate the same item concurrently.
+                // Delta or the hydration helper has already claimed this file.
+                // A full helper fill writes the inode and marks its xattr before
+                // the daemon can restore mtime/update SQLite; its close-write can
+                // therefore reach this scan in that short Hydrating window. It
+                // is client-owned I/O, not a user edit, and must never be queued
+                // for upload. DirtyRemote is likewise owned by the download path.
                 if !stat.is_dir
-                    && record.is_some_and(|record| record.state == ItemState::DirtyRemote)
+                    && record.is_some_and(|record| {
+                        matches!(record.state, ItemState::DirtyRemote | ItemState::Hydrating)
+                    })
                 {
                     continue;
                 }
@@ -309,6 +376,22 @@ impl Engine {
                 // the real file in the cloud. Nothing about them is ours to
                 // upload, so they only recurse (below) and refresh marks.
                 let path = dir.join(name);
+                if !stat.is_dir {
+                    let expected_id = record.map(|record| record.id.as_str());
+                    if placeholder_claim(&rooted, &path)
+                        .is_some_and(|(claimed_id, _)| Some(claimed_id.as_str()) != expected_id)
+                        && record.is_some()
+                        && !self.prepare_copied_placeholder(
+                            &rooted,
+                            &path,
+                            stat,
+                            expected_id,
+                            completed_writes.is_some_and(|paths| paths.contains(&path)),
+                        )?
+                    {
+                        continue;
+                    }
+                }
                 let placeholder_state =
                     record.and_then(|record| owned_placeholder_state(&rooted, &path, &record.id));
                 let content_is_ours =
@@ -343,17 +426,39 @@ impl Engine {
 
                 match decide_local(name, record, Some(stat)) {
                     LocalAction::CreateRemoteFolder => {
-                        // A parent that is itself new has no id to record yet;
-                        // the runner resolves it from the path once the parent
-                        // exists — the queue preserves creation order.
-                        self.store.enqueue(
-                            &self.account_id,
-                            OpKind::CreateRemoteFolder,
-                            parent_id.as_deref(),
-                            Some(&dir.join(name)),
-                            None,
-                        )?;
-                        stack.push((None, dir.join(name)));
+                        let new_path = dir.join(name);
+                        let moved = self.moved_candidate(&account, &by_inode, &new_path, stat)?;
+                        if let Some((known, old_path)) = moved {
+                            self.store.enqueue_move(
+                                &self.account_id,
+                                &known.id,
+                                &old_path,
+                                &new_path,
+                            )?;
+                            moved_ids.insert(known.id.clone());
+                            self.note_moved_placeholder_subtree(
+                                &account, &rooted, &known.id, &old_path, &new_path,
+                            )?;
+                            // A full verification still inspects the moved
+                            // subtree for edits. An incremental watcher pass
+                            // skips it: the directory move itself covers every
+                            // unchanged descendant in one remote operation.
+                            if full_scan {
+                                stack.push((Some(known.id.clone()), new_path));
+                            }
+                        } else {
+                            // A parent that is itself new has no id to record
+                            // yet; the runner resolves it from the path once the
+                            // parent exists — the queue preserves creation order.
+                            self.store.enqueue(
+                                &self.account_id,
+                                OpKind::CreateRemoteFolder,
+                                parent_id.as_deref(),
+                                Some(&new_path),
+                                None,
+                            )?;
+                            stack.push((None, new_path));
+                        }
                     }
                     LocalAction::UploadNew => {
                         // Deferred: whether this is truly new or the far end
@@ -467,45 +572,49 @@ impl Engine {
         // a vanished record whose inode reappeared elsewhere is one PATCH,
         // not a remote delete plus a re-upload that forfeits the server-side
         // version history.
-        let by_inode = if appeared.is_empty() {
-            HashMap::new()
-        } else {
-            self.store.items_by_inode(&self.account_id)?
-        };
-        let mut moved_ids = std::collections::HashSet::new();
         for (path, stat) in &appeared {
             // Parents are deliberately not recorded here: the runner resolves
             // them from the path, because a destination directory created in
             // this same pass has no remote id until its own queued creation
             // has run.
-            let known = by_inode.get(&stat.ino).filter(|record| {
-                vanished.iter().any(|v| v.id == record.id)
-                    || self
-                        .has_moved(&account, record, path.parent().unwrap_or(path), "")
-                        .unwrap_or(false)
-            });
-            match known {
-                Some(record) => {
+            let moved = self.moved_candidate(&account, &by_inode, path, stat)?;
+            match moved {
+                Some((record, old_path)) => {
                     moved_ids.insert(record.id.clone());
-                    if !stat.is_dir && crate::sync::plan::local_is_modified(record, stat) {
+                    let is_placeholder = !stat.is_dir
+                        && owned_placeholder_state(&rooted, path, &record.id)
+                            == Some(PlaceholderState::Dehydrated);
+                    if is_placeholder {
+                        self.note_placeholder(path);
+                    }
+                    if !is_placeholder && crate::sync::plan::local_is_modified(record, stat) {
                         // Moving preserves the remote identity, but it does not
                         // transfer bytes. If the file was also edited before
                         // this scan, commit the metadata and content work
                         // together so a crash cannot drop the upload half.
-                        self.store
-                            .enqueue_move_and_upload(&self.account_id, &record.id, path)?;
-                    } else {
-                        self.store.enqueue_conditional(
+                        self.store.enqueue_move_and_upload(
                             &self.account_id,
-                            OpKind::MoveRemote,
                             &record.id,
-                            Some(path),
-                            None,
-                            record.etag.as_deref().or(record.ctag.as_deref()),
+                            &old_path,
+                            path,
                         )?;
+                    } else {
+                        self.store
+                            .enqueue_move(&self.account_id, &record.id, &old_path, path)?;
                     }
                 }
                 None => {
+                    if !stat.is_dir
+                        && !self.prepare_copied_placeholder(
+                            &rooted,
+                            path,
+                            stat,
+                            None,
+                            completed_writes.is_some_and(|paths| paths.contains(path)),
+                        )?
+                    {
+                        continue;
+                    }
                     self.store
                         .enqueue(&self.account_id, OpKind::Upload, None, Some(path), None)?;
                 }
@@ -618,25 +727,131 @@ impl Engine {
             .collect())
     }
 
-    /// Whether a known item really moved, rather than a new file coincidentally
-    /// landing on a recycled inode.
-    fn has_moved(
+    /// Match a new path to a stable known inode without mistaking a conflict
+    /// copy, a remote-owned replacement, or an inode from another filesystem
+    /// for a user move.
+    fn moved_candidate<'a>(
         &self,
         account: &Account,
-        known: &ItemRecord,
-        new_dir: &Path,
-        new_name: &str,
-    ) -> Result<bool> {
-        let Some(old) = self.store.local_path(account, &known.id)? else {
-            return Ok(false);
+        by_inode: &'a HashMap<u64, ItemRecord>,
+        new_path: &Path,
+        stat: &LocalStat,
+    ) -> Result<Option<(&'a ItemRecord, PathBuf)>> {
+        if account.root_dev != Some(stat.dev) {
+            return Ok(None);
+        }
+        let Some(known) = by_inode.get(&stat.ino) else {
+            return Ok(None);
         };
-        if old == new_dir.join(new_name) {
-            return Ok(false);
+        if known.is_folder != stat.is_dir
+            || matches!(
+                known.state,
+                ItemState::DirtyRemote | ItemState::Hydrating | ItemState::Conflict
+            )
+        {
+            return Ok(None);
+        }
+        let Some(old) = self.store.local_path(account, &known.id)? else {
+            return Ok(None);
+        };
+        if old == new_path {
+            return Ok(None);
         }
         // Inodes are recycled aggressively, so require that nothing remains at
-        // the old path before believing this is the same file.
-        Ok(!old.exists())
+        // the old path before believing this is the same item. Preserve an I/O
+        // failure instead of treating it as absence and issuing a remote move.
+        match old.try_exists() {
+            Ok(false) => Ok(Some((known, old))),
+            Ok(true) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
+
+    /// Turn a completed copy of one of our placeholders into an ordinary new
+    /// file. File managers commonly preserve xattrs; without this check the
+    /// destination impersonates the source item and either uploads sparse
+    /// zeroes or is refused forever as a placeholder.
+    fn prepare_copied_placeholder(
+        &self,
+        rooted: &RootedFs,
+        path: &Path,
+        stat: &LocalStat,
+        expected_item_id: Option<&str>,
+        completed_write: bool,
+    ) -> Result<bool> {
+        let file = match rooted.open_read(path) {
+            Ok(file) => file,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(claimed_id) = Placeholder::item_id_file(&file) else {
+            return Ok(true);
+        };
+        if expected_item_id == Some(claimed_id.as_str()) {
+            return Ok(true);
+        }
+
+        let state = Placeholder::state_file(&file);
+        if state == PlaceholderState::Unmanaged {
+            Placeholder::clear_marks_file(&file)?;
+            return Ok(true);
+        }
+
+        let source = self.store.item(&claimed_id)?;
+        let size_matches = source
+            .as_ref()
+            .is_none_or(|record| record.size == stat.size);
+        let expected_hash = Placeholder::content_hash_file(&file)
+            .or_else(|| source.as_ref().and_then(|record| record.quickxor.clone()));
+        let before = super::transfer::FileVersion::capture_file(&file)?;
+        let exact_copy = if size_matches {
+            if let Some(expected_hash) = expected_hash.as_deref() {
+                let mut reader = file.try_clone()?;
+                let actual = crate::hash::quick_xor_reader(&mut reader)?;
+                super::transfer::FileVersion::capture_file(&file)?.same_content_as(before)
+                    && actual == expected_hash
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let fully_allocated = !Occupancy::read_file(&file)?.is_sparse();
+        let safe_to_claim = exact_copy
+            || (completed_write && (state == PlaceholderState::Hydrated || fully_allocated));
+        if !safe_to_claim {
+            tracing::debug!(
+                path = %path.display(),
+                claimed_item_id = %claimed_id,
+                ?state,
+                completed_write,
+                fully_allocated,
+                "deferring an incomplete copied placeholder"
+            );
+            return Ok(false);
+        }
+
+        Placeholder::clear_marks_file(&file)?;
+        if !super::transfer::FileVersion::capture_file(&file)?.same_content_as(before) {
+            // The copied identity is gone, so a later watcher/full-scan pass can
+            // safely treat the still-changing bytes as an ordinary local file.
+            return Ok(false);
+        }
+        tracing::info!(
+            path = %path.display(),
+            source_item_id = %claimed_id,
+            "detached copied placeholder identity"
+        );
+        Ok(true)
+    }
+}
+
+fn placeholder_claim(rooted: &RootedFs, path: &Path) -> Option<(String, PlaceholderState)> {
+    let file = rooted.open_read(path).ok()?;
+    let item_id = Placeholder::item_id_file(&file)?;
+    Some((item_id, Placeholder::state_file(&file)))
 }
 
 fn owned_placeholder_state(
@@ -644,9 +859,25 @@ fn owned_placeholder_state(
     path: &Path,
     expected_item_id: &str,
 ) -> Option<PlaceholderState> {
-    let file = rooted.open_read(path).ok()?;
-    (Placeholder::item_id_file(&file).as_deref() == Some(expected_item_id))
-        .then(|| Placeholder::state_file(&file))
+    match rooted.open_read(path) {
+        Ok(file) => (Placeholder::item_id_file(&file).as_deref() == Some(expected_item_id))
+            .then(|| Placeholder::state_file(&file)),
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            use std::os::unix::fs::MetadataExt;
+
+            // Registration failures leave known placeholders mode 000 until
+            // the HSM protects the inode. Their user xattrs are deliberately
+            // unreadable to this unprivileged scanner, so identify only the
+            // fail-closed shape at the database-owned path. Treating a user's
+            // unrelated mode-000 file conservatively as unchanged is safer
+            // than uploading sparse zeroes over the remote content.
+            let file = rooted.open_path(path).ok()?;
+            let metadata = file.metadata().ok()?;
+            (metadata.is_file() && metadata.mode() & 0o7777 == 0)
+                .then_some(PlaceholderState::Dehydrated)
+        }
+        Err(_) => None,
+    }
 }
 
 /// Directory entries worth considering, with their stats.
@@ -661,9 +892,7 @@ fn read_dir(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if INTERNAL_SUFFIXES.iter().any(|s| name.ends_with(s))
-            || INTERNAL_NAMES.contains(&name.as_str())
-        {
+        if INTERNAL_SUFFIXES.iter().any(|s| name.ends_with(s)) {
             // Staging leftovers are pure cache: consumed within seconds when
             // things work, so one still here after fifteen minutes is an
             // orphan of a failed hand-off. The scan is already walking this
@@ -703,7 +932,6 @@ fn read_dir_readonly(dir: &Path) -> std::io::Result<Vec<(String, LocalStat)>> {
         if INTERNAL_SUFFIXES
             .iter()
             .any(|suffix| name.ends_with(suffix))
-            || INTERNAL_NAMES.contains(&name.as_str())
         {
             continue;
         }

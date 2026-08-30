@@ -100,6 +100,70 @@ class StatusTests(unittest.TestCase):
         self.assertIsNone(ext.status_of(self.path))
 
 
+class SyncRootTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.dir.name, "OneDrive")
+        os.mkdir(self.root)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_root_and_descendants_are_managed(self):
+        self.assertTrue(ext.is_in_sync_root(self.root, (self.root,)))
+        self.assertTrue(
+            ext.is_in_sync_root(os.path.join(self.root, "Docs", "a.txt"), (self.root,))
+        )
+
+    def test_a_similar_path_prefix_is_not_inside_the_root(self):
+        copied = os.path.join(self.dir.name, "OneDrive-old", "a.txt")
+        self.assertFalse(ext.is_in_sync_root(copied, (self.root,)))
+
+    def test_an_external_copy_is_not_claimed_even_if_it_kept_xattrs(self):
+        copied = os.path.join(self.dir.name, "Downloads", "copy.bin")
+        os.makedirs(os.path.dirname(copied))
+        with open(copied, "wb") as handle:
+            handle.write(b"complete bytes")
+        os.setxattr(copied, "user.gonedrive.state", b"dehydrated")
+
+        self.assertIs(ext.status_of(copied), ext.ONLINE_ONLY)
+        self.assertFalse(ext.is_in_sync_root(copied, (self.root,)))
+
+
+class MenuScopeTests(unittest.TestCase):
+    def test_selection_and_background_actions_never_share_an_id(self):
+        for action in ("menu", "pin", "free", "fetch"):
+            self.assertNotEqual(
+                ext.menu_item_name("selection", action),
+                ext.menu_item_name("background", action),
+            )
+
+    def test_background_menu_is_bound_only_to_the_current_folder(self):
+        provider = ext.GOnedriveExtension()
+        folder = mock.MagicMock()
+        folder.is_directory.return_value = True
+        provider._path_of = mock.Mock(return_value="/sync/current")
+        provider._build_menu = mock.Mock(return_value=["background-menu"])
+        provider.get_file_items = mock.Mock(
+            side_effect=AssertionError("background must not reuse selection actions")
+        )
+
+        self.assertEqual(provider.get_background_items(folder), ["background-menu"])
+        provider._build_menu.assert_called_once_with(
+            [(folder, "/sync/current")], "background"
+        )
+
+    def test_file_menu_is_bound_only_to_selected_paths(self):
+        provider = ext.GOnedriveExtension()
+        selected = mock.MagicMock()
+        provider._path_of = mock.Mock(return_value="/sync/selected.docx")
+        provider._build_menu = mock.Mock(return_value=["selection-menu"])
+
+        self.assertEqual(provider.get_file_items([selected]), ["selection-menu"])
+        provider._build_menu.assert_called_once_with(
+            [(selected, "/sync/selected.docx")], "selection"
+        )
+
 class EmblemAssetTests(unittest.TestCase):
     def test_every_emblem_the_code_names_is_shipped(self):
         # A named-but-missing emblem renders as nothing, which looks exactly

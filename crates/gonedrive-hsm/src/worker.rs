@@ -1,25 +1,32 @@
 //! Non-blocking fanotify dispatch and bounded placeholder hydration workers.
 
+use std::ffi::CString;
 use std::io::Read;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 
 use anyhow::{bail, Context, Result};
 use gonedrive_ipc::hsm::Event;
-use gonedrive_ipc::reader_policy::{is_background_reader, is_bulk_copier};
+use gonedrive_ipc::reader_policy::{
+    is_background_reader, is_bulk_copier, is_file_manager_reader, FILE_MANAGER_COPY_READER,
+};
 
 use crate::fanotify::PreContentEvent;
-use crate::{
-    send_to_session, ClientSession, FileIdentity, Pending, Reply, Shared, HYDRATE_TIMEOUT,
-};
+use crate::marks::remove_mark_by_event_fd;
+use crate::server::send_to_session;
+use crate::{ClientSession, FileIdentity, Pending, Reply, Shared, HYDRATE_TIMEOUT};
 
 /// Poll for events and hand each one to a worker.
 ///
 /// The loop itself must never block on anything but the poll: doing the fill
 /// here would deadlock, because the write can block on the very event that has
 /// not been answered yet.
-pub(super) fn event_loop(shared: Arc<Shared>, workers: mpsc::SyncSender<PreContentEvent>) {
+pub(super) fn event_loop(
+    shared: Arc<Shared>,
+    workers: mpsc::SyncSender<PreContentEvent>,
+) -> std::io::Result<()> {
     let mut poll = libc::pollfd {
         fd: shared.fan.as_fd(),
         events: libc::POLLIN,
@@ -33,8 +40,7 @@ pub(super) fn event_loop(shared: Arc<Shared>, workers: mpsc::SyncSender<PreConte
             if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            tracing::error!(error = %err, "poll failed");
-            return;
+            return Err(err);
         }
         if rc == 0 {
             continue;
@@ -53,12 +59,18 @@ pub(super) fn event_loop(shared: Arc<Shared>, workers: mpsc::SyncSender<PreConte
                         }
                         Err(mpsc::TrySendError::Disconnected(event)) => {
                             let _ = shared.fan.respond(event.fd.as_raw_fd(), false);
-                            return;
+                            return Ok(());
                         }
                     }
                 }
             }
-            Err(e) => tracing::error!(error = %e, "reading events failed"),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A permanent read error leaves POLLIN asserted and, more
+            // importantly, means no blocked reader can be answered. Returning
+            // terminates the helper so systemd can create a fresh fanotify
+            // group; logging once is better than an immortal one-line-per-
+            // second error loop and a registration deadlock.
+            Err(error) => return Err(error),
         }
     }
 }
@@ -127,6 +139,55 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
         return;
     }
 
+    // Partial hydration leaves the inode watched. If this exact range was
+    // filled by an earlier read, the real bytes are already under the blocked
+    // reader: allow it directly. Round-tripping through the daemon would copy
+    // and fsync the same small range again for every Nautilus sniff.
+    if !event.is_open {
+        match requested_range_is_materialized(
+            fd,
+            event.offset,
+            event.length,
+            stat.st_size.max(0) as u64,
+        ) {
+            Ok(true) => {
+                let file_size = stat.st_size.max(0) as u64;
+                let fully_materialized = file_size > 0
+                    && requested_range_is_materialized(fd, 0, file_size, file_size)
+                        .unwrap_or(false);
+                if fully_materialized {
+                    if let Err(error) = mark_hydrated(fd) {
+                        tracing::warn!(path = ?event.path, %error, "could not repair fully materialized placeholder state");
+                    }
+                    if let Err(error) = remove_mark_by_event_fd(&shared, identity, fd) {
+                        tracing::debug!(path = ?event.path, %error, "could not drop repaired hydrated mark");
+                    }
+                }
+                if let Err(error) = shared.fan.respond(fd, true) {
+                    tracing::error!(%error, "could not allow a materialized range");
+                }
+                if fully_materialized {
+                    if let Some(path) = &event.path {
+                        let _ = send_to_session(
+                            &client,
+                            &Event::Filled {
+                                id: 0,
+                                ok: true,
+                                path: path.to_string_lossy().into_owned(),
+                                full: true,
+                            },
+                        );
+                    }
+                }
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::debug!(%error, "could not inspect placeholder extents");
+            }
+        }
+    }
+
     // An open event: let the daemon decide whether this opener needs the whole
     // file up front (a sparse-aware copier does, because it will SEEK over the
     // holes without ever reading). Most openers are allowed straight through
@@ -157,7 +218,9 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
         }
     };
     if allow && full {
-        remove_mark_by_identity(&shared, identity);
+        if let Err(error) = remove_mark_by_event_fd(&shared, identity, fd) {
+            tracing::debug!(path = ?event.path, %error, "could not drop hydrated mark");
+        }
     }
 
     // Answered no matter what: an unanswered pre-content event leaves the
@@ -191,9 +254,7 @@ fn hydrate(
     let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
 
-    let reader = std::fs::read_to_string(format!("/proc/{}/comm", event.pid))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let reader = hydration_reader(event.pid, path);
     let request = Event::Hydrate {
         id,
         path: path.to_string_lossy().into_owned(),
@@ -213,16 +274,19 @@ fn hydrate(
             bail!("the daemon did not answer within {HYDRATE_TIMEOUT:?}")
         }
     };
-    let (mut staged, offset, full) = match reply {
+    let (mut staged, offset, requested_full) = match reply {
         Reply::Fill(file, offset, full) => (file, offset, full),
         // Browsing sniff of an untouched placeholder: allow, no fill, offline.
         Reply::AllowEmpty => return Ok((true, false)),
-        Reply::Deny => return Ok((false, true)),
+        // `full = false` distinguishes an intentional offline browse refusal
+        // from a failed fill. The daemon has no hydration state to unwind for
+        // this path and must not publish a spurious failure completion.
+        Reply::Deny => return Ok((false, false)),
     };
 
     let staged_len = staged.metadata()?.len();
     let target_len = descriptor_len(event.fd.as_raw_fd())?;
-    let expected = expected_fill_len(full, offset, event.length, target_len)?;
+    let expected = expected_fill_len(requested_full, offset, event.length, target_len)?;
     if staged_len != expected {
         bail!(
             "staged content has {staged_len} bytes, expected {expected} for {}",
@@ -240,8 +304,29 @@ fn hydrate(
         );
     }
 
+    // Progressive reads can cover a whole small file without any one request
+    // being labelled full. Once SEEK_HOLE confirms that no sparse range
+    // remains, finalise exactly like a whole-file fill: otherwise real bytes
+    // occupy disk forever while the xattr and UI still say online-only.
+    let full = requested_full
+        || (target_len > 0
+            && requested_range_is_materialized(event.fd.as_raw_fd(), 0, target_len, target_len)
+                .unwrap_or(false));
+
     if full {
-        tracing::info!(path = %path.display(), bytes = written, %reader, pid = event.pid, "hydrated");
+        // The blocked reader resumes as soon as FAN_ALLOW is sent. Mark the
+        // source first so a file manager copying xattrs along with the now-real
+        // bytes cannot leave the destination claiming it is still a sparse
+        // online-only placeholder. The daemon follows with the full set of
+        // marks and the content hash after it receives Filled. SQLite remains
+        // Hydrating until then, which keeps watcher reconciliation from treating
+        // this helper-owned close-write as a local edit.
+        if let Err(error) = mark_hydrated(event.fd.as_raw_fd()) {
+            // The bytes are already complete, so an xattr failure must not turn
+            // a successful download into an I/O error for the user's copy.
+            tracing::warn!(path = %path.display(), %error, "could not mark hydrated before releasing reader");
+        }
+        tracing::info!(path = %path.display(), bytes = target_len, %reader, pid = event.pid, "hydrated");
     } else {
         // Only the requested window was filled; the watch stays, so a reader
         // that keeps going comes back for the rest.
@@ -257,6 +342,19 @@ fn hydrate(
     Ok((true, full))
 }
 
+pub(super) fn mark_hydrated(fd: RawFd) -> std::io::Result<()> {
+    let name = CString::new("user.gonedrive.state").expect("xattr name contains no NUL");
+    let value = b"hydrated";
+    // SAFETY: `name` is NUL-terminated, `value` is valid for its length, and
+    // the fanotify event descriptor remains owned by `event` for this call.
+    let rc = unsafe { libc::fsetxattr(fd, name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 fn descriptor_stat(fd: std::os::unix::io::RawFd) -> Result<libc::stat> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `stat` points to writable storage and `fd` belongs to the event.
@@ -265,6 +363,40 @@ fn descriptor_stat(fd: std::os::unix::io::RawFd) -> Result<libc::stat> {
     }
     // SAFETY: fstat succeeded and initialized the structure.
     Ok(unsafe { stat.assume_init() })
+}
+
+pub(super) fn requested_range_is_materialized(
+    fd: RawFd,
+    offset: u64,
+    length: u64,
+    file_size: u64,
+) -> std::io::Result<bool> {
+    if length == 0 {
+        return Ok(false);
+    }
+    let end = offset.saturating_add(length).min(file_size);
+    if offset >= end {
+        return Ok(true);
+    }
+    let offset = libc::off_t::try_from(offset).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "range offset exceeds the filesystem offset type",
+        )
+    })?;
+    // SAFETY: `fd` is the valid descriptor supplied with this fanotify event.
+    // SEEK_HOLE inspects extent metadata and does not read or fault file data.
+    let next_hole = unsafe { libc::lseek(fd, offset, libc::SEEK_HOLE) };
+    if next_hole < 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            // Unsupported extent reporting and a wholly sparse tail both fall
+            // back to the ordinary daemon hydration path.
+            Some(libc::EINVAL) | Some(libc::ENXIO) => Ok(false),
+            _ => Err(error),
+        };
+    }
+    Ok(next_hole as u64 >= end)
 }
 
 fn descriptor_len(fd: std::os::unix::io::RawFd) -> Result<u64> {
@@ -343,13 +475,63 @@ pub(super) fn fill_from(
     Ok(total)
 }
 
-fn remove_mark_by_identity(shared: &Arc<Shared>, identity: FileIdentity) {
-    let entry = shared.marks.lock().unwrap().remove(&identity);
-    if let Some(entry) = entry {
-        if let Err(error) = shared.fan.unwatch_fd(entry.file.as_raw_fd()) {
-            tracing::debug!(path = %entry.path.display(), %error, "could not drop hydrated mark");
+/// Classify a file-manager read without trusting its process name alone.
+///
+/// Nautilus reads file headers both for display metadata and for a real copy.
+/// During a copy it has already opened the destination for writing before the
+/// first source read; a browse has no such descriptor. Binding the decision to
+/// the same PID and filename keeps ordinary folder rendering offline while a
+/// copy receives real bytes before its first read is released.
+pub(super) fn hydration_reader(pid: i32, source: &Path) -> String {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|name| name.trim().to_string())
+        .unwrap_or_default();
+    if is_file_manager_reader(&comm) {
+        if let Some(destination) = writable_copy_destination(pid, source) {
+            tracing::info!(
+                source = %source.display(),
+                destination = %destination.display(),
+                pid,
+                "file-manager copy detected"
+            );
+            return FILE_MANAGER_COPY_READER.into();
         }
     }
+    comm
+}
+
+pub(super) fn writable_copy_destination(pid: i32, source: &Path) -> Option<PathBuf> {
+    let source_name = source.file_name()?;
+    let descriptors = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    for descriptor in descriptors.flatten() {
+        let fd = descriptor.file_name();
+        let flags = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", fd.to_string_lossy()))
+            .ok()
+            .and_then(|info| parse_open_flags(&info));
+        let Some(flags) = flags else {
+            continue;
+        };
+        if flags & libc::O_ACCMODE == libc::O_RDONLY {
+            continue;
+        }
+        let Ok(target) = std::fs::read_link(descriptor.path()) else {
+            continue;
+        };
+        if target == source || target.file_name() != Some(source_name) {
+            continue;
+        }
+        if std::fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_file()) {
+            return Some(target);
+        }
+    }
+    None
+}
+
+fn parse_open_flags(fdinfo: &str) -> Option<i32> {
+    let flags = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:\t"))?;
+    i32::from_str_radix(flags.trim(), 8).ok()
 }
 
 /// Name the process if it is one that should never trigger a download.
@@ -373,25 +555,5 @@ pub(super) fn fail_pending_for_uid(shared: &Arc<Shared>, uid: u32) {
     };
     for entry in pending {
         let _ = entry.reply.send(Reply::Deny);
-    }
-}
-
-pub(super) fn remove_marks_for_uid(shared: &Arc<Shared>, uid: u32) {
-    let removed = {
-        let mut marks = shared.marks.lock().unwrap();
-        let identities: Vec<_> = marks
-            .iter()
-            .filter(|(_, entry)| entry.uid == uid)
-            .map(|(identity, _)| *identity)
-            .collect();
-        identities
-            .into_iter()
-            .filter_map(|identity| marks.remove(&identity))
-            .collect::<Vec<_>>()
-    };
-    for entry in removed {
-        if let Err(error) = shared.fan.unwatch_fd(entry.file.as_raw_fd()) {
-            tracing::debug!(path = %entry.path.display(), %error, "could not remove disconnected mark");
-        }
     }
 }

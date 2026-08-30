@@ -42,10 +42,26 @@ pub struct Activity {
     /// One of `downloaded`, `uploaded`, `deleted`, `conflict`, `failed`.
     pub kind: String,
     pub name: String,
+    /// OneDrive-relative display path captured when the activity happened.
+    pub path: String,
     /// Extra context: the conflict copy's name, or the error.
     pub detail: String,
     /// Unix seconds.
     pub when: i64,
+}
+
+/// One durable queue entry shown while synchronization is waiting or retrying.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PendingItem {
+    /// One of `upload`, `download`, `create_remote_folder`, `delete_remote`,
+    /// `move_remote`.
+    pub kind: String,
+    /// OneDrive-relative display path, or an honest fallback when unavailable.
+    pub path: String,
+    pub attempts: u32,
+    /// Unix seconds; zero means immediately due.
+    pub retry_at: i64,
+    pub last_error: String,
 }
 
 /// One entry of a browsable folder listing, for the folder chooser.
@@ -58,9 +74,10 @@ pub struct FolderEntry {
     pub selected: bool,
     /// Whether the choice was made on this entry itself rather than inherited.
     pub explicit: bool,
-    /// Total remote bytes beneath it.
+    /// Bytes in direct file children, or the file's own size.
     pub bytes: u64,
-    pub files: u64,
+    /// Direct children for a folder, or one for a file.
+    pub items: u64,
 }
 
 /// What the daemon is doing right now.
@@ -71,6 +88,8 @@ pub struct SyncStatus {
     pub state: String,
     /// Operations still queued.
     pub pending: u64,
+    /// A bounded preview of the durable operations counted by `pending`.
+    pub pending_items: Vec<PendingItem>,
     /// The file currently being transferred, if any.
     pub current_item: String,
     pub transferred: u64,
@@ -220,6 +239,23 @@ pub mod hsm {
     pub const SOCKET_PATH: &str = "/run/gonedrive/hsm.sock";
     /// Maximum newline-delimited JSON frame accepted in either direction.
     pub const MAX_FRAME_SIZE: usize = 64 * 1024;
+    /// Keep one batch bounded even when every path is very short. The encoded
+    /// frame limit remains the final authority for unusually long paths.
+    pub const MAX_WATCH_BATCH: usize = 256;
+
+    /// Result for one path in a batched mark request. Results have the same
+    /// order as the request paths, avoiding another copy of every long path in
+    /// the helper's reply.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct WatchOutcome {
+        pub ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub dev: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ino: Option<u64>,
+    }
 
     /// Sent by the daemon to the helper.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +263,15 @@ pub mod hsm {
     pub enum Request {
         /// Intercept reads of this placeholder until it is hydrated.
         Watch { id: u64, path: String },
+        /// Register several placeholders in one bounded round trip.
+        WatchBatch { id: u64, paths: Vec<String> },
+        /// Start a complete mark-set declaration after reconnecting. Existing
+        /// marks remain armed until the matching commit succeeds.
+        BeginWatchSet { id: u64 },
+        /// Remove marks not observed since [`Request::BeginWatchSet`].
+        CommitWatchSet { id: u64 },
+        /// Abandon an incomplete declaration without changing existing marks.
+        AbortWatchSet { id: u64 },
         /// Stop intercepting: the file is hydrated, gone, or no longer ours.
         Unwatch { id: u64, path: String },
         /// Answer to a [`Event::Hydrate`].
@@ -297,6 +342,18 @@ pub mod hsm {
         Features {
             #[serde(default)]
             partial_hydration: bool,
+            /// Whether [`Request::WatchBatch`] is understood. Missing means
+            /// false, so a new daemon remains compatible with an old helper.
+            #[serde(default)]
+            batch_marks: bool,
+            /// Whether a complete reconnect registration can retire stale
+            /// marks without an unprotected interval.
+            #[serde(default)]
+            mark_sweeps: bool,
+            /// The helper can distinguish a real Nautilus copy from file-type
+            /// sniffing by observing the copy's writable destination descriptor.
+            #[serde(default)]
+            file_manager_copy_detection: bool,
         },
         /// Completion of a watch/unwatch request. A request id makes concurrent
         /// registrations unambiguous and lets the daemon refuse to create a
@@ -315,6 +372,16 @@ pub mod hsm {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             ino: Option<u64>,
         },
+        /// Completion of a [`Request::WatchBatch`]. A top-level error covers a
+        /// malformed/oversized request; otherwise there is one result per path.
+        WatchBatchResult {
+            id: u64,
+            ok: bool,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            message: Option<String>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            results: Vec<WatchOutcome>,
+        },
         /// Retained for protocol compatibility with older helpers. New watch
         /// operations use [`Event::WatchResult`].
         Ok,
@@ -328,7 +395,7 @@ pub mod hsm {
 
     #[cfg(test)]
     mod tests {
-        use super::{Event, Request};
+        use super::{Event, Request, WatchOutcome};
 
         #[test]
         fn watch_acknowledgements_keep_their_request_id() {
@@ -357,6 +424,80 @@ pub mod hsm {
                     ..
                 }
             ));
+        }
+
+        #[test]
+        fn batch_marks_preserve_result_order_without_repeating_paths() {
+            let request = Request::WatchBatch {
+                id: 7,
+                paths: vec!["/tmp/a".into(), "/tmp/b".into()],
+            };
+            let encoded = serde_json::to_string(&request).unwrap();
+            assert!(!encoded.contains("watch_results"));
+
+            let event = Event::WatchBatchResult {
+                id: 7,
+                ok: true,
+                message: None,
+                results: vec![
+                    WatchOutcome {
+                        ok: true,
+                        message: None,
+                        dev: Some(1),
+                        ino: Some(2),
+                    },
+                    WatchOutcome {
+                        ok: false,
+                        message: Some("unsupported".into()),
+                        dev: None,
+                        ino: None,
+                    },
+                ],
+            };
+            let encoded = serde_json::to_string(&event).unwrap();
+            let parsed: Event = serde_json::from_str(&encoded).unwrap();
+            assert!(matches!(
+                parsed,
+                Event::WatchBatchResult {
+                    id: 7,
+                    ok: true,
+                    results,
+                    ..
+                } if results.len() == 2 && results[0].ino == Some(2)
+            ));
+        }
+
+        #[test]
+        fn old_feature_replies_default_batch_marks_off() {
+            let parsed: Event =
+                serde_json::from_str(r#"{"op":"features","partial_hydration":true}"#).unwrap();
+            assert!(matches!(
+                parsed,
+                Event::Features {
+                    partial_hydration: true,
+                    batch_marks: false,
+                    mark_sweeps: false,
+                    file_manager_copy_detection: false,
+                }
+            ));
+        }
+
+        #[test]
+        fn mark_set_controls_round_trip_with_request_ids() {
+            for request in [
+                Request::BeginWatchSet { id: 1 },
+                Request::CommitWatchSet { id: 2 },
+                Request::AbortWatchSet { id: 3 },
+            ] {
+                let encoded = serde_json::to_string(&request).unwrap();
+                let parsed: Request = serde_json::from_str(&encoded).unwrap();
+                assert!(matches!(
+                    parsed,
+                    Request::BeginWatchSet { .. }
+                        | Request::CommitWatchSet { .. }
+                        | Request::AbortWatchSet { .. }
+                ));
+            }
         }
     }
 }

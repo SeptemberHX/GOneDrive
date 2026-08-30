@@ -420,10 +420,11 @@ async fn a_local_file_differing_only_in_case_loses_no_data() {
 
 /// The DriveItem a completed chunk upload returns.
 fn uploaded_big_item() -> Value {
+    let quickxor = gonedrive_core::hash::quick_xor(&vec![7u8; 400_000]);
     json!({
         "id": "NEW", "name": "big.bin", "size": 400_000,
         "cTag": "cu", "eTag": "eu",
-        "file": {"mimeType": "application/octet-stream"},
+        "file": {"mimeType": "application/octet-stream", "hashes": {"quickXorHash": quickxor}},
         "parentReference": {"driveId": "drive1", "id": ROOT},
         "fileSystemInfo": {"lastModifiedDateTime": "2026-08-28T00:00:00Z"}
     })
@@ -459,7 +460,9 @@ async fn a_large_upload_completes_in_multiple_chunks() {
         .and(path("/session-a"))
         .and(header("Content-Range", "bytes 0-327679/400000"))
         .respond_with(ResponseTemplate::new(202).set_body_json(
-            json!({"uploadUrl": upload_url, "nextExpectedRanges": ["327680-399999"]}),
+            // This is Graph's documented fragment response: unlike session
+            // creation, it deliberately has no `uploadUrl` field.
+            json!({"nextExpectedRanges": ["327680-399999"]}),
         ))
         .mount(&h.server)
         .await;
@@ -487,7 +490,9 @@ async fn an_interrupted_upload_resumes_from_its_committed_offset() {
             key: file.to_string_lossy().into_owned(),
             account_id: ACCOUNT.into(),
             upload_url: upload_url.clone(),
-            expires_at: None,
+            // Cached expiry can be stale because every accepted fragment
+            // extends the server-side session. It still must be queried.
+            expires_at: Some(time::macros::datetime!(2020-01-01 00:00 UTC)),
             committed_offset: 327_680,
             total_size: 400_000,
             source_fingerprint: Some(
@@ -504,6 +509,13 @@ async fn an_interrupted_upload_resumes_from_its_committed_offset() {
         .expect(0)
         .mount(&h.server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/resume-here"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"nextExpectedRanges": ["327680-399999"]}),
+        ))
+        .mount(&h.server)
+        .await;
     // Only the tail remains.
     Mock::given(method("PUT"))
         .and(path("/resume-here"))
@@ -518,4 +530,167 @@ async fn an_interrupted_upload_resumes_from_its_committed_offset() {
         "the upload should resume from its offset and complete"
     );
     assert!(h.store.item("NEW").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn an_overlapping_chunk_uses_session_status_instead_of_restarting() {
+    let h = chunked_upload_harness().await;
+    let upload_url = format!("{}/overlap", h.server.uri());
+    Mock::given(method("POST"))
+        .and(path_regex(r"createUploadSession$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"uploadUrl": upload_url, "expirationDateTime": "2030-01-01T00:00:00Z"}),
+        ))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/overlap"))
+        .and(header("Content-Range", "bytes 0-327679/400000"))
+        .respond_with(ResponseTemplate::new(416))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/overlap"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"nextExpectedRanges": ["327680-399999"]}),
+        ))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/overlap"))
+        .and(header("Content-Range", "bytes 327680-399999/400000"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(uploaded_big_item()))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.uploaded, 1);
+    assert!(h.store.item("NEW").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn an_unreadable_final_response_is_verified_by_size_and_hash() {
+    let h = chunked_upload_harness().await;
+    let upload_url = format!("{}/unclear-finish", h.server.uri());
+    Mock::given(method("POST"))
+        .and(path_regex(r"createUploadSession$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"uploadUrl": upload_url, "expirationDateTime": "2030-01-01T00:00:00Z"}),
+        ))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/unclear-finish"))
+        .and(header("Content-Range", "bytes 0-327679/400000"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(
+            json!({"nextExpectedRanges": ["327680-399999"]}),
+        ))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/unclear-finish"))
+        .and(header("Content-Range", "bytes 327680-399999/400000"))
+        .respond_with(ResponseTemplate::new(201).set_body_string("{"))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/ROOT:/big.bin"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(uploaded_big_item()))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.uploaded, 1);
+    assert!(h.store.item("NEW").unwrap().is_some());
+    assert!(h
+        .store
+        .upload_session(ACCOUNT, &h.path("big.bin").to_string_lossy())
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn an_unverifiable_final_response_keeps_a_durable_retry() {
+    let h = chunked_upload_harness().await;
+    let upload_url = format!("{}/not-visible-yet", h.server.uri());
+    Mock::given(method("POST"))
+        .and(path_regex(r"createUploadSession$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"uploadUrl": upload_url, "expirationDateTime": "2030-01-01T00:00:00Z"}),
+        ))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/not-visible-yet"))
+        .and(header("Content-Range", "bytes 0-327679/400000"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(
+            json!({"nextExpectedRanges": ["327680-399999"]}),
+        ))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/not-visible-yet"))
+        .and(header("Content-Range", "bytes 327680-399999/400000"))
+        .respond_with(ResponseTemplate::new(201).set_body_string("{"))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/ROOT:/big.bin"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(
+            json!({"error": {"code": "itemNotFound", "message": "not visible yet"}}),
+        ))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.uploaded, 0);
+    assert_eq!(summary.failed, 0, "uncertainty is retryable, not data loss");
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 1);
+    let session = h
+        .store
+        .upload_session(ACCOUNT, &h.path("big.bin").to_string_lossy())
+        .unwrap()
+        .expect("the ambiguous completion marker must survive");
+    assert_eq!(session.committed_offset, 400_000);
+}
+
+#[tokio::test]
+async fn an_ambiguous_completion_after_restart_never_resends_file_bytes() {
+    let h = chunked_upload_harness().await;
+    let file = h.path("big.bin");
+    h.store
+        .save_upload_session(&gonedrive_core::db::UploadSessionRecord {
+            key: file.to_string_lossy().into_owned(),
+            account_id: ACCOUNT.into(),
+            upload_url: format!("{}/already-committed", h.server.uri()),
+            // An expired upload URL must not erase a durable completion marker.
+            expires_at: Some(time::macros::datetime!(2020-01-01 00:00 UTC)),
+            committed_offset: 400_000,
+            total_size: 400_000,
+            source_fingerprint: Some(
+                gonedrive_core::sync::transfer::file_fingerprint(&file).unwrap(),
+            ),
+        })
+        .unwrap();
+    Mock::given(method("POST"))
+        .and(path_regex(r"createUploadSession$"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&h.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/ROOT:/big.bin"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(uploaded_big_item()))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.uploaded, 1);
+    assert!(h.store.item("NEW").unwrap().is_some());
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 0);
 }

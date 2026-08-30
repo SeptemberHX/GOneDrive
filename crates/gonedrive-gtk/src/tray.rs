@@ -16,6 +16,8 @@ use crate::backend::Command;
 pub enum TrayAction {
     ShowPanel,
     OpenFolder,
+    RestartDaemon,
+    RestartFilesOnDemand,
     Quit,
 }
 
@@ -219,15 +221,36 @@ impl Tray for GonedriveTray {
             MenuItem::Separator,
             SubMenu {
                 label: "更多".into(),
-                submenu: vec![StandardItem {
-                    label: "退出 GOnedrive".into(),
-                    icon_name: "application-exit-symbolic".into(),
-                    activate: Box::new(|tray: &mut Self| {
-                        let _ = tray.actions.send_blocking(TrayAction::Quit);
-                    }),
-                    ..Default::default()
-                }
-                .into()],
+                submenu: vec![
+                    StandardItem {
+                        label: "重启同步后台".into(),
+                        icon_name: "system-reboot-symbolic".into(),
+                        activate: Box::new(|tray: &mut Self| {
+                            let _ = tray.actions.send_blocking(TrayAction::RestartDaemon);
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    StandardItem {
+                        label: "重启文件按需服务…".into(),
+                        icon_name: "system-run-symbolic".into(),
+                        activate: Box::new(|tray: &mut Self| {
+                            let _ = tray.actions.send_blocking(TrayAction::RestartFilesOnDemand);
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    MenuItem::Separator,
+                    StandardItem {
+                        label: "退出 GOnedrive".into(),
+                        icon_name: "application-exit-symbolic".into(),
+                        activate: Box::new(|tray: &mut Self| {
+                            let _ = tray.actions.send_blocking(TrayAction::Quit);
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                ],
                 ..Default::default()
             }
             .into(),

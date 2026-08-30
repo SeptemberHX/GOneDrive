@@ -50,9 +50,16 @@ pub struct GraphClient {
 #[derive(Debug)]
 pub enum ChunkOutcome {
     /// The service accepted the chunk and wants more, starting at this offset.
-    Accepted { next_offset: Option<u64> },
+    Accepted {
+        next_offset: Option<u64>,
+        expires_at: Option<OffsetDateTime>,
+    },
     /// The final chunk landed; the upload is done.
     Completed(Box<DriveItem>),
+    /// Graph acknowledged the final fragment but its driveItem response could
+    /// not be decoded. The caller must verify the item independently before it
+    /// marks the upload complete or sends any more bytes.
+    CompletionUnknown { reason: String },
 }
 
 impl GraphClient {
@@ -167,6 +174,16 @@ impl GraphClient {
         let response = self
             .send(|http| http.get(format!("{base}/me/drive/items/{item_id}")))
             .await?;
+        Ok(response.json().await?)
+    }
+
+    /// Resolve a direct child by name. Normal sync bookkeeping stays id-based;
+    /// this path form is reserved for reconciling a newly-created upload whose
+    /// final `driveItem` response was lost after Graph committed the bytes.
+    pub async fn child_by_name(&self, parent_id: &str, name: &str) -> Result<DriveItem> {
+        let encoded = urlencode_segment(name);
+        let url = format!("{}/me/drive/items/{parent_id}:/{encoded}", self.base);
+        let response = self.send(|http| http.get(&url)).await?;
         Ok(response.json().await?)
     }
 
@@ -289,6 +306,10 @@ impl GraphClient {
                 let mut req = http
                     .put(&url)
                     .header("Content-Type", "application/octet-stream")
+                    // Keep this explicit for empty files. Some Graph frontends
+                    // reject a zero-byte PUT as 411 when an intermediary turns
+                    // an inferred empty body into a request with no length.
+                    .header("Content-Length", content.len().to_string())
                     .body(content.clone());
                 if let Some(tag) = &if_match {
                     req = req.header("If-Match", tag);
@@ -423,27 +444,97 @@ impl GraphClient {
             match status {
                 // 202: more chunks wanted. 200/201: the file is complete.
                 202 => {
-                    let session: UploadSession = response
-                        .json()
-                        .await
-                        .map_err(|error| Error::Http(error.without_url()))?;
+                    let status = match response.json::<UploadStatus>().await {
+                        Ok(status) => status,
+                        Err(error) => {
+                            // The fragment may already be durable even when its
+                            // response body was cut short. Querying the session
+                            // is the only safe way to choose the next offset.
+                            tracing::debug!(
+                                error = %error.without_url(),
+                                "recovering upload offset after an unreadable 202 response"
+                            );
+                            self.upload_session_status_url(upload_url.clone()).await?
+                        }
+                    };
                     return Ok(ChunkOutcome::Accepted {
-                        next_offset: session.next_offset(),
+                        next_offset: status.next_offset(),
+                        expires_at: status.expiration_date_time,
                     });
                 }
                 200 | 201 => {
-                    let item: DriveItem = response
-                        .json()
-                        .await
-                        .map_err(|error| Error::Http(error.without_url()))?;
-                    return Ok(ChunkOutcome::Completed(Box::new(item)));
+                    return match response.json::<DriveItem>().await {
+                        Ok(item) => Ok(ChunkOutcome::Completed(Box::new(item))),
+                        Err(error) => Ok(ChunkOutcome::CompletionUnknown {
+                            reason: error.without_url().to_string(),
+                        }),
+                    };
                 }
-                404 | 409 | 410 => {
+                404 | 410 => {
                     // The session is gone; the caller must start a new one
                     // rather than keep pushing bytes into a dead URL.
                     return Err(Error::UploadSessionExpired {
                         item: "resumable upload".into(),
                         reason: format!("the service returned {status}"),
+                    });
+                }
+                416 => {
+                    // Graph uses 416 when a retried fragment overlaps bytes it
+                    // already accepted. Ask for the authoritative missing range
+                    // instead of discarding or blindly recreating the session.
+                    let status = self.upload_session_status_url(upload_url.clone()).await?;
+                    return Ok(ChunkOutcome::Accepted {
+                        next_offset: status.next_offset(),
+                        expires_at: status.expiration_date_time,
+                    });
+                }
+                429 | 500..=599 if attempt < MAX_ATTEMPTS => {
+                    let delay = retry_after(response.headers()).unwrap_or_else(|| backoff(attempt));
+                    tokio::time::sleep(delay.min(MAX_RETRY_AFTER)).await;
+                }
+                _ => {
+                    let body = response
+                        .bytes()
+                        .await
+                        .map_err(|error| Error::Http(error.without_url()))?;
+                    return Err(graph_error(status, &body));
+                }
+            }
+        }
+    }
+
+    /// Query which bytes are still missing from a resumable upload.
+    pub async fn upload_session_status(&self, upload_url: &str) -> Result<UploadStatus> {
+        let upload_url = self.validated_upload_url(upload_url)?;
+        self.upload_session_status_url(upload_url).await
+    }
+
+    async fn upload_session_status_url(&self, upload_url: Url) -> Result<UploadStatus> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let response = self.http.get(upload_url.clone()).send().await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) if attempt < MAX_ATTEMPTS && is_transient_transport(&error) => {
+                    tokio::time::sleep(backoff(attempt)).await;
+                    continue;
+                }
+                Err(error) => return Err(Error::Http(error.without_url())),
+            };
+
+            let status = response.status().as_u16();
+            match status {
+                200 => {
+                    return response
+                        .json::<UploadStatus>()
+                        .await
+                        .map_err(|error| Error::Http(error.without_url()));
+                }
+                404 | 410 => {
+                    return Err(Error::UploadSessionExpired {
+                        item: "resumable upload".into(),
+                        reason: format!("status query returned {status}"),
                     });
                 }
                 429 | 500..=599 if attempt < MAX_ATTEMPTS => {

@@ -245,7 +245,7 @@ impl DaemonService {
         self.app
             .materialize_tree()
             .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))
     }
 
     async fn fetch_now(&self, path: &str) -> zbus::fdo::Result<u64> {
@@ -322,6 +322,11 @@ impl DaemonService {
 pub async fn serve(app: Arc<App>) -> Result<zbus::Connection> {
     let connection = connection::Builder::session()
         .context("could not connect to the session bus")?
+        // zbus permits replacing an existing owner by default. A second
+        // daemon must fail here instead of competing for the database, local
+        // watcher and privileged helper while silently stealing the UI name.
+        .allow_name_replacements(false)
+        .replace_existing_names(false)
         .name(SERVICE_NAME)
         .context("another GOnedrive daemon already owns the bus name")?
         .serve_at(OBJECT_PATH, DaemonService { app: app.clone() })

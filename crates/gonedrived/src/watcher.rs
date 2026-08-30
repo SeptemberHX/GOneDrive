@@ -5,14 +5,14 @@
 //! watches a user may hold. The periodic full scan is what guarantees
 //! convergence — this just makes the common case feel immediate.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use notify::event::{EventKind, ModifyKind};
+use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind, RenameMode};
 use notify::{Event, RecursiveMode, Watcher};
 
 const EVENT_QUEUE: usize = 4096;
@@ -25,10 +25,12 @@ const IGNORED_SUFFIXES: &[&str] = &[".gonedrive-partial"];
 pub struct LocalWatcher {
     /// Dropping this stops the watch.
     _watcher: notify::RecommendedWatcher,
+    open_writes: OpenWrites,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalChangeKind {
+    CloseWrite,
     Create,
     Remove,
     Modify,
@@ -47,7 +49,90 @@ struct LocalChange {
 #[derive(Debug)]
 pub struct LocalChangeBatch {
     pub paths: Vec<PathBuf>,
+    /// Exact file names whose last writable handle closed in this burst.
+    /// The local reconciler uses this to distinguish a completed copy from a
+    /// destination that merely has its final size but is still being filled.
+    pub completed_writes: Vec<PathBuf>,
     pub force_full: bool,
+}
+
+/// Paths with a create/data event that have not reached close-write yet.
+///
+/// This state is updated in notify's callback before the bounded event queue,
+/// so queue overflow cannot lose a close and leave reconciliation blocked
+/// forever. The coordinator also consults it before applying a full-scan
+/// report, preventing the periodic verifier from racing an application write.
+#[derive(Debug, Clone, Default)]
+pub struct OpenWrites {
+    paths: Arc<Mutex<HashMap<PathBuf, usize>>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl OpenWrites {
+    fn observe(&self, kind: &EventKind, paths: &[PathBuf]) {
+        let mut open = self.paths.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = false;
+        match kind {
+            EventKind::Create(CreateKind::File) => {
+                for path in paths {
+                    open.entry(path.clone()).or_insert(1);
+                    changed = true;
+                }
+            }
+            EventKind::Modify(ModifyKind::Data(_)) => {
+                for path in paths {
+                    // inotify reports a directory's child-list mutation as a
+                    // data change on the directory itself. Directories never
+                    // emit CloseWrite, so tracking one here would block every
+                    // incremental scan below it forever. A metadata lookup is
+                    // cheap relative to a write event and keeps the gate tied
+                    // strictly to regular file content.
+                    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
+                        open.entry(path.clone()).or_insert(1);
+                        changed = true;
+                    }
+                }
+            }
+            EventKind::Access(AccessKind::Close(AccessMode::Write)) | EventKind::Remove(_) => {
+                for path in paths {
+                    changed |= open.remove(path).is_some();
+                }
+            }
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if paths.len() >= 2 => {
+                if let Some(count) = open.remove(&paths[0]) {
+                    open.insert(paths[1].clone(), count);
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+        drop(open);
+        if changed {
+            // `notify_one` retains a permit when the batching task has not
+            // reached its wait yet, closing the check-then-sleep race.
+            self.changed.notify_one();
+        }
+    }
+
+    pub fn blocks(&self, scopes: &HashSet<PathBuf>) -> bool {
+        let open = self.paths.lock().unwrap_or_else(|e| e.into_inner());
+        open.keys().any(|path| {
+            scopes
+                .iter()
+                .any(|scope| path.starts_with(scope) || scope.starts_with(path))
+        })
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    async fn wait_for_change(&self) {
+        self.changed.notified().await;
+    }
 }
 
 impl LocalWatcher {
@@ -65,19 +150,23 @@ impl LocalWatcher {
         let (batch_tx, batch_rx) = tokio::sync::mpsc::channel(BATCH_QUEUE);
         let overflowed = Arc::new(AtomicBool::new(false));
         let callback_overflow = overflowed.clone();
+        let open_writes = OpenWrites::default();
+        let callback_writes = open_writes.clone();
+        let batch_writes = open_writes.clone();
 
         let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
             match result {
                 Ok(event) => {
-                    if !is_change(&event.kind) {
-                        return;
-                    }
                     let paths: Vec<_> = event
                         .paths
                         .into_iter()
                         .filter(|path| !is_internal(path))
                         .collect();
                     if paths.is_empty() {
+                        return;
+                    }
+                    callback_writes.observe(&event.kind, &paths);
+                    if !is_change(&event.kind) {
                         return;
                     }
                     let kind = classify(&event.kind);
@@ -107,21 +196,35 @@ impl LocalWatcher {
         tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
                 let mut dirty = HashSet::new();
-                add_dirty_paths(&mut dirty, first);
+                let mut completed_writes = HashSet::new();
+                add_dirty_paths(&mut dirty, &mut completed_writes, first);
                 // Collapse the burst: keep swallowing events until the tree has
-                // been quiet for the debounce window.
+                // been quiet for the debounce window. A quiet *open* writer is
+                // not complete: wait for close-write rather than uploading the
+                // stable-looking prefix it happens to have produced so far.
                 loop {
                     match tokio::time::timeout(debounce, rx.recv()).await {
-                        Ok(Some(change)) => add_dirty_paths(&mut dirty, change),
+                        Ok(Some(change)) => {
+                            add_dirty_paths(&mut dirty, &mut completed_writes, change)
+                        }
                         Ok(None) => return,
+                        Err(_) if batch_writes.blocks(&dirty) => {
+                            batch_writes.wait_for_change().await
+                        }
                         Err(_) => break,
                     }
                 }
                 let mut paths: Vec<_> = dirty.into_iter().collect();
                 paths.sort();
+                let mut completed_writes: Vec<_> = completed_writes.into_iter().collect();
+                completed_writes.sort();
                 let force_full = overflowed.swap(false, Ordering::AcqRel);
                 if batch_tx
-                    .send(LocalChangeBatch { paths, force_full })
+                    .send(LocalChangeBatch {
+                        paths,
+                        completed_writes,
+                        force_full,
+                    })
                     .await
                     .is_err()
                 {
@@ -130,12 +233,23 @@ impl LocalWatcher {
             }
         });
 
-        Ok((Self { _watcher: watcher }, batch_rx))
+        Ok((
+            Self {
+                _watcher: watcher,
+                open_writes,
+            },
+            batch_rx,
+        ))
+    }
+
+    pub fn open_writes(&self) -> OpenWrites {
+        self.open_writes.clone()
     }
 }
 
 fn classify(kind: &EventKind) -> LocalChangeKind {
     match kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => LocalChangeKind::CloseWrite,
         EventKind::Create(_) => LocalChangeKind::Create,
         EventKind::Remove(_) => LocalChangeKind::Remove,
         EventKind::Modify(ModifyKind::Name(_)) => LocalChangeKind::Rename,
@@ -144,11 +258,24 @@ fn classify(kind: &EventKind) -> LocalChangeKind {
     }
 }
 
-fn add_dirty_paths(dirty: &mut HashSet<PathBuf>, change: LocalChange) {
+fn add_dirty_paths(
+    dirty: &mut HashSet<PathBuf>,
+    completed_writes: &mut HashSet<PathBuf>,
+    change: LocalChange,
+) {
     // Rename events carry both old and new names. For every change scan the
     // entry and its parent; this pairs cross-directory moves in one batch and
     // notices deletion of the old name even when that path no longer exists.
     for path in change.paths {
+        match change.kind {
+            LocalChangeKind::Create | LocalChangeKind::Modify => {
+                completed_writes.remove(&path);
+            }
+            LocalChangeKind::CloseWrite | LocalChangeKind::Rename => {
+                completed_writes.insert(path.clone());
+            }
+            LocalChangeKind::Remove | LocalChangeKind::Other => {}
+        }
         if let Some(parent) = path.parent() {
             dirty.insert(parent.to_path_buf());
         }
@@ -170,6 +297,7 @@ fn add_dirty_paths(dirty: &mut HashSet<PathBuf>, change: LocalChange) {
 /// has nothing to sync from them anyway.
 fn is_change(kind: &EventKind) -> bool {
     match kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
         EventKind::Access(_) => false,
         EventKind::Modify(ModifyKind::Metadata(_)) => false,
         EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => true,
@@ -234,6 +362,7 @@ fn count_directories(root: &Path, limit: usize) -> usize {
 mod tests {
     use super::*;
     use notify::event::RenameMode;
+    use std::io::Write;
 
     #[test]
     fn rename_batches_both_names_and_both_parents() {
@@ -242,6 +371,7 @@ mod tests {
         let mut dirty = HashSet::new();
         add_dirty_paths(
             &mut dirty,
+            &mut HashSet::new(),
             LocalChange {
                 kind: classify(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
                 paths: vec![old.clone(), new.clone()],
@@ -260,5 +390,86 @@ mod tests {
         assert!(!is_change(&EventKind::Modify(ModifyKind::Metadata(
             notify::event::MetadataKind::Any,
         ))));
+    }
+
+    #[test]
+    fn writable_handles_block_only_their_own_scopes_until_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope_a = dir.path().join("A");
+        let scope_b = dir.path().join("B");
+        std::fs::create_dir_all(&scope_a).unwrap();
+        let path = scope_a.join("writing.bin");
+        std::fs::write(&path, b"in progress").unwrap();
+        let tracker = OpenWrites::default();
+        tracker.observe(
+            &EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            std::slice::from_ref(&path),
+        );
+
+        assert!(tracker.blocks(&HashSet::from([scope_a])));
+        assert!(!tracker.blocks(&HashSet::from([scope_b])));
+
+        tracker.observe(
+            &EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            std::slice::from_ref(&path),
+        );
+        assert!(tracker.is_idle());
+    }
+
+    #[test]
+    fn directory_content_changes_do_not_become_permanent_open_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = OpenWrites::default();
+        tracker.observe(
+            &EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+            &[dir.path().to_path_buf()],
+        );
+
+        assert!(tracker.is_idle());
+        assert!(!tracker.blocks(&HashSet::from([dir.path().join("child.txt")])));
+    }
+
+    #[test]
+    fn close_write_marks_the_exact_file_complete() {
+        let path = PathBuf::from("/sync/A/file.bin");
+        let mut dirty = HashSet::new();
+        let mut completed = HashSet::new();
+        add_dirty_paths(
+            &mut dirty,
+            &mut completed,
+            LocalChange {
+                kind: LocalChangeKind::CloseWrite,
+                paths: vec![path.clone()],
+            },
+        );
+
+        assert!(dirty.contains(Path::new("/sync/A")));
+        assert!(completed.contains(&path));
+    }
+
+    #[tokio::test]
+    async fn a_real_open_writer_is_not_published_before_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_watcher, mut batches) =
+            LocalWatcher::start(dir.path(), Duration::from_millis(40)).unwrap();
+        let path = dir.path().join("slow-copy.bin");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"unfinished prefix").unwrap();
+        file.flush().unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(180), batches.recv())
+                .await
+                .is_err(),
+            "an open destination must not reach reconciliation"
+        );
+
+        drop(file);
+        let batch = tokio::time::timeout(Duration::from_secs(2), batches.recv())
+            .await
+            .expect("close-write batch timed out")
+            .expect("watcher stopped");
+        assert!(batch.paths.contains(&path));
+        assert!(batch.completed_writes.contains(&path));
     }
 }

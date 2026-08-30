@@ -37,6 +37,12 @@ pub enum Error {
     #[error("upload session for {item} is no longer valid: {reason}")]
     UploadSessionExpired { item: String, reason: String },
 
+    /// Graph acknowledged the final fragment, but the returned driveItem could
+    /// not be decoded and has not yet been independently verified. Retrying
+    /// must reconcile the cloud item; it must not create another same-name file.
+    #[error("upload completion for {item} is awaiting verification: {reason}")]
+    UploadCommitUncertain { item: String, reason: String },
+
     /// The user asked for this transfer to stop.
     #[error("cancelled")]
     Cancelled,
@@ -80,12 +86,22 @@ impl Error {
             // Nothing is wrong with the saved credential. Once the user
             // unlocks the login keyring, the exact same operation can run.
             Error::KeyringLocked(_) => true,
+            Error::UploadCommitUncertain { .. } => true,
             // `is_body` is the one that matters on a flaky link: a connection
             // dropped or reset *while streaming a response body* (a train
             // entering a tunnel mid-download) surfaces here, not as a connect
             // or request error. Without it such an interruption counts as
             // permanent and the transfer is abandoned on the first failure.
-            Error::Http(e) => e.is_timeout() || e.is_connect() || e.is_request() || e.is_body(),
+            Error::Http(e) => {
+                e.is_timeout()
+                    || e.is_connect()
+                    || e.is_request()
+                    || e.is_body()
+                    // A successful status with a truncated or temporarily
+                    // malformed body is recoverable by querying the resource
+                    // again. Treating it as permanent used to discard uploads.
+                    || e.is_decode()
+            }
             Error::Io(e) => matches!(
                 e.kind(),
                 std::io::ErrorKind::Interrupted

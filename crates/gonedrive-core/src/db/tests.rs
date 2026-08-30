@@ -50,13 +50,21 @@ fn activity_persists_newest_first_and_is_trimmed() {
     let store = Store::open_in_memory().unwrap();
     for i in 0..5 {
         store
-            .push_activity("downloaded", &format!("f{i}.txt"), "", 1000 + i, 3)
+            .push_activity(
+                "downloaded",
+                &format!("f{i}.txt"),
+                &format!("OneDrive/f{i}.txt"),
+                "",
+                1000 + i,
+                3,
+            )
             .unwrap();
     }
     let recent = store.recent_activity(10).unwrap();
     // Trimmed to the last 3, newest first.
     assert_eq!(recent.len(), 3);
     assert_eq!(recent[0].name, "f4.txt");
+    assert_eq!(recent[0].path, "OneDrive/f4.txt");
     assert_eq!(recent[2].name, "f2.txt");
     assert_eq!(recent[0].kind, "downloaded");
     assert_eq!(recent[0].when, 1004);
@@ -435,7 +443,12 @@ fn edited_move_queues_metadata_and_content_together() {
     store.upsert_item(&file("F1", "ROOT", "a.txt")).unwrap();
 
     store
-        .enqueue_move_and_upload("acct", "F1", Path::new("/sync/b.txt"))
+        .enqueue_move_and_upload(
+            "acct",
+            "F1",
+            Path::new("/sync/a.txt"),
+            Path::new("/sync/b.txt"),
+        )
         .unwrap();
 
     let queued = store.due_ops("acct", 10).unwrap();

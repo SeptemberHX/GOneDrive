@@ -45,6 +45,8 @@ pub const XATTR_QUICKXOR: &str = "user.gonedrive.quickxor";
 /// Transient flag: set while an upload or download is in flight, so the file
 /// manager can show a syncing emblem, and removed when it finishes.
 pub const XATTR_SYNCING: &str = "user.gonedrive.syncing";
+/// Original permission bits while an unprotected placeholder is fail-closed.
+pub const XATTR_SAFETY_MODE: &str = "user.gonedrive.safety_mode";
 
 /// What a placeholder currently holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +115,25 @@ impl Occupancy {
 pub struct Placeholder;
 
 impl Placeholder {
+    /// Keep an unprotected sparse placeholder visible but unreadable. The HSM
+    /// restores the exact saved mode on the same inode after its mark succeeds.
+    pub(crate) fn lock_unprotected_file(file: &std::fs::File) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let mode = file.metadata()?.mode() & 0o7777;
+        if mode == 0 {
+            return Ok(());
+        }
+        set_xattr_file(file, XATTR_SAFETY_MODE, &mode.to_le_bytes())?;
+        // SAFETY: `file` is owned by the caller and `fchmod` has no pointers.
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = remove_xattr_file(file, XATTR_SAFETY_MODE);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     /// Create a file that reports `size` bytes but occupies none.
     ///
     /// The file is truncated to full size and then has that whole range punched
@@ -240,7 +261,23 @@ impl Placeholder {
         item_id: &str,
         ctag: Option<&str>,
     ) -> Result<()> {
+        Self::mark_hydrated_file_with_hash(file, item_id, ctag, None)
+    }
+
+    /// Descriptor-bound hydrated marks for callers that already hashed the
+    /// exact bytes they published. Uploads use this to avoid reading a large
+    /// file twice while still making every durable xattr visible together.
+    pub(crate) fn mark_hydrated_file_with_hash(
+        file: &std::fs::File,
+        item_id: &str,
+        ctag: Option<&str>,
+        known_hash: Option<&str>,
+    ) -> Result<()> {
         Self::write_marks_file(file, PlaceholderState::Hydrated, item_id, ctag)?;
+        if let Some(hash) = known_hash {
+            let _ = set_xattr_file(file, XATTR_QUICKXOR, hash.as_bytes());
+            return Ok(());
+        }
         if let Ok(mut reader) = file.try_clone() {
             if reader.seek(SeekFrom::Start(0)).is_ok() {
                 if let Ok(hash) = crate::hash::quick_xor_reader(&mut reader) {
@@ -334,10 +371,6 @@ impl Placeholder {
         Ok(())
     }
 
-    pub(crate) fn set_content_hash_file(file: &std::fs::File, hash: &str) -> Result<()> {
-        set_xattr_file(file, XATTR_QUICKXOR, hash.as_bytes())
-    }
-
     /// The content hash recorded the last time we wrote this file, if any.
     pub fn content_hash(path: &Path) -> Option<String> {
         let raw = xattr::get(path, XATTR_QUICKXOR).ok()??;
@@ -370,8 +403,27 @@ impl Placeholder {
 
     /// Remove GOnedrive's marks, leaving an ordinary file behind.
     pub fn clear_marks(path: &Path) -> Result<()> {
-        for name in [XATTR_STATE, XATTR_ITEM_ID, XATTR_CTAG, XATTR_PIN] {
+        for name in managed_xattrs() {
             let _ = xattr::remove(path, name);
+        }
+        Ok(())
+    }
+
+    /// Descriptor-bound counterpart used while reconciling a copied
+    /// placeholder. Clearing through the already-validated inode prevents a
+    /// concurrent path replacement from losing its own marks instead.
+    pub(crate) fn clear_marks_file(file: &std::fs::File) -> Result<()> {
+        if let Some(raw) = get_xattr_file(file, XATTR_SAFETY_MODE)? {
+            if let Ok(bytes) = <[u8; 4]>::try_from(raw.as_slice()) {
+                let mode = u32::from_le_bytes(bytes);
+                // SAFETY: `file` is live and `fchmod` has no pointer inputs.
+                if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+        }
+        for name in managed_xattrs() {
+            let _ = remove_xattr_file(file, name);
         }
         Ok(())
     }
@@ -408,6 +460,18 @@ impl Placeholder {
         }
         Ok(())
     }
+}
+
+fn managed_xattrs() -> [&'static str; 7] {
+    [
+        XATTR_STATE,
+        XATTR_ITEM_ID,
+        XATTR_CTAG,
+        XATTR_PIN,
+        XATTR_QUICKXOR,
+        XATTR_SYNCING,
+        XATTR_SAFETY_MODE,
+    ]
 }
 
 fn get_xattr_file(file: &std::fs::File, name: &str) -> Result<Option<Vec<u8>>> {
@@ -530,6 +594,32 @@ mod tests {
         let content = std::fs::read(&path).unwrap();
         assert_eq!(content.len(), 4096);
         assert!(content.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_failed_mark_safety_locks_without_removing_the_placeholder() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tmp();
+        let path = dir.path().join("visible.bin");
+        Placeholder::create(&path, 4096, "ITEM1", None, None).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let original = file.metadata().unwrap().mode() & 0o7777;
+
+        Placeholder::lock_unprotected_file(&file).unwrap();
+
+        assert!(path.exists(), "a mark failure must not hide the file name");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, 0);
+
+        // An unprivileged owner cannot read user xattrs while the inode is
+        // mode 000. Restore the original mode before inspecting the marker;
+        // the privileged HSM can read it while installing the replacement
+        // watch.
+        assert_eq!(unsafe { libc::fchmod(file.as_raw_fd(), original) }, 0);
+        assert_eq!(
+            get_xattr_file(&file, XATTR_SAFETY_MODE).unwrap(),
+            Some(original.to_le_bytes().to_vec())
+        );
     }
 
     #[test]

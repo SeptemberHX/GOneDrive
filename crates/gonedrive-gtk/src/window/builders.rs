@@ -93,7 +93,12 @@ impl Ui {
             .build();
         let status_title = gtk::Label::builder().xalign(0.0).build();
         status_title.set_markup("<b>已是最新</b>");
-        let status_sub = gtk::Label::builder().xalign(0.0).build();
+        let status_sub = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::Char)
+            .max_width_chars(64)
+            .build();
         status_sub.add_css_class("dim-label");
         status_sub.add_css_class("caption");
         status_text.append(&status_title);

@@ -34,13 +34,21 @@ impl Engine {
             }
             Err(error) => return Err(error),
         };
-        // An explicit "always keep on this device" wins outright.
+        // An effective "always keep on this device" wins outright, whether
+        // selected on this folder or inherited from an ancestor.
         if self.store.explicitly_pinned(folder_id)? {
             let changed = Placeholder::state_file(&folder) != PlaceholderState::Hydrated;
             let _ = Placeholder::mark_dir_file(&folder, PlaceholderState::Hydrated, folder_id);
             let _ = Placeholder::set_pin_file(&folder, "pinned");
             return Ok(changed);
         }
+
+        // A folder that used to be pinned must stop advertising that choice as
+        // soon as it is released. The file manager trusts this xattr offline.
+        let effective = self
+            .store
+            .effective_pin(folder_id, self.config.download_new.default_pin())?;
+        let _ = Placeholder::set_pin_file(&folder, effective.as_str());
 
         let mut all_local = true;
         for child in self.store.children(&self.account_id, folder_id)? {

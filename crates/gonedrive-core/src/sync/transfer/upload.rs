@@ -169,6 +169,7 @@ async fn upload_file_inner(
         mtime,
         source_version,
         source_fingerprint,
+        hash,
         target,
         on_progress,
         rooted,
@@ -191,24 +192,105 @@ async fn upload_resumable(
     mtime: OffsetDateTime,
     source_version: FileVersion,
     source_fingerprint: String,
+    expected_quickxor: String,
     target: UploadTarget<'_>,
     on_progress: &mut impl FnMut(u64, u64) -> bool,
     rooted: Option<&RootedFs>,
 ) -> Result<DriveItem> {
-    let mut session =
+    let commit = UploadCommit {
+        store,
+        target: &target,
+        source,
+        source_version,
+        rooted,
+        size,
+    };
+    let (mut session, resumed) =
         resume_or_create(graph, store, &target, size, mtime, &source_fingerprint).await?;
     let mut offset = session.committed_offset;
     let mut pacer = RatePacer::new(config.upload_limit_bytes_per_sec);
 
+    // `offset == size` is a durable marker for a final 200/201 whose driveItem
+    // body was lost. Never send bytes or create a new same-name session from
+    // that state; independently verify the cloud item until it becomes visible.
+    if offset == size {
+        return finish_reconciled_upload(
+            graph,
+            &commit,
+            &expected_quickxor,
+            "the final response was unreadable",
+            on_progress,
+        )
+        .await;
+    }
+
+    if resumed {
+        match graph.upload_session_status(&session.upload_url).await {
+            Ok(status) => {
+                let Some(server_offset) = status.next_offset() else {
+                    store.set_upload_offset(target.account_id, target.session_key, size)?;
+                    return finish_reconciled_upload(
+                        graph,
+                        &commit,
+                        &expected_quickxor,
+                        "the upload status contained no missing range",
+                        on_progress,
+                    )
+                    .await;
+                };
+                if server_offset > size {
+                    store.delete_upload_session(target.account_id, target.session_key)?;
+                    return Err(Error::UploadSessionExpired {
+                        item: target.name.to_string(),
+                        reason: format!(
+                            "the service requested byte {server_offset} beyond the {size}-byte file"
+                        ),
+                    });
+                }
+                offset = server_offset;
+                session.committed_offset = offset;
+                session.expires_at = status.expiration_date_time;
+                store.save_upload_session(&session)?;
+                if offset == size {
+                    return finish_reconciled_upload(
+                        graph,
+                        &commit,
+                        &expected_quickxor,
+                        "the service reported that no bytes remain",
+                        on_progress,
+                    )
+                    .await;
+                }
+                if !on_progress(offset, size) {
+                    return Err(Error::Cancelled);
+                }
+            }
+            Err(Error::UploadSessionExpired { .. }) => {
+                if let Some(item) =
+                    matching_remote_upload(graph, &target, size, &expected_quickxor).await?
+                {
+                    return finish_upload(&commit, item, on_progress);
+                }
+                store.delete_upload_session(target.account_id, target.session_key)?;
+                (session, _) =
+                    resume_or_create(graph, store, &target, size, mtime, &source_fingerprint)
+                        .await?;
+                offset = 0;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
     loop {
         if offset >= size {
-            // Every byte is accounted for but the service never returned the
-            // finished item, so the session is not in a state we can trust.
-            store.delete_upload_session(target.account_id, target.session_key)?;
-            return Err(Error::UploadSessionExpired {
-                item: target.name.to_string(),
-                reason: "all bytes were sent but the upload never completed".into(),
-            });
+            return finish_reconciled_upload(
+                graph,
+                &commit,
+                &expected_quickxor,
+                "all bytes were accepted without a readable final item",
+                on_progress,
+            )
+            .await;
         }
 
         let len = config.upload_chunk_size.min(size - offset);
@@ -222,17 +304,25 @@ async fn upload_resumable(
             .await
         {
             Ok(ChunkOutcome::Completed(item)) => {
-                store.delete_upload_session(target.account_id, target.session_key)?;
-                // The service has committed the file. Finalise bookkeeping
-                // even if the scheduling slice expired during this chunk;
-                // abandoning now would leave an ambiguous successful upload.
-                let _ = on_progress(size, size);
-                if capture(rooted, source)? != source_version {
-                    return Err(file_changed_error(source, "uploading"));
-                }
-                return Ok(*item);
+                return finish_upload(&commit, *item, on_progress);
             }
-            Ok(ChunkOutcome::Accepted { next_offset }) => {
+            Ok(ChunkOutcome::CompletionUnknown { reason }) => {
+                // Persist the ambiguity before doing another network request so
+                // a crash cannot make the next process resend the final bytes.
+                store.set_upload_offset(target.account_id, target.session_key, size)?;
+                return finish_reconciled_upload(
+                    graph,
+                    &commit,
+                    &expected_quickxor,
+                    &reason,
+                    on_progress,
+                )
+                .await;
+            }
+            Ok(ChunkOutcome::Accepted {
+                next_offset,
+                expires_at,
+            }) => {
                 // Trust the service's view of what it received over our own
                 // arithmetic; a retried chunk can leave the two disagreeing.
                 let next = next_offset.unwrap_or(offset + len);
@@ -246,19 +336,27 @@ async fn upload_resumable(
                     });
                 }
                 offset = next;
-                store.set_upload_offset(target.account_id, target.session_key, offset)?;
+                session.committed_offset = offset;
+                session.expires_at = expires_at.or(session.expires_at);
+                store.save_upload_session(&session)?;
                 pacer.pace(len).await;
                 if !on_progress(offset, size) {
                     return Err(Error::Cancelled);
                 }
             }
             Err(Error::UploadSessionExpired { .. }) => {
+                if let Some(item) =
+                    matching_remote_upload(graph, &target, size, &expected_quickxor).await?
+                {
+                    return finish_upload(&commit, item, on_progress);
+                }
                 // Start over rather than pushing bytes at a dead URL. The file
                 // is re-read from the beginning, which is the only correct
                 // recovery when the service has discarded the staging area.
                 store.delete_upload_session(target.account_id, target.session_key)?;
-                session = resume_or_create(graph, store, &target, size, mtime, &source_fingerprint)
-                    .await?;
+                (session, _) =
+                    resume_or_create(graph, store, &target, size, mtime, &source_fingerprint)
+                        .await?;
                 offset = 0;
             }
             Err(error) => return Err(error),
@@ -273,23 +371,23 @@ async fn resume_or_create(
     size: u64,
     mtime: OffsetDateTime,
     source_fingerprint: &str,
-) -> Result<UploadSessionRecord> {
+) -> Result<(UploadSessionRecord, bool)> {
     if let Some(existing) = store.upload_session(target.account_id, target.session_key)? {
         let usable = existing.total_size == size
-            && existing.committed_offset < size
-            && existing.source_fingerprint.as_deref() == Some(source_fingerprint)
-            && existing
-                .expires_at
-                .is_none_or(|time| time > OffsetDateTime::now_utc());
+            && existing.committed_offset <= size
+            && existing.source_fingerprint.as_deref() == Some(source_fingerprint);
         if usable {
             tracing::debug!(
                 key = target.session_key,
                 offset = existing.committed_offset,
                 "resuming upload"
             );
-            return Ok(existing);
+            return Ok((existing, true));
         }
-        // The file changed underneath us, or the session aged out.
+        // The file changed underneath us or the persisted state is invalid.
+        // Do not reject a matching session from its cached expiry alone: every
+        // accepted fragment extends that expiry and a crash can happen before
+        // the refreshed timestamp is saved. The status GET above is authoritative.
         store.delete_upload_session(target.account_id, target.session_key)?;
     }
 
@@ -313,7 +411,83 @@ async fn resume_or_create(
         source_fingerprint: Some(source_fingerprint.to_string()),
     };
     store.save_upload_session(&record)?;
-    Ok(record)
+    Ok((record, false))
+}
+
+struct UploadCommit<'a, 'target> {
+    store: &'a Store,
+    target: &'a UploadTarget<'target>,
+    source: &'a Path,
+    source_version: FileVersion,
+    rooted: Option<&'a RootedFs>,
+    size: u64,
+}
+
+async fn finish_reconciled_upload(
+    graph: &GraphClient,
+    commit: &UploadCommit<'_, '_>,
+    expected_quickxor: &str,
+    reason: &str,
+    on_progress: &mut impl FnMut(u64, u64) -> bool,
+) -> Result<DriveItem> {
+    if let Some(item) =
+        matching_remote_upload(graph, commit.target, commit.size, expected_quickxor).await?
+    {
+        return finish_upload(commit, item, on_progress);
+    }
+    Err(Error::UploadCommitUncertain {
+        item: commit.target.name.to_string(),
+        reason: reason.to_string(),
+    })
+}
+
+async fn matching_remote_upload(
+    graph: &GraphClient,
+    target: &UploadTarget<'_>,
+    size: u64,
+    expected_quickxor: &str,
+) -> Result<Option<DriveItem>> {
+    let result = match target.item_id {
+        Some(item_id) => graph.item(item_id).await,
+        None => graph.child_by_name(target.parent_id, target.name).await,
+    };
+    let item = match result {
+        Ok(item) => item,
+        Err(Error::Graph { status: 404, .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let remote_hash = item
+        .hashes()
+        .and_then(|hashes| hashes.quick_xor_hash.as_deref());
+    if item.size == Some(size) && remote_hash == Some(expected_quickxor) {
+        Ok(Some(item))
+    } else {
+        tracing::warn!(
+            name = target.name,
+            remote_size = ?item.size,
+            expected_size = size,
+            remote_hash = ?remote_hash,
+            "cloud item did not match an ambiguously completed upload"
+        );
+        Ok(None)
+    }
+}
+
+fn finish_upload(
+    commit: &UploadCommit<'_, '_>,
+    item: DriveItem,
+    on_progress: &mut impl FnMut(u64, u64) -> bool,
+) -> Result<DriveItem> {
+    commit
+        .store
+        .delete_upload_session(commit.target.account_id, commit.target.session_key)?;
+    // The service has committed the file. Finalise bookkeeping even if the
+    // scheduling slice expired during the last request.
+    let _ = on_progress(commit.size, commit.size);
+    if capture(commit.rooted, commit.source)? != commit.source_version {
+        return Err(file_changed_error(commit.source, "uploading"));
+    }
+    Ok(item)
 }
 
 pub(super) async fn read_chunk(

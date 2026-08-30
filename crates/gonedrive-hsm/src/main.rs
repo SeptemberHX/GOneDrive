@@ -18,13 +18,13 @@
 //!   the reader sees as an ordinary I/O error.
 
 mod fanotify;
+mod file_handle;
 mod marks;
+mod server;
 mod worker;
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{mpsc, Arc, Mutex};
@@ -32,13 +32,24 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use gonedrive_ipc::hsm::{Event, Request, MAX_FRAME_SIZE, SOCKET_PATH};
+use gonedrive_ipc::hsm::{Event, SOCKET_PATH};
 
 use crate::fanotify::Fanotify;
-use crate::marks::{install_mark, open_authorised, remove_marks_for_path};
+use crate::file_handle::{MountHandles, ReopenableFile};
 #[cfg(test)]
-use crate::worker::{background_reader, expected_fill_len, fill_from};
-use crate::worker::{event_loop, fail_pending_for_uid, handle_event, remove_marks_for_uid};
+use crate::marks::open_authorised;
+use crate::marks::MarkRegistry;
+use crate::server::{bind_socket, send_to_session, send_to_stream, serve_daemon};
+#[cfg(test)]
+use crate::server::{parallel_map_ordered, read_frame, truncate_mark_error, MARK_ERROR_BYTES};
+#[cfg(test)]
+use crate::worker::{
+    background_reader, expected_fill_len, fill_from, hydration_reader, mark_hydrated,
+    requested_range_is_materialized,
+};
+use crate::worker::{event_loop, handle_event};
+#[cfg(test)]
+use gonedrive_ipc::hsm::MAX_FRAME_SIZE;
 
 /// How long a blocked reader waits before we give up and fail its read.
 /// Long enough for a large file over a slow link, short enough that a wedged
@@ -89,10 +100,9 @@ struct FileIdentity {
 
 struct MarkEntry {
     uid: u32,
-    path: PathBuf,
-    /// Kept open so even a replaced or deleted pathname can be unmarked by
-    /// descriptor, without reopening attacker-controlled path components.
-    file: std::fs::File,
+    path: Arc<Path>,
+    file: ReopenableFile,
+    sweep: u64,
 }
 
 #[derive(Clone)]
@@ -106,7 +116,11 @@ struct Shared {
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
     sessions: Mutex<HashMap<u32, ClientSession>>,
-    marks: Mutex<HashMap<FileIdentity, MarkEntry>>,
+    marks: Mutex<MarkRegistry>,
+    sweeps: Mutex<HashMap<u32, u64>>,
+    mounts: MountHandles,
+    descriptor_fallbacks: AtomicU64,
+    next_sweep: AtomicU64,
     allowed_uid: Option<u32>,
 }
 
@@ -153,19 +167,6 @@ impl Shared {
     }
 }
 
-fn send_to_session(session: &ClientSession, event: &Event) -> Result<()> {
-    send_to_stream(&session.stream, event)
-}
-
-fn send_to_stream(stream: &Arc<Mutex<UnixStream>>, event: &Event) -> Result<()> {
-    let mut line = serde_json::to_string(event)?;
-    line.push('\n');
-    let mut stream = stream.lock().unwrap();
-    stream.write_all(line.as_bytes())?;
-    stream.flush()?;
-    Ok(())
-}
-
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -186,7 +187,11 @@ fn main() -> Result<()> {
         next_id: AtomicU64::new(1),
         pending: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
-        marks: Mutex::new(HashMap::new()),
+        marks: Mutex::new(MarkRegistry::default()),
+        sweeps: Mutex::new(HashMap::new()),
+        mounts: MountHandles::default(),
+        descriptor_fallbacks: AtomicU64::new(0),
+        next_sweep: AtomicU64::new(1),
         allowed_uid: cli.uid,
     });
 
@@ -209,16 +214,30 @@ fn main() -> Result<()> {
             })?;
     }
 
+    let (event_error_tx, event_error_rx) = mpsc::channel();
     {
         let shared = shared.clone();
+        let event_error_tx = event_error_tx.clone();
         std::thread::Builder::new()
             .name("fanotify".into())
-            .spawn(move || event_loop(shared, work_tx))?;
+            .spawn(move || {
+                let error = event_loop(shared, work_tx).err().unwrap_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "fanotify worker queue disconnected",
+                    )
+                });
+                let _ = event_error_tx.send(error);
+            })?;
     }
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    listener.set_nonblocking(true)?;
+    loop {
+        if let Ok(error) = event_error_rx.try_recv() {
+            return Err(error).context("fanotify event loop stopped; restarting helper");
+        }
+        match listener.accept() {
+            Ok((stream, _address)) => {
                 let shared = shared.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = serve_daemon(&shared, stream) {
@@ -226,271 +245,10 @@ fn main() -> Result<()> {
                     }
                 });
             }
-            Err(e) => tracing::warn!(error = %e, "accept failed"),
-        }
-    }
-    Ok(())
-}
-
-/// Create the socket with a root-owned parent directory.
-fn bind_socket(path: &Path) -> Result<UnixListener> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-        use std::os::unix::fs::MetadataExt;
-        let metadata = std::fs::symlink_metadata(parent)?;
-        // SAFETY: geteuid has no arguments and cannot fail.
-        let effective_uid = unsafe { libc::geteuid() };
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != effective_uid
-        {
-            bail!(
-                "socket directory {} must be a real directory owned by the helper uid",
-                parent.display()
-            );
-        }
-        // The directory is the access control: only root may replace the
-        // socket, while any local user may attempt to connect and is then
-        // checked with SO_PEERCRED.
-        let mut perms = std::fs::metadata(parent)?.permissions();
-        use std::os::unix::fs::PermissionsExt;
-        perms.set_mode(0o755);
-        std::fs::set_permissions(parent, perms)?;
-    }
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            use std::os::unix::fs::FileTypeExt;
-            if !metadata.file_type().is_socket() {
-                bail!("refusing to replace non-socket {}", path.display());
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
             }
-            std::fs::remove_file(path)?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let listener = UnixListener::bind(path)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
-    Ok(listener)
-}
-
-/// Read the connecting process's credentials.
-fn peer_creds(stream: &UnixStream) -> Result<(u32, i32)> {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `cred` and `len` are valid for the duration of the call.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut libc::ucred as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok((cred.uid, cred.pid))
-}
-
-/// Removes exactly the session installed by one connection, on every exit
-/// path, including malformed/oversized frames and socket read errors.
-struct SessionGuard {
-    shared: Arc<Shared>,
-    uid: u32,
-    pid: i32,
-    stream: Arc<Mutex<UnixStream>>,
-}
-
-impl Drop for SessionGuard {
-    fn drop(&mut self) {
-        let disconnected = {
-            let mut sessions = self
-                .shared
-                .sessions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if sessions.get(&self.uid).is_some_and(|session| {
-                session.pid == self.pid && Arc::ptr_eq(&session.stream, &self.stream)
-            }) {
-                sessions.remove(&self.uid);
-                true
-            } else {
-                false
-            }
-        };
-        if disconnected {
-            fail_pending_for_uid(&self.shared, self.uid);
-            remove_marks_for_uid(&self.shared, self.uid);
-        }
-    }
-}
-
-fn serve_daemon(shared: &Arc<Shared>, stream: UnixStream) -> Result<()> {
-    let (uid, pid) = peer_creds(&stream)?;
-    let writer = Arc::new(Mutex::new(stream.try_clone()?));
-    if shared.allowed_uid.is_some_and(|expected| expected != uid) {
-        bail!("refusing a connection from uid {uid}");
-    }
-    {
-        let mut sessions = shared.sessions.lock().unwrap();
-        if sessions.contains_key(&uid) {
-            bail!("a daemon for uid {uid} is already connected");
-        }
-        sessions.insert(
-            uid,
-            ClientSession {
-                pid,
-                stream: writer.clone(),
-            },
-        );
-    }
-    tracing::info!(uid, pid, "serving daemon");
-    let _session = SessionGuard {
-        shared: shared.clone(),
-        uid,
-        pid,
-        stream: writer,
-    };
-
-    let mut reader = BufReader::new(stream);
-    while let Some(line) = read_frame(&mut reader)? {
-        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
-            continue;
-        }
-        let request: Request = match serde_json::from_slice(&line) {
-            Ok(request) => request,
-            Err(e) => {
-                let _ = shared.send(
-                    uid,
-                    &Event::Error {
-                        message: format!("malformed request: {e}"),
-                    },
-                );
-                continue;
-            }
-        };
-        handle_request(shared, request, uid);
-    }
-    Ok(())
-}
-
-/// Read one newline-delimited JSON frame without ever allocating beyond the
-/// protocol limit. An oversized frame closes only that uid's session.
-fn read_frame(reader: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>> {
-    let mut frame = Vec::new();
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return Ok((!frame.is_empty()).then_some(frame));
-        }
-        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
-            if frame.len() + newline > MAX_FRAME_SIZE {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "HSM request exceeds 64 KiB",
-                ));
-            }
-            frame.extend_from_slice(&available[..newline]);
-            reader.consume(newline + 1);
-            return Ok(Some(frame));
-        }
-        if frame.len() + available.len() > MAX_FRAME_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "HSM request exceeds 64 KiB",
-            ));
-        }
-        let len = available.len();
-        frame.extend_from_slice(available);
-        reader.consume(len);
-    }
-}
-
-fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
-    match request {
-        Request::Ping => {
-            let _ = shared.send(
-                uid,
-                &Event::Pong {
-                    version: env!("CARGO_PKG_VERSION").into(),
-                },
-            );
-        }
-        Request::Features => {
-            let _ = shared.send(
-                uid,
-                &Event::Features {
-                    partial_hydration: true,
-                },
-            );
-        }
-        Request::Watch { id, path } => {
-            let path = PathBuf::from(path);
-            let result = install_mark(shared, &path, uid);
-            let identity = result.as_ref().ok().copied();
-            let _ = shared.send(
-                uid,
-                &Event::WatchResult {
-                    id,
-                    ok: result.is_ok(),
-                    message: result.err().map(|error| error.to_string()),
-                    dev: identity.map(|identity| identity.dev),
-                    ino: identity.map(|identity| identity.ino),
-                },
-            );
-        }
-        Request::Unwatch { id, path } => {
-            let path = PathBuf::from(path);
-            let result = remove_marks_for_path(shared, &path, uid);
-            let _ = shared.send(
-                uid,
-                &Event::WatchResult {
-                    id,
-                    ok: result.is_ok(),
-                    message: result.err().map(|error| error.to_string()),
-                    dev: None,
-                    ino: None,
-                },
-            );
-        }
-        Request::Hydrated {
-            id,
-            ok,
-            source,
-            offset,
-            full,
-        } => {
-            let belongs_to_client = shared
-                .pending
-                .lock()
-                .unwrap()
-                .get(&id)
-                .is_some_and(|pending| pending.uid == uid);
-            if !belongs_to_client {
-                tracing::warn!(uid, id, "ignoring a hydration reply for another session");
-                return;
-            }
-            let reply = match (ok, source) {
-                (true, Some(source)) => {
-                    let source = PathBuf::from(source);
-                    // Open once, without following the final symlink. The same
-                    // descriptor is validated, sized and copied by the worker.
-                    match open_authorised(&source, uid, libc::O_RDONLY) {
-                        Ok(source) => Reply::Fill(source.file, offset, full),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "refusing staged content");
-                            Reply::Deny
-                        }
-                    }
-                }
-                (true, None) => Reply::AllowEmpty,
-                (false, _) => Reply::Deny,
-            };
-            if let Some(pending) = shared.pending.lock().unwrap().remove(&id) {
-                let _ = pending.reply.send(reply);
-            }
+            Err(error) => tracing::warn!(%error, "accept failed"),
         }
     }
 }

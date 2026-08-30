@@ -36,7 +36,10 @@ NoNewPrivileges=true
 # CAP_SETPCAP, so it cannot narrow the bounding set and the unit fails to
 # start with 218/CAPABILITIES. A user daemon holds no capabilities to drop
 # anyway, so there is nothing to bound.
-RestrictSUIDSGID=true
+# Do not enable RestrictSUIDSGID here. systemd implements it with a seccomp
+# filter that rejects openat2(O_CREAT) with ENOSYS, while RootedFs deliberately
+# requires that syscall for race-resistant writes. NoNewPrivileges already
+# prevents this process from gaining privileges through setuid executables.
 RestrictRealtime=true
 RestrictNamespaces=true
 LockPersonality=true

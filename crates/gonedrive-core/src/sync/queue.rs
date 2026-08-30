@@ -1,5 +1,6 @@
 //! Durable transfer and remote-mutation queue execution.
 
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use crate::sync::selection::{available_bytes, human_bytes};
 use crate::sync::transfer::{self, UploadTarget};
 
 use super::engine::{
-    stat_of, Direction, Engine, QueueScope, SafetyStopKind, SyncEvent, SyncSummary,
+    stat_of, Direction, Engine, QueueScope, SafetyStopKind, SyncEvent, SyncPhase, SyncSummary,
 };
 
 /// Operations pulled off the queue per pass.
@@ -30,13 +31,13 @@ impl Engine {
     /// recorded. On a large drive an enumeration costs minutes, so making every
     /// transfer queue behind one turns a 30-second job into a coffee break.
     pub async fn transfer_only(&self) -> Result<SyncSummary> {
-        self.emit(SyncEvent::Started);
+        let phase = SyncPhase::start(self);
         let mut summary = SyncSummary::default();
         self.scan_local(&mut summary)?;
         self.drain_queue(&mut summary).await?;
         self.stamp_directories(&self.account()?)?;
         summary.still_queued = self.store.pending_count(&self.account_id)?;
-        self.emit(SyncEvent::Finished(summary.clone()));
+        phase.finish(&summary);
         Ok(summary)
     }
 
@@ -48,13 +49,13 @@ impl Engine {
         deadline: Instant,
         scope: QueueScope,
     ) -> Result<SyncSummary> {
-        self.emit(SyncEvent::Started);
+        let phase = SyncPhase::start(self);
         let mut summary = SyncSummary::default();
         self.drain_queue_until(&mut summary, Some(deadline), scope)
             .await?;
         self.stamp_directories(&self.account()?)?;
         summary.still_queued = self.store.pending_count(&self.account_id)?;
-        self.emit(SyncEvent::Finished(summary.clone()));
+        phase.finish(&summary);
         Ok(summary)
     }
 
@@ -83,6 +84,7 @@ impl Engine {
                 );
                 self.emit(SyncEvent::Failed {
                     name: account.root_local_path.display().to_string(),
+                    path: Some(account.root_local_path.clone()),
                     error: format!(
                         "only {} free; downloads are paused until at least {} is available",
                         human_bytes(free),
@@ -179,6 +181,13 @@ impl Engine {
             summary.failed += 1;
             self.emit(SyncEvent::Failed {
                 name,
+                path: op.local_path.clone().or_else(|| {
+                    op.item_id.as_deref().and_then(|id| {
+                        self.account()
+                            .ok()
+                            .and_then(|account| self.store.local_path(&account, id).ok().flatten())
+                    })
+                }),
                 error: error.to_string(),
             });
             if let Some(id) = &op.item_id {
@@ -229,6 +238,21 @@ impl Engine {
             .or(self.store.local_path(account, item_id)?)
             .ok_or_else(|| Error::other(format!("no local path for {item_id}")))?;
 
+        // Upgrade/crash recovery: an on-demand read may already have delivered
+        // this exact remote version while the durable scheduler still held its
+        // download row. Verify the bytes before retiring that stale row; a
+        // locally edited hydrated file must continue into conflict handling.
+        if record.state == ItemState::Synced {
+            if let Ok(existing) = rooted.open_read(&path) {
+                if Placeholder::state_file(&existing) == PlaceholderState::Hydrated
+                    && self.disposable_local_version(&record, &existing).is_some()
+                {
+                    tracing::info!(path = %path.display(), "retiring a stale completed download");
+                    return Ok(());
+                }
+            }
+        }
+
         // A download overwrites whatever is on disk. If that file holds edits
         // that were never uploaded — an in-place change the size+mtime
         // heuristic missed, so the remote was judged the newer side — preserve
@@ -254,6 +278,7 @@ impl Engine {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned(),
+                    path: path.clone(),
                 });
                 summary.conflicts += 1;
                 self.store
@@ -322,6 +347,7 @@ impl Engine {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned(),
+                path: path.clone(),
             });
             return Err(transfer::file_changed_error(
                 &path,
@@ -330,13 +356,13 @@ impl Engine {
         }
 
         let local = LocalStat::from_metadata(&published.metadata()?);
-        self.store.set_local_stat(
+        self.store.commit_hydration(
+            &account.id,
             item_id,
             OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
             Some(local.size),
             Some(local.ino),
         )?;
-        self.store.set_item_state(item_id, ItemState::Synced)?;
         // The file manager marks were written before the stability check above,
         // so the synced emblem and database state become visible together.
         if let Some(parent) = &record.parent_id {
@@ -345,6 +371,7 @@ impl Engine {
         summary.downloaded += 1;
         self.emit(SyncEvent::ItemDone {
             name: record.name,
+            path,
             direction: Direction::Download,
         });
         Ok(())
@@ -362,7 +389,7 @@ impl Engine {
             .local_path
             .clone()
             .ok_or_else(|| Error::other("upload operation without a local path"))?;
-        let Some(path_meta) = rooted.metadata(&path)? else {
+        let Some(_) = rooted.metadata(&path)? else {
             // Deleted between queueing and running; the scan will notice.
             return Ok(());
         };
@@ -400,7 +427,10 @@ impl Engine {
         // Bind the transient marker to the inode already checked above. A path
         // replacement must not make cleanup mutate the replacement instead.
         let _ = Placeholder::set_syncing_file(&source_file, true);
-        let source_version = transfer::FileVersion::from_metadata(&path_meta);
+        // Derive the stability token from the descriptor that will be hashed
+        // and marked, rather than a path lookup that could name a replaced
+        // inode by the time the upload starts.
+        let source_version = transfer::FileVersion::capture_file(&source_file)?;
         let result = transfer::upload_file_rooted(
             &rooted,
             &self.graph,
@@ -459,6 +489,7 @@ impl Engine {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .into_owned(),
+                        path: path.clone(),
                     });
                     summary.conflicts += 1;
                     self.store.enqueue(
@@ -477,10 +508,10 @@ impl Engine {
         if !transfer::FileVersion::capture_rooted(&rooted, &path)?.same_content_as(source_version) {
             return Err(transfer::file_changed_error(&path, "uploading"));
         }
-        let content_hash = rooted
-            .open_read(&path)
-            .ok()
-            .and_then(|mut file| crate::hash::quick_xor_reader(&mut file).ok());
+        let content_hash = source_file.try_clone().ok().and_then(|mut file| {
+            file.seek(SeekFrom::Start(0)).ok()?;
+            crate::hash::quick_xor_reader(&mut file).ok()
+        });
         if !transfer::FileVersion::capture_rooted(&rooted, &path)?.same_content_as(source_version) {
             return Err(transfer::file_changed_error(&path, "hashing after upload"));
         }
@@ -506,25 +537,45 @@ impl Engine {
             summary.uploaded += 1;
             return Ok(());
         }
-        if let Some(local) = stat_of(&path) {
-            self.store.set_local_stat(
+        if let Ok(meta) = source_file.metadata() {
+            let local = LocalStat::from_metadata(&meta);
+            if let Err(error) = self.store.set_local_stat(
                 &record.id,
                 OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
                 Some(local.size),
                 Some(local.ino),
-            )?;
-        }
-        // The bytes on disk are now the bytes on the server: record their hash
-        // so a later dehydrate recognises the file as synced and safe to free,
-        // and so an in-place edit after this point is caught.
-        if let Some(hash) = content_hash {
-            if let Ok(file) = rooted.open_read(&path) {
-                let _ = Placeholder::set_content_hash_file(&file, &hash);
+            ) {
+                // The service has already committed the upload. Retrying a
+                // brand-new create could only collide with that same item;
+                // leave reconciliation to the next local/delta pass instead.
+                tracing::warn!(path = %path.display(), %error, "could not record uploaded local version");
             }
+        }
+
+        let default_pin = self.config.download_new.default_pin();
+        let pin = match self.store.effective_pin(&record.id, default_pin) {
+            Ok(pin) => pin,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not resolve uploaded file retention policy");
+                default_pin
+            }
+        };
+        let marks = Placeholder::mark_hydrated_file_with_hash(
+            &source_file,
+            &record.id,
+            record.ctag.as_deref(),
+            content_hash.as_deref(),
+        )
+        .and_then(|()| Placeholder::set_pin_file(&source_file, pin.as_str()));
+        if let Err(error) = marks {
+            // As above, a local metadata failure must not turn a committed
+            // remote create into a duplicate retry. A later scan repairs marks.
+            tracing::warn!(path = %path.display(), %error, "could not publish uploaded placeholder marks");
         }
         summary.uploaded += 1;
         self.emit(SyncEvent::ItemDone {
             name,
+            path,
             direction: Direction::Upload,
         });
         Ok(())
@@ -576,8 +627,9 @@ impl Engine {
             .item(item_id)?
             .map(|record| record.name)
             .unwrap_or_default();
-        if let Some(path) = self.store.local_path(&self.account()?, item_id)? {
-            match std::fs::symlink_metadata(&path) {
+        let activity_path = self.store.local_path(&self.account()?, item_id)?;
+        if let Some(path) = &activity_path {
+            match std::fs::symlink_metadata(path) {
                 Ok(_) => {
                     tracing::info!(path = %path.display(), "local delete was undone; cancelling remote delete");
                     return Ok(());
@@ -616,7 +668,10 @@ impl Engine {
             );
         }
         summary.deleted_remote += 1;
-        self.emit(SyncEvent::Deleted { name });
+        self.emit(SyncEvent::Deleted {
+            name,
+            path: activity_path,
+        });
         Ok(())
     }
 
@@ -670,6 +725,7 @@ impl Engine {
                 self.emit(SyncEvent::Conflict {
                     original: name_for_path(&path),
                     copy: name_for_path(&copy),
+                    path: path.clone(),
                 });
                 return Ok(());
             }

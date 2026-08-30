@@ -70,14 +70,17 @@ async fn on_demand_mode_places_new_files_from_delta() {
     h.server.reset().await;
     h.mock_delta(
         Some(("token", "v1")),
-        vec![file(
-            "F9",
-            "D1",
-            "new.pdf",
-            "c1",
-            4096,
-            "2026-08-21T10:00:00Z",
-        )],
+        vec![
+            folder("D9", "D1", "云端空目录"),
+            file(
+                "F9",
+                "D1",
+                "new.pdf",
+                "c1",
+                4096,
+                "2026-08-21T10:00:00Z",
+            ),
+        ],
         "v2",
     )
     .await;
@@ -89,6 +92,107 @@ async fn on_demand_mode_places_new_files_from_delta() {
         "a new file should appear as a placeholder at once"
     );
     assert_eq!(Placeholder::state(&p), PlaceholderState::Dehydrated);
+    assert!(
+        h.path("Docs/云端空目录").is_dir(),
+        "an empty remote folder must also appear in a browsable on-demand tree"
+    );
+}
+
+#[tokio::test]
+async fn enabling_on_demand_at_runtime_applies_to_later_delta_items() {
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+
+    let h = Harness::metadata_only().await;
+    h.mock_delta(None, vec![root_item(), folder("D1", ROOT, "Docs")], "v1")
+        .await;
+    assert_eq!(h.sync().await.failed, 0);
+
+    // This is what the MaterializeTree command does in a running daemon. The
+    // mode must affect later polling without requiring a process restart.
+    h.engine.enable_on_demand();
+
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![file(
+            "F9",
+            "D1",
+            "restored.pdf",
+            "c1",
+            4096,
+            "2026-08-21T10:00:00Z",
+        )],
+        "v2",
+    )
+    .await;
+    assert_eq!(h.sync().await.failed, 0);
+
+    let path = h.path("Docs/restored.pdf");
+    assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
+    assert_eq!(Placeholder::item_id(&path).as_deref(), Some("F9"));
+}
+
+#[tokio::test]
+async fn a_web_restore_rebuilds_the_local_on_demand_subtree() {
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+
+    let mut config = Config {
+        client_id: "test".into(),
+        on_demand: true,
+        ..Config::default()
+    };
+    config.sync_root = std::path::PathBuf::new();
+    let h = Harness::with_config(config).await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("TODO", ROOT, "Todo"),
+            folder("EXPENSE", "TODO", "2025 报销"),
+            file(
+                "F1",
+                "EXPENSE",
+                "receipt.pdf",
+                "c1",
+                4096,
+                "2026-08-21T10:00:00Z",
+            ),
+        ],
+        "v1",
+    )
+    .await;
+    assert_eq!(h.sync().await.failed, 0);
+    assert!(h.path("Todo/2025 报销/receipt.pdf").exists());
+
+    // State immediately before this incident's web restore: the client's
+    // successful remote delete already removed the database subtree, and the
+    // old local path was absent because the user had moved its inode elsewhere.
+    std::fs::remove_dir_all(h.path("Todo/2025 报销")).unwrap();
+    h.store.delete_subtree("EXPENSE").unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![
+            folder("EXPENSE", "TODO", "2025 报销"),
+            file(
+                "F1",
+                "EXPENSE",
+                "receipt.pdf",
+                "c1",
+                4096,
+                "2026-08-21T10:00:00Z",
+            ),
+        ],
+        "v2",
+    )
+    .await;
+    assert_eq!(h.sync().await.failed, 0);
+
+    let restored = h.path("Todo/2025 报销/receipt.pdf");
+    assert!(restored.exists(), "the restored cloud path must be visible again");
+    assert_eq!(Placeholder::state(&restored), PlaceholderState::Dehydrated);
+    assert_eq!(Placeholder::item_id(&restored).as_deref(), Some("F1"));
 }
 
 #[tokio::test]
@@ -274,6 +378,44 @@ async fn an_explicitly_pinned_folder_is_a_check_even_while_online() {
 }
 
 #[tokio::test]
+async fn desktop_markers_are_neither_uploaded_nor_mistaken_for_deletions() {
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "Media"),
+            file(
+                "F1",
+                "D1",
+                ".nomedia",
+                "c1",
+                5,
+                "2026-08-20T10:00:00Z",
+            ),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"known").await;
+    h.sync().await;
+    std::fs::write(h.path(".trackerignore"), b"local marker").unwrap();
+
+    let report = h.engine.discover_local_changes().unwrap();
+    assert!(report.dirty_paths.is_empty());
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 0);
+
+    let summary = h
+        .engine
+        .sync_local_paths(&[h.root.clone(), h.path("Media")])
+        .unwrap();
+
+    assert_eq!(summary.still_queued, 0);
+    assert!(h.store.item("F1").unwrap().is_some());
+    assert_eq!(std::fs::read(h.path("Media/.nomedia")).unwrap(), b"known");
+}
+
+#[tokio::test]
 async fn read_only_discovery_reports_work_without_mutating_the_queue() {
     let h = Harness::new().await;
     std::fs::write(h.path("new.txt"), b"local").unwrap();
@@ -442,4 +584,21 @@ async fn remote_enumeration_and_download_drain_are_separate_phases() {
         outbound[0].local_path.as_deref(),
         Some(h.path("local.txt").as_path())
     );
+}
+
+#[tokio::test]
+async fn a_failed_sync_phase_still_emits_its_terminal_event() {
+    let h = Harness::new().await;
+    let mut events = h.engine.subscribe();
+    h.store.remove_account(ACCOUNT).unwrap();
+
+    assert!(h.engine.sync_local_paths(&[]).is_err());
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        gonedrive_core::sync::engine::SyncEvent::Started
+    ));
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        gonedrive_core::sync::engine::SyncEvent::Finished(_)
+    ));
 }

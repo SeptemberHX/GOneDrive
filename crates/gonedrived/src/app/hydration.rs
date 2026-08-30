@@ -5,11 +5,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use gonedrive_core::sync::engine::{Engine, FullScanReport};
+use gonedrive_core::sync::engine::Engine;
+use gonedrive_core::sync::{
+    lock_unwatched_placeholder_for_account, materialise_placeholder_for_account,
+    placeholder_inventory_for_account,
+};
 use gonedrive_core::Error;
 use gonedrive_ipc::{Activity, Hydration};
 
 use super::{decide_stage, ensure_progress_window, App, InFlight, StagePlan, ACTIVITY_LIMIT};
+use crate::open_intent::OpenDecision;
 
 impl App {
     pub async fn stage_for(
@@ -19,43 +24,53 @@ impl App {
         length: u64,
         reader: &str,
         is_open: bool,
-        allow_partial: bool,
-    ) -> Result<Option<(std::path::PathBuf, u64, bool)>> {
+        capabilities: HydrationCapabilities,
+    ) -> Result<StageOutcome> {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let plan = decide_stage(is_open, reader, offset, length, size, allow_partial);
-        if plan == StagePlan::AllowOpen {
-            return Ok(None);
+        let mut plan = decide_stage(
+            is_open,
+            reader,
+            offset,
+            length,
+            size,
+            capabilities.partial,
+            capabilities.file_manager_copy_detection,
+        );
+        if !is_open && gonedrive_ipc::reader_policy::is_progressive_reader(reader) {
+            plan = match self.open_intents.decide(path).await {
+                OpenDecision::Explicit => StagePlan::Full,
+                OpenDecision::Prefetch => StagePlan::BrowseLocal {
+                    offset,
+                    length: length.max(1),
+                },
+                OpenDecision::Unavailable => plan,
+            };
         }
-        let cancel = self.begin_hydration(path).await;
+        match plan {
+            StagePlan::AllowOpen | StagePlan::BrowseLocal { .. } => return Ok(StageOutcome::Allow),
+            StagePlan::DenyBrowse => return Ok(StageOutcome::Deny),
+            StagePlan::Full | StagePlan::Range { .. } => {}
+        }
+        let Some(cancel) = self.begin_hydration(path, plan.shows_progress()).await else {
+            // Another request for this path completed while we waited for the
+            // per-path lock. Its real bytes are already under the blocked
+            // reader, so do not stage or record the same download again.
+            return Ok(StageOutcome::Allow);
+        };
 
         let result = match plan {
             // Let the open proceed untouched; the reads that follow drive
             // hydration. Keeps a media player streaming instead of pulling the
             // whole file just to read a header.
-            StagePlan::AllowOpen => unreachable!(),
+            StagePlan::AllowOpen | StagePlan::BrowseLocal { .. } | StagePlan::DenyBrowse => {
+                unreachable!()
+            }
             // A sparse-aware copier (on open) or a consumer past the head:
             // give it the whole file before it looks.
             StagePlan::Full => self
                 .stage_content(path, cancel)
                 .await
-                .map(|staged| Some((staged, 0, true))),
-            // Browsing: serve the window only if it is already on disk from a
-            // real earlier read; otherwise allow the read against the sparse
-            // file with no network. The type comes from the name, as on Windows.
-            StagePlan::BrowseLocal { offset, length } => {
-                let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-                if let Some(engine) = engines.first() {
-                    if let Ok(Some(staged)) =
-                        engine.stage_range_if_local(path, offset, length).await
-                    {
-                        Ok(Some((staged, offset, false)))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    Ok(None)
-                }
-            }
+                .map(|staged| StageOutcome::Fill(staged, 0, true)),
             // The first head-read of a consumer: fetch just that window.
             StagePlan::Range { offset, length } => {
                 let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
@@ -63,7 +78,11 @@ impl App {
                     Some(engine) => engine
                         .stage_range(path, offset, length)
                         .await
-                        .map(|staged| Some((staged, offset, false)))
+                        .map(|staged| {
+                            staged.map_or(StageOutcome::Allow, |staged| {
+                                StageOutcome::Fill(staged, offset, false)
+                            })
+                        })
                         .map_err(anyhow::Error::from),
                     None => Err(anyhow::anyhow!("no account is signed in")),
                 }
@@ -71,7 +90,7 @@ impl App {
         };
         if result.is_err() {
             self.hydrations.write().await.remove(path);
-        } else if let Ok(Some((staged, _, _))) = &result {
+        } else if let Ok(StageOutcome::Fill(staged, _, _)) = &result {
             if let Some(entry) = self.hydrations.write().await.get_mut(path) {
                 entry.staged = Some(staged.clone());
             }
@@ -103,8 +122,17 @@ impl App {
         )
     }
 
-    async fn begin_hydration(&self, path: &std::path::Path) -> Arc<std::sync::atomic::AtomicBool> {
+    async fn begin_hydration(
+        &self,
+        path: &std::path::Path,
+        visible: bool,
+    ) -> Option<Arc<std::sync::atomic::AtomicBool>> {
         let guard = self.hydration_locks.acquire(path).await;
+        if gonedrive_core::hydrate::Placeholder::state(path)
+            == gonedrive_core::hydrate::PlaceholderState::Hydrated
+        {
+            return None;
+        }
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.hydrations.write().await.insert(
             path.to_path_buf(),
@@ -119,12 +147,13 @@ impl App {
                     transferred: 0,
                     total: 0,
                 },
+                visible,
                 cancel: cancel.clone(),
                 staged: None,
                 _path_guard: guard,
             },
         );
-        cancel
+        Some(cancel)
     }
 
     /// What was synced recently, newest first.
@@ -136,6 +165,7 @@ impl App {
             .map(|row| Activity {
                 kind: row.kind,
                 name: row.name,
+                path: row.path,
                 detail: row.detail,
                 when: row.when,
             })
@@ -148,6 +178,7 @@ impl App {
             .read()
             .await
             .values()
+            .filter(|entry| entry.visible)
             .map(|entry| entry.hydration.clone())
             .collect()
     }
@@ -224,6 +255,9 @@ impl App {
             }
         }
         self.hydrations.write().await.remove(path);
+        if result.is_ok() {
+            self.refresh_pending_status().await;
+        }
         result
     }
 
@@ -268,6 +302,10 @@ impl App {
         }
 
         let result = self.hydrate_inner(path).await;
+
+        if result.is_ok() {
+            self.refresh_pending_status().await;
+        }
 
         if result.is_err() {
             if let Some(hsm) = &hsm {
@@ -319,17 +357,35 @@ impl App {
         *self.hsm.write().await = client;
     }
 
-    /// Remove a dehydrated file that the helper could not mark. Leaving it on
-    /// disk would expose sparse zeroes as real content; the remote record stays
-    /// so a later successful materialisation can recreate it.
-    pub async fn discard_unwatched_placeholder(&self, path: &std::path::Path) -> Result<()> {
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        for engine in engines {
-            if engine.discard_unwatched_placeholder(path).is_ok() {
-                return Ok(());
+    /// Keep a failed mark target visible while making reads fail closed. The
+    /// helper restores its original mode only after the inode is protected.
+    pub async fn lock_unwatched_placeholder(&self, path: &std::path::Path) -> Result<()> {
+        let mut failures = crate::failure_summary::FailureSummary::default();
+        for account in self.store.accounts()? {
+            if !path.starts_with(&account.root_local_path) {
+                continue;
+            }
+            match lock_unwatched_placeholder_for_account(&self.store, &account, path) {
+                Ok(()) => return Ok(()),
+                Err(gonedrive_core::Error::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(())
+                }
+                Err(error) => failures.record(|| error.to_string()),
             }
         }
-        anyhow::bail!("no account owns {}", path.display())
+        if matches!(
+            std::fs::symlink_metadata(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "no account could safety-lock placeholder {}: {}",
+            path.display(),
+            failures.describe()
+        )
     }
 
     /// Present the whole drive as a browsable placeholder tree.
@@ -346,8 +402,9 @@ impl App {
             .clone();
 
         tracing::info!("materialising the drive as a placeholder tree");
+        let worker_engine = engine.clone();
         let paths = tokio::task::spawn_blocking(move || {
-            engine.materialize_all(|done, total| {
+            worker_engine.materialize_all(|done, total| {
                 if done % 5000 == 0 || done == total {
                     tracing::info!(done, total, "materialising");
                 }
@@ -358,6 +415,18 @@ impl App {
 
         let count = paths.len() as u64;
         self.protect_placeholders(&hsm, &paths).await?;
+
+        // Materialising is a mode choice, not a one-shot repair. Persist it and
+        // publish it to the live engine so later deltas create new/restored
+        // entries without repeating this whole-tree pass at every start.
+        if !self.config.on_demand {
+            let mut config = (*self.config).clone();
+            config.on_demand = true;
+            config
+                .save()
+                .context("could not persist files-on-demand mode")?;
+        }
+        engine.enable_on_demand();
         tracing::info!(placeholders = count, "placeholder tree ready");
         Ok(count)
     }
@@ -411,12 +480,8 @@ impl App {
                 }
             }
         }
+        self.refresh_pending_status().await;
         Ok(outcome)
-    }
-
-    /// Whether the files-on-demand helper is connected.
-    pub async fn on_demand_ready(&self) -> bool {
-        self.hsm.read().await.is_some()
     }
 
     async fn require_hsm(&self) -> Result<Arc<crate::hsm_client::HsmClient>> {
@@ -447,7 +512,7 @@ impl App {
                 selected: entry.pin.wants_content(),
                 explicit: entry.explicit,
                 bytes: entry.bytes,
-                files: entry.files,
+                items: entry.items,
             })
             .collect())
     }
@@ -462,7 +527,9 @@ impl App {
         let engine = engines
             .first()
             .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
-        Ok(engine.set_pin(relative, pin)?)
+        let outcome = engine.set_pin(relative, pin)?;
+        self.refresh_pending_status().await;
+        Ok(outcome)
     }
 
     /// Create placeholders for never-downloaded files in a subtree.
@@ -481,45 +548,105 @@ impl App {
         Ok(outcome)
     }
 
-    /// Protect a batch, removing every not-yet-protected placeholder if one
-    /// mark fails. A zero-readable sparse file must never outlive a partial
-    /// registration attempt.
+    /// Protect a batch through the client's serialized, bounded registration
+    /// path. Any file that cannot be marked is made unreadable before this
+    /// returns; a zero-readable sparse file must never outlive an attempt.
     async fn protect_placeholders(
         &self,
         hsm: &crate::hsm_client::HsmClient,
         paths: &[std::path::PathBuf],
     ) -> Result<()> {
-        for (index, path) in paths.iter().enumerate() {
-            if let Err(error) = hsm.watch(path).await {
-                let mut cleanup_errors = Vec::new();
-                for unprotected in &paths[index..] {
-                    if let Err(cleanup_error) =
-                        self.discard_unwatched_placeholder(unprotected).await
-                    {
-                        cleanup_errors.push(format!("{}: {cleanup_error}", unprotected.display()));
-                    }
-                }
-                let cleanup = if cleanup_errors.is_empty() {
-                    String::new()
-                } else {
-                    format!("; cleanup also failed for {}", cleanup_errors.join(", "))
-                };
-                return Err(error).with_context(|| {
-                    format!("could not protect placeholder {}{cleanup}", path.display())
-                });
-            }
-        }
-        Ok(())
+        hsm.watch_paths(self, paths).await.map(|_| ())
     }
 
-    /// Placeholders on disk that still need intercepting.
+    /// Placeholders on disk that still need intercepting. This deliberately
+    /// reads local account metadata instead of live engines: protection must
+    /// be installed before network authentication has succeeded.
     pub async fn dehydrated_paths(&self) -> Result<Vec<std::path::PathBuf>> {
-        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
-        let mut out = Vec::new();
-        for engine in engines {
-            out.extend(engine.dehydrated_paths()?);
+        Ok(self.placeholder_inventory().await?.0)
+    }
+
+    /// Existing mark targets and missing on-demand files, collected together
+    /// so HSM startup never needs two database/path passes over a large drive.
+    pub(crate) async fn placeholder_inventory(
+        &self,
+    ) -> Result<(
+        Vec<std::path::PathBuf>,
+        Vec<(gonedrive_core::db::Account, String)>,
+    )> {
+        let store = self.store.clone();
+        let on_demand = self.config.on_demand;
+        tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            let mut missing = Vec::new();
+            for account in store.accounts()? {
+                let inventory = placeholder_inventory_for_account(&store, &account)?;
+                out.extend(inventory.existing);
+                if on_demand {
+                    missing.extend(
+                        inventory
+                            .missing
+                            .into_iter()
+                            .map(|item_id| (account.clone(), item_id)),
+                    );
+                }
+            }
+            out.sort();
+            out.dedup();
+            Ok((out, missing))
+        })
+        .await
+        .context("placeholder inventory worker failed")?
+    }
+
+    /// Recreate only placeholders found missing by the startup inventory, then
+    /// protect each bounded batch before exposing more. Materialisation errors
+    /// mean local content occupies the path and are left for reconciliation;
+    /// mark errors remain fatal and are retried by the HSM supervisor.
+    pub(crate) async fn restore_missing_placeholders(
+        &self,
+        hsm: &crate::hsm_client::HsmClient,
+        missing: &[(gonedrive_core::db::Account, String)],
+    ) -> Result<usize> {
+        const RESTORE_BATCH: usize = 128;
+
+        let mut restored = 0usize;
+        let mut skipped = crate::failure_summary::FailureSummary::default();
+        for chunk in missing.chunks(RESTORE_BATCH) {
+            let store = self.store.clone();
+            let chunk = chunk.to_vec();
+            let results = tokio::task::spawn_blocking(move || {
+                chunk
+                    .into_iter()
+                    .map(|(account, item_id)| {
+                        let result =
+                            materialise_placeholder_for_account(&store, &account, &item_id)
+                                .map_err(|error| error.to_string());
+                        (item_id, result)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .context("placeholder restore worker failed")?;
+            let mut paths = Vec::with_capacity(results.len());
+            for (item_id, result) in results {
+                match result {
+                    Ok(path) => paths.push(path),
+                    Err(error) => skipped.record(|| format!("{item_id}: {error}")),
+                }
+            }
+            if !paths.is_empty() {
+                restored += hsm.watch_paths(self, &paths).await?;
+            }
         }
-        Ok(out)
+        if !skipped.is_empty() {
+            tracing::warn!(
+                skipped = skipped.total(),
+                examples = skipped.describe(),
+                "could not rebuild some missing placeholders"
+            );
+        }
+        Ok(restored)
     }
 
     pub(super) async fn register_pending_placeholders(
@@ -534,18 +661,22 @@ impl App {
             return Ok(0);
         }
         let Some(hsm) = self.hsm.read().await.clone() else {
-            let mut cleanup_errors = Vec::new();
+            let mut cleanup_errors = crate::failure_summary::FailureSummary::default();
             for path in &paths {
-                if let Err(error) = self.discard_unwatched_placeholder(path).await {
-                    cleanup_errors.push(format!("{}: {error}", path.display()));
+                if let Err(error) = self.lock_unwatched_placeholder(path).await {
+                    cleanup_errors.record(|| format!("{}: {error:#}", path.display()));
                 }
             }
             let detail = if cleanup_errors.is_empty() {
                 String::new()
             } else {
-                format!("; cleanup failed for {}", cleanup_errors.join(", "))
+                format!(
+                    "; cleanup failed for {} placeholder(s): {}",
+                    cleanup_errors.total(),
+                    cleanup_errors.describe()
+                )
             };
-            anyhow::bail!("files-on-demand helper is unavailable; removed up to {} unprotected placeholder(s){detail}", paths.len());
+            anyhow::bail!("files-on-demand helper is unavailable; safety-locked up to {} unprotected placeholder(s){detail}", paths.len());
         };
         self.protect_placeholders(&hsm, &paths).await?;
         Ok(paths.len())
@@ -553,11 +684,41 @@ impl App {
 
     pub(super) async fn reconcile_placeholder_report(
         &self,
-        report: &FullScanReport,
+        placeholders: Vec<(std::path::PathBuf, u64, u64)>,
     ) -> Result<usize> {
+        self.pending_placeholder_reports
+            .lock()
+            .await
+            .remember(placeholders);
+        self.reconcile_pending_placeholder_report().await
+    }
+
+    /// Replay the newest full local observation after the HSM becomes ready.
+    /// The snapshot is cleared only if no newer scan replaced it meanwhile.
+    pub(crate) async fn reconcile_pending_placeholder_report(&self) -> Result<usize> {
+        let Some(snapshot) = self.pending_placeholder_reports.lock().await.snapshot() else {
+            return Ok(0);
+        };
         let Some(hsm) = self.hsm.read().await.clone() else {
             return Ok(0);
         };
-        hsm.reconcile_observed(self, &report.placeholders).await
+        let reconciled = hsm.reconcile_observed(self, &snapshot).await?;
+        self.pending_placeholder_reports
+            .lock()
+            .await
+            .clear_if_current(&snapshot);
+        Ok(reconciled)
     }
+}
+
+pub(crate) enum StageOutcome {
+    Allow,
+    Deny,
+    Fill(std::path::PathBuf, u64, bool),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HydrationCapabilities {
+    pub(crate) partial: bool,
+    pub(crate) file_manager_copy_detection: bool,
 }

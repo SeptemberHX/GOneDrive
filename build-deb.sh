@@ -72,7 +72,7 @@ Maintainer: GOnedrive <noreply@example.com>
 Installed-Size: $INSTALLED_KB
 Section: net
 Priority: optional
-Depends: libc6, libgtk-4-1 (>= 4.18), libadwaita-1-0 (>= 1.7), python3, python3-gi
+Depends: libc6, libgtk-4-1 (>= 4.18), libadwaita-1-0 (>= 1.7), python3, python3-gi, init-system-helpers
 Recommends: python3-nautilus, gnome-shell-extension-appindicator
 Description: OneDrive client for Linux with files-on-demand
  GOnedrive syncs Microsoft OneDrive two ways and supports files-on-demand:
@@ -91,6 +91,10 @@ if [ "$1" = configure ]; then
     systemctl restart gonedrive-hsm.service || true
     # The sync daemon runs per user; enable it for every user's session.
     systemctl --global enable gonedrived.service || true
+    # Reload and restart every active user instance. A global enable alone does
+    # not replace an already-running daemon during an upgrade.
+    deb-systemd-invoke --user daemon-reload || true
+    deb-systemd-invoke --user restart gonedrived.service || true
     gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
     update-desktop-database /usr/share/applications 2>/dev/null || true
 fi
@@ -100,6 +104,7 @@ cat > "$STAGE/DEBIAN/prerm" <<'PRERM'
 #!/bin/sh
 set -e
 if [ "$1" = remove ] || [ "$1" = purge ]; then
+    deb-systemd-invoke --user stop gonedrived.service || true
     systemctl disable --now gonedrive-hsm.service || true
     systemctl --global disable gonedrived.service || true
 fi
@@ -110,6 +115,7 @@ cat > "$STAGE/DEBIAN/postrm" <<'POSTRM'
 set -e
 if [ "$1" = remove ] || [ "$1" = purge ]; then
     systemctl daemon-reload 2>/dev/null || true
+    deb-systemd-invoke --user daemon-reload || true
     gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
 fi
 POSTRM
@@ -121,5 +127,5 @@ echo ">> Building $OUT…"
 dpkg-deb --root-owner-group --build "$STAGE" "$OUT"
 echo
 echo "Done: $OUT"
-echo "Install with:  sudo apt install ./$OUT   (or: sudo dpkg -i $OUT)"
+echo "Install/update with:  sudo apt install --reinstall ./$OUT   (or: sudo dpkg -i $OUT)"
 echo "Then sign in:  gonedrived login   (or open GOnedrive and click 登录)"

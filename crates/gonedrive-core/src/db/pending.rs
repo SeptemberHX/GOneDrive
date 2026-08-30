@@ -155,31 +155,52 @@ impl Store {
         })
     }
 
-    /// Queue a metadata move and the content upload that belongs with it as
-    /// one durable decision. A crash must never leave an edited rename with
-    /// only its move half recorded.
-    pub fn enqueue_move_and_upload(
+    /// Queue a metadata-only move as one transaction with withdrawing a stale
+    /// source-side delete and rebasing every descendant operation.
+    pub fn enqueue_move(
         &self,
         account_id: &str,
         item_id: &str,
-        local_path: &Path,
+        old_path: &Path,
+        new_path: &Path,
     ) -> Result<()> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
-            let precondition: Option<String> = tx
-                .query_row(
-                    "SELECT COALESCE(etag, ctag) FROM items WHERE id = ?1",
-                    params![item_id],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .flatten();
+            let precondition = prepare_local_move(&tx, account_id, item_id, old_path, new_path)?;
             enqueue_pending(
                 &tx,
                 account_id,
                 OpKind::MoveRemote,
                 Some(item_id),
-                Some(local_path),
+                Some(new_path),
+                None,
+                precondition.as_deref(),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Queue a metadata move and the content upload that belongs with it as
+    /// one durable decision. A crash must never leave an edited rename with
+    /// only its move half recorded. The source-side delete and every queued
+    /// descendant path are updated in the same transaction.
+    pub fn enqueue_move_and_upload(
+        &self,
+        account_id: &str,
+        item_id: &str,
+        old_path: &Path,
+        new_path: &Path,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let precondition = prepare_local_move(&tx, account_id, item_id, old_path, new_path)?;
+            enqueue_pending(
+                &tx,
+                account_id,
+                OpKind::MoveRemote,
+                Some(item_id),
+                Some(new_path),
                 None,
                 precondition.as_deref(),
             )?;
@@ -188,7 +209,7 @@ impl Store {
                 account_id,
                 OpKind::Upload,
                 Some(item_id),
-                Some(local_path),
+                Some(new_path),
                 None,
                 precondition.as_deref(),
             )?;
@@ -207,38 +228,9 @@ impl Store {
         old_path: &Path,
         new_path: &Path,
     ) -> Result<()> {
-        let old = old_path.to_string_lossy().into_owned();
-        let new = new_path.to_string_lossy().into_owned();
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
-            tx.execute(
-                "UPDATE OR IGNORE pending_ops
-                    SET local_path = ?3 || substr(local_path, length(?2) + 1)
-                  WHERE account_id = ?1
-                    AND (local_path = ?2 OR substr(local_path, 1, length(?2) + 1) = ?2 || '/')",
-                params![account_id, old, new],
-            )?;
-            // A row left at the old path collided with equivalent work already
-            // queued at the new path; the destination row is the one to keep.
-            tx.execute(
-                "DELETE FROM pending_ops
-                  WHERE account_id = ?1
-                    AND (local_path = ?2 OR substr(local_path, 1, length(?2) + 1) = ?2 || '/')",
-                params![account_id, old],
-            )?;
-            tx.execute(
-                "UPDATE OR IGNORE upload_sessions
-                    SET key = ?3 || substr(key, length(?2) + 1)
-                  WHERE account_id = ?1
-                    AND (key = ?2 OR substr(key, 1, length(?2) + 1) = ?2 || '/')",
-                params![account_id, old, new],
-            )?;
-            tx.execute(
-                "DELETE FROM upload_sessions
-                  WHERE account_id = ?1
-                    AND (key = ?2 OR substr(key, 1, length(?2) + 1) = ?2 || '/')",
-                params![account_id, old],
-            )?;
+            rebase_pending_paths_on(&tx, account_id, old_path, new_path)?;
             tx.commit()?;
             Ok(())
         })
@@ -304,25 +296,30 @@ impl Store {
             };
             let sql = format!(
                 "SELECT id, account_id, kind, item_id, local_path, payload, precondition,
-                        attempts, last_error
+                        attempts, next_attempt_at, last_error
                    FROM pending_ops
                   WHERE account_id = ?1 AND next_attempt_at <= ?2 {filter}
                   ORDER BY CASE WHEN kind = 'download' THEN 0 ELSE 1 END, id LIMIT ?3"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![account_id, now(), limit as i64], |row| {
-                Ok(PendingOp {
-                    id: row.get(0)?,
-                    account_id: row.get(1)?,
-                    kind: OpKind::parse(&row.get::<_, String>(2)?).unwrap_or(OpKind::Upload),
-                    item_id: row.get(3)?,
-                    local_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
-                    payload: row.get(5)?,
-                    precondition: row.get(6)?,
-                    attempts: row.get::<_, i64>(7)? as u32,
-                    last_error: row.get(8)?,
-                })
-            })?;
+            let rows = stmt.query_map(params![account_id, now(), limit as i64], row_to_pending)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// A bounded snapshot of all durable work, including delayed retries.
+    pub fn pending_ops(&self, account_id: &str, limit: usize) -> Result<Vec<PendingOp>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, account_id, kind, item_id, local_path, payload, precondition,
+                        attempts, next_attempt_at, last_error
+                   FROM pending_ops
+                  WHERE account_id = ?1
+                  ORDER BY CASE WHEN kind = 'download' THEN 0 ELSE 1 END,
+                           next_attempt_at, id
+                  LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![account_id, limit as i64], row_to_pending)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }
@@ -342,24 +339,11 @@ impl Store {
             Ok(conn
                 .query_row(
                     "SELECT id, account_id, kind, item_id, local_path, payload, precondition,
-                            attempts, last_error
+                            attempts, next_attempt_at, last_error
                        FROM pending_ops
                       WHERE id = ?1 AND next_attempt_at <= ?2",
                     params![id, now()],
-                    |row| {
-                        Ok(PendingOp {
-                            id: row.get(0)?,
-                            account_id: row.get(1)?,
-                            kind: OpKind::parse(&row.get::<_, String>(2)?)
-                                .unwrap_or(OpKind::Upload),
-                            item_id: row.get(3)?,
-                            local_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
-                            payload: row.get(5)?,
-                            precondition: row.get(6)?,
-                            attempts: row.get::<_, i64>(7)? as u32,
-                            last_error: row.get(8)?,
-                        })
-                    },
+                    row_to_pending,
                 )
                 .optional()?)
         })
@@ -432,6 +416,94 @@ impl Store {
             )? as u64)
         })
     }
+}
+
+fn row_to_pending(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingOp> {
+    Ok(PendingOp {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        kind: OpKind::parse(&row.get::<_, String>(2)?).unwrap_or(OpKind::Upload),
+        item_id: row.get(3)?,
+        local_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+        payload: row.get(5)?,
+        precondition: row.get(6)?,
+        attempts: row.get::<_, i64>(7)? as u32,
+        next_attempt_at: row.get(8)?,
+        last_error: row.get(9)?,
+    })
+}
+
+fn prepare_local_move(
+    conn: &Connection,
+    account_id: &str,
+    item_id: &str,
+    old_path: &Path,
+    new_path: &Path,
+) -> Result<Option<String>> {
+    let precondition: Option<String> = conn
+        .query_row(
+            "SELECT COALESCE(etag, ctag) FROM items
+              WHERE account_id = ?1 AND id = ?2",
+            params![account_id, item_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    conn.execute(
+        "WITH RECURSIVE moved_tree(id) AS (
+             SELECT id FROM items WHERE account_id = ?1 AND id = ?2
+             UNION ALL
+             SELECT child.id
+               FROM items AS child
+               JOIN moved_tree AS parent ON child.parent_id = parent.id
+              WHERE child.account_id = ?1
+         )
+         DELETE FROM pending_ops
+          WHERE account_id = ?1 AND kind = 'delete_remote'
+            AND item_id IN (SELECT id FROM moved_tree)",
+        params![account_id, item_id],
+    )?;
+    rebase_pending_paths_on(conn, account_id, old_path, new_path)?;
+    Ok(precondition)
+}
+
+fn rebase_pending_paths_on(
+    conn: &Connection,
+    account_id: &str,
+    old_path: &Path,
+    new_path: &Path,
+) -> Result<()> {
+    let old = old_path.to_string_lossy().into_owned();
+    let new = new_path.to_string_lossy().into_owned();
+    conn.execute(
+        "UPDATE OR IGNORE pending_ops
+            SET local_path = ?3 || substr(local_path, length(?2) + 1)
+          WHERE account_id = ?1
+            AND (local_path = ?2 OR substr(local_path, 1, length(?2) + 1) = ?2 || '/')",
+        params![account_id, old, new],
+    )?;
+    // A row left at the old path collided with equivalent work already queued
+    // at the destination; the destination row is the one to keep.
+    conn.execute(
+        "DELETE FROM pending_ops
+          WHERE account_id = ?1
+            AND (local_path = ?2 OR substr(local_path, 1, length(?2) + 1) = ?2 || '/')",
+        params![account_id, old],
+    )?;
+    conn.execute(
+        "UPDATE OR IGNORE upload_sessions
+            SET key = ?3 || substr(key, length(?2) + 1)
+          WHERE account_id = ?1
+            AND (key = ?2 OR substr(key, 1, length(?2) + 1) = ?2 || '/')",
+        params![account_id, old, new],
+    )?;
+    conn.execute(
+        "DELETE FROM upload_sessions
+          WHERE account_id = ?1
+            AND (key = ?2 OR substr(key, 1, length(?2) + 1) = ?2 || '/')",
+        params![account_id, old],
+    )?;
+    Ok(())
 }
 
 fn enqueue_pending(

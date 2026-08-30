@@ -62,7 +62,7 @@ pub(crate) fn list(path: PathBuf) -> Result<()> {
             entry.item.name.clone()
         };
         let count = if entry.item.is_folder {
-            format!("{} file(s)", entry.files)
+            format!("{} item(s)", entry.items)
         } else {
             String::new()
         };

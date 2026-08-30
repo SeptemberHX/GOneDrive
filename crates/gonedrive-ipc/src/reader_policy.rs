@@ -39,9 +39,11 @@ pub const BULK_COPIERS: &[&str] = &[
 ];
 
 /// The file manager, its preview pane, and every thumbnailer — anything that
-/// reads a file to *describe* it. A thumbnail of an online-only file simply
-/// does not render until the file is opened for real, exactly as on Windows; it
-/// must never pull the whole image down. Matched as a prefix of `comm`.
+/// reads a file to *describe* it. Dedicated thumbnailers stay entirely offline.
+/// Nautilus is also a copier, so the helper distinguishes a real copy by its
+/// writable destination descriptor. Ordinary browsing stays offline; a proven
+/// copy receives the complete source and never receives placeholder zeroes.
+/// Matched as a prefix of `comm`.
 pub const BROWSING_READERS: &[&str] = &[
     "nautilus",
     "sushi",  // GNOME's preview (spacebar)
@@ -56,6 +58,24 @@ pub const BROWSING_READERS: &[&str] = &[
     "ffmpegthumbnail",
     "evince-thumbnai",
 ];
+
+/// Browsers that also execute explicit user copies. Unlike a dedicated
+/// thumbnailer, they cannot safely be given zeroes for a missing range.
+pub const FILE_MANAGER_READERS: &[&str] = &["nautilus"];
+
+/// Synthetic reader name emitted by the helper after it observes that Nautilus
+/// holds a writable destination for the same source file. Unlike a metadata
+/// sniff, this read must receive every real byte before it is allowed through.
+pub const FILE_MANAGER_COPY_READER: &str = "nautilus-copy";
+
+/// Interactive viewers that issue speculative reads for neighbouring files.
+///
+/// A gallery application commonly opens the selected image and several nearby
+/// images in the same process. Process identity therefore cannot tell a real
+/// open from preloading. These readers are served progressively, one kernel-
+/// requested range at a time, instead of promoting their second read to a
+/// whole-file hydration.
+pub const PROGRESSIVE_READERS: &[&str] = &["loupe", "eog", "gwenview", "shotwell"];
 
 /// The matching background-reader prefix, if `comm` is one.
 pub fn is_background_reader(comm: &str) -> Option<&'static str> {
@@ -73,6 +93,23 @@ pub fn is_bulk_copier(comm: &str) -> bool {
 /// Whether `comm` is a file manager or thumbnailer that must never download.
 pub fn is_browsing_reader(comm: &str) -> bool {
     BROWSING_READERS
+        .iter()
+        .any(|prefix| comm.starts_with(prefix))
+}
+
+pub fn is_file_manager_reader(comm: &str) -> bool {
+    FILE_MANAGER_READERS
+        .iter()
+        .any(|prefix| comm.starts_with(prefix))
+}
+
+pub fn is_file_manager_copy_reader(reader: &str) -> bool {
+    reader == FILE_MANAGER_COPY_READER
+}
+
+/// Whether `comm` should be served only the ranges it actually requests.
+pub fn is_progressive_reader(comm: &str) -> bool {
+    PROGRESSIVE_READERS
         .iter()
         .any(|prefix| comm.starts_with(prefix))
 }
@@ -107,5 +144,19 @@ mod tests {
         assert!(is_browsing_reader("gst-video-thumb"));
         assert!(!is_browsing_reader("cp"));
         assert!(!is_browsing_reader("libreoffice"));
+        assert!(is_file_manager_reader("nautilus"));
+        assert!(!is_file_manager_reader("gdk-pixbuf-thum"));
+        assert!(is_file_manager_copy_reader(FILE_MANAGER_COPY_READER));
+        assert!(!is_file_manager_copy_reader("nautilus"));
+    }
+
+    #[test]
+    fn gallery_viewers_are_progressive_not_browsers() {
+        for reader in ["loupe", "eog", "gwenview", "shotwell"] {
+            assert!(is_progressive_reader(reader), "{reader}");
+            assert!(!is_browsing_reader(reader), "{reader}");
+        }
+        assert!(!is_progressive_reader("libreoffice"));
+        assert!(!is_progressive_reader("cp"));
     }
 }
