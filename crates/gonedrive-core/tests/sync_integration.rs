@@ -187,7 +187,9 @@ fn file(id: &str, parent: &str, name: &str, ctag: &str, size: u64, mtime: &str) 
     json!({
         "id": id, "name": name, "size": size,
         "cTag": ctag, "eTag": format!("e-{ctag}"),
-        "file": {"mimeType": "text/plain", "hashes": {"quickXorHash": ctag}},
+        // Most scenarios exercise cTag fallback. Tests that care about content
+        // hashes provide a real quickXorHash for their exact byte fixture.
+        "file": {"mimeType": "text/plain"},
         "parentReference": {"driveId": "drive1", "id": parent},
         "fileSystemInfo": {"lastModifiedDateTime": mtime}
     })
@@ -211,6 +213,19 @@ fn tombstone(id: &str, parent: &str) -> Value {
 fn mtime_secs(path: &Path) -> i64 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path).unwrap().mtime()
+}
+
+fn ctime(path: &Path) -> (i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).unwrap();
+    (metadata.ctime(), metadata.ctime_nsec())
+}
+
+fn mtime_rfc3339(path: &Path) -> String {
+    time::OffsetDateTime::from_unix_timestamp(mtime_secs(path))
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------

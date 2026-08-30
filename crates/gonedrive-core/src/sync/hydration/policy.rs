@@ -441,12 +441,14 @@ impl Engine {
                 }
                 Ok(file) if Placeholder::state_file(&file) == PlaceholderState::Hydrated => {
                     let local = LocalStat::from_metadata(&file.metadata()?);
+                    let content_hash = Placeholder::content_hash_file(&file);
                     self.store.commit_hydration(
                         &account.id,
                         &record.id,
                         OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
                         Some(local.size),
                         Some(local.ino),
+                        content_hash.as_deref(),
                     )?;
                     repaired += 1;
                     tracing::info!(path = %path.display(), state = ?ItemState::Synced, "repaired a stale hydrating record");
@@ -563,11 +565,14 @@ impl Engine {
             let Ok(file) = rooted.open_read(&path) else {
                 continue;
             };
+            // Do not automatically reclaim an application-owned replacement
+            // inode. It may still be open in an editor. An explicit user
+            // action remains available and verifies the durable hash first.
             if Placeholder::item_id_file(&file).as_deref() != Some(&record.id) {
                 continue;
             }
             let occupancy = crate::hydrate::Occupancy::read_file(&file)?;
-            if occupancy.allocated == 0 {
+            if Placeholder::content_layout_file(&file)?.has_no_data() {
                 continue;
             }
             let atime = file

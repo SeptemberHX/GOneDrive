@@ -5,10 +5,11 @@ offers the two actions that matter: keep it here, or give the space back.
 
 Two decisions keep this fast enough to run on every file Nautilus draws:
 
-* **Status comes from the file's own extended attributes**, not from the
-  daemon. Rendering a folder of a thousand files means a thousand answers, and
-  a ``getxattr`` is a syscall where asking the daemon would be a round trip.
-  It also means the emblems are still right when the daemon is not running.
+* **Status normally comes from the file's own extended attributes**, not from
+  the daemon. Rendering a folder of a thousand files means a thousand answers,
+  and a ``getxattr`` is a syscall where asking the daemon would be a round trip.
+  An application-owned inode created by atomic save deliberately has no marks;
+  inside the configured root it falls back to locally available.
 * **Actions go over D-Bus and do not wait.** Freeing a folder can take a while;
   blocking here would freeze the file manager's UI thread.
 """
@@ -125,10 +126,22 @@ FOLDER_LOCAL = Status(EMBLEM_LOCAL, "包含本地内容")
 FOLDER_PINNED = Status(EMBLEM_PINNED, "始终保留在此设备")
 
 
-def status_of(path, is_dir=False):
+def status_of(path, is_dir=False, managed_without_xattr=False):
     """Classify a path already known to be inside a GOnedrive sync root."""
     state = _xattr(path, XATTR_STATE)
     if state is None:
+        # Atomic-save APIs replace the inode and discard its user xattrs. The
+        # daemon intentionally leaves that application-owned inode alone so an
+        # editor does not receive a false external-modification notification.
+        # Callers may use this fallback only after `_path_of` proved the file is
+        # inside a configured sync root.
+        if (
+            managed_without_xattr
+            and not is_dir
+            and not os.path.islink(path)
+            and os.path.isfile(path)
+        ):
+            return AVAILABLE
         return None
     # A transfer in flight wins over the resting state, so an upload or download
     # reads as "syncing" rather than the check or cloud it will settle into.
@@ -177,7 +190,7 @@ class GOnedriveExtension(
         path = self._path_of(file)
         if path is None:
             return
-        status = status_of(path, file.is_directory())
+        status = status_of(path, file.is_directory(), managed_without_xattr=True)
         if status is None:
             return
         file.add_emblem(status.emblem)
@@ -199,7 +212,10 @@ class GOnedriveExtension(
     def _build_menu(self, managed, namespace):
         """Build one menu bound to exactly the paths in ``managed``."""
 
-        statuses = [status_of(p, f.is_directory()) for f, p in managed]
+        statuses = [
+            status_of(p, f.is_directory(), managed_without_xattr=True)
+            for f, p in managed
+        ]
         # A folder carries no status of its own but still has contents worth
         # acting on, so it counts as actionable when it is inside the tree.
         folders = [p for f, p in managed if f.is_directory()]

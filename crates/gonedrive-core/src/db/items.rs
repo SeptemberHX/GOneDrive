@@ -255,13 +255,15 @@ impl Store {
         mtime: Option<OffsetDateTime>,
         size: Option<u64>,
         ino: Option<u64>,
+        quickxor: Option<&str>,
     ) -> Result<()> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             tx.execute(
                 "UPDATE items
                     SET local_mtime = ?3, local_size = ?4, local_ino = ?5,
-                        state = 'synced', updated_at = ?6
+                        quickxor = COALESCE(?6, quickxor),
+                        state = 'synced', updated_at = ?7
                   WHERE id = ?1 AND account_id = ?2",
                 params![
                     id,
@@ -269,6 +271,7 @@ impl Store {
                     mtime.map(|t| t.unix_timestamp()),
                     size.map(|v| v as i64),
                     ino.map(|v| v as i64),
+                    quickxor,
                     now()
                 ],
             )?;

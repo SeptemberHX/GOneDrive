@@ -65,12 +65,14 @@ impl Engine {
             file.set_times(times)?;
         }
         let local = LocalStat::from_metadata(&file.metadata()?);
+        let content_hash = Placeholder::content_hash_file(&file);
         self.store.commit_hydration(
             &account.id,
             &item_id,
             OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
             Some(local.size),
             Some(local.ino),
+            content_hash.as_deref(),
         )?;
         let _ = self.refresh_folder_ancestors(&account, &item_id);
         Ok(offset)
@@ -251,20 +253,24 @@ impl Engine {
         use std::io::{Seek, SeekFrom};
 
         let before = transfer::FileVersion::capture_file(file).ok()?;
-        let occ = match crate::hydrate::Occupancy::read_file(file) {
-            Ok(occupancy) => occupancy,
+        let layout = match Placeholder::content_layout_file(file) {
+            Ok(layout) => layout,
             // If we cannot inspect the file, we cannot prove its bytes are
             // disposable. Every destructive caller must fail closed.
             Err(_) => return None,
         };
-        let disposable = if occ.allocated < occ.apparent_size
+        let disposable = if !layout.is_fully_materialized()
             && Placeholder::state_file(file) == PlaceholderState::Dehydrated
         {
             // An actual placeholder or partial range cache owns no local
             // content. A hydrated VM image or database can be sparse too and
             // must continue through the hash check below.
             true
-        } else if let Some(recorded) = Placeholder::content_hash_file(file) {
+        } else if let Some(recorded) = record
+            .quickxor
+            .clone()
+            .or_else(|| Placeholder::content_hash_file(file))
+        {
             match file.try_clone().and_then(|mut reader| {
                 reader.seek(SeekFrom::Start(0))?;
                 crate::hash::quick_xor_reader(&mut reader)
@@ -274,8 +280,13 @@ impl Engine {
                 Err(_) => false,
             }
         } else {
-            // No recorded hash (a file written before content hashing, or one
-            // that arrived some other way): fall back to size+mtime.
+            // A marked legacy file may predate content hashing; retain its
+            // size+mtime fallback. An unmarked application replacement has no
+            // equally strong identity proof, so fail closed until an upload
+            // records its hash in SQLite.
+            if Placeholder::item_id_file(file).as_deref() != Some(record.id.as_str()) {
+                return None;
+            }
             let local = LocalStat::from_metadata(&file.metadata().ok()?);
             !crate::sync::plan::local_is_modified(record, &local)
         };

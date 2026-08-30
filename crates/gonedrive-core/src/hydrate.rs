@@ -2,14 +2,15 @@
 //!
 //! This is the Linux answer to what Windows calls Files On-Demand. A
 //! placeholder is a genuine file on a genuine ext4 directory — `ls` reports its
-//! real size, a file manager shows it, `find` finds it — but every block is a
-//! hole, so `du` reports zero and the disk holds nothing.
+//! real size, a file manager shows it, `find` finds it — but every content block
+//! is a hole. The filesystem may still charge a small metadata block for the
+//! extended attributes that identify the placeholder.
 //!
 //! Three operations make the illusion work:
 //!
 //! * [`Placeholder::create`] — the file exists at full size, holding nothing.
 //! * [`Placeholder::hydrate`] — content is written back into the holes.
-//! * [`Placeholder::dehydrate`] — content is punched back out, freeing space.
+//! * [`Placeholder::dehydrate`] — content extents are discarded, freeing space.
 //!
 //! State lives in extended attributes rather than only in the database, because
 //! xattrs travel with the file. A lost or rebuilt database can be recovered by
@@ -106,15 +107,57 @@ impl Occupancy {
         }
     }
 
-    /// Whether the file occupies materially less space than it claims.
+    /// Whether `du` reports materially less space than `ls`.
+    ///
+    /// This is an approximate storage metric, not a content-layout test: xattr
+    /// metadata is included in `allocated`, so a small, completely sparse
+    /// placeholder can legitimately return false here.
     pub fn is_sparse(self) -> bool {
         self.allocated < self.apparent_size
+    }
+}
+
+/// Which logical content ranges of a regular file have physical data extents.
+///
+/// Unlike [`Occupancy`], this does not confuse filesystem metadata or external
+/// xattr blocks with user content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentLayout {
+    /// A zero-length file has no range to classify.
+    Empty,
+    /// Every byte in the apparent range is a hole.
+    Sparse,
+    /// The file contains both data extents and holes.
+    Partial,
+    /// Every byte in the apparent range is backed by a data extent.
+    Full,
+}
+
+impl ContentLayout {
+    /// Whether reading the file can return no locally stored content bytes.
+    pub fn has_no_data(self) -> bool {
+        matches!(self, Self::Empty | Self::Sparse)
+    }
+
+    /// Whether every logical byte is locally materialized.
+    pub fn is_fully_materialized(self) -> bool {
+        matches!(self, Self::Empty | Self::Full)
     }
 }
 
 pub struct Placeholder;
 
 impl Placeholder {
+    /// Inspect content extents without treating xattr metadata as file data.
+    pub fn content_layout(path: &Path) -> Result<ContentLayout> {
+        let file = std::fs::File::open(path)?;
+        content_layout_file(&file)
+    }
+
+    pub(crate) fn content_layout_file(file: &std::fs::File) -> Result<ContentLayout> {
+        content_layout_file(file)
+    }
+
     /// Keep an unprotected sparse placeholder visible but unreadable. The HSM
     /// restores the exact saved mode on the same inode after its mark succeeds.
     pub(crate) fn lock_unprotected_file(file: &std::fs::File) -> Result<()> {
@@ -134,12 +177,10 @@ impl Placeholder {
         Ok(())
     }
 
-    /// Create a file that reports `size` bytes but occupies none.
+    /// Create a file that reports `size` bytes but has no content blocks.
     ///
-    /// The file is truncated to full size and then has that whole range punched
-    /// out. Truncating alone would already produce a hole on ext4, but not on
-    /// every filesystem, and an explicit punch makes the intent unambiguous —
-    /// this file is *meant* to be empty, it is not merely un-written.
+    /// The file is truncated to zero and then extended to its advertised size,
+    /// making the whole logical range a hole without allocating its contents.
     pub fn create(
         path: &Path,
         size: u64,
@@ -155,10 +196,7 @@ impl Placeholder {
             .create(true)
             .truncate(true)
             .open(path)?;
-        file.set_len(size)?;
-        if size > 0 {
-            punch_hole(&file, 0, size)?;
-        }
+        reset_to_sparse_size(&file, size)?;
         drop(file);
 
         Self::write_marks(path, PlaceholderState::Dehydrated, item_id, ctag)?;
@@ -176,10 +214,7 @@ impl Placeholder {
         ctag: Option<&str>,
         mtime: Option<OffsetDateTime>,
     ) -> Result<()> {
-        file.set_len(size)?;
-        if size > 0 {
-            punch_hole(file, 0, size)?;
-        }
+        reset_to_sparse_size(file, size)?;
         Self::write_marks_file(file, PlaceholderState::Dehydrated, item_id, ctag)?;
         if let Some(mtime) = mtime {
             let times =
@@ -192,20 +227,11 @@ impl Placeholder {
     /// Release a hydrated file's blocks, keeping the file and its size.
     ///
     /// This is "free up space". The caller is responsible for having confirmed
-    /// the content is safely uploaded first — punching a hole is not reversible
+    /// the content is safely uploaded first — discarding extents is not reversible
     /// without going back to the service.
     pub fn dehydrate(path: &Path, item_id: &str, ctag: Option<&str>) -> Result<u64> {
-        let before = Occupancy::read(path)?;
         let file = std::fs::File::options().write(true).open(path)?;
-        if before.apparent_size > 0 {
-            punch_hole(&file, 0, before.apparent_size)?;
-        }
-        file.sync_all()?;
-        drop(file);
-
-        Self::write_marks(path, PlaceholderState::Dehydrated, item_id, ctag)?;
-        let after = Occupancy::read(path)?;
-        Ok(before.allocated.saturating_sub(after.allocated))
+        Self::dehydrate_file(&file, item_id, ctag)
     }
 
     pub(crate) fn dehydrate_file(
@@ -214,11 +240,13 @@ impl Placeholder {
         ctag: Option<&str>,
     ) -> Result<u64> {
         let before = Occupancy::read_file(file)?;
-        if before.apparent_size > 0 {
-            punch_hole(file, 0, before.apparent_size)?;
-        }
-        file.sync_all()?;
+        // Publish the fail-closed state before discarding bytes. If the process
+        // dies between the two truncates, a later scan must see a placeholder
+        // and fetch the remote copy, never upload the temporary zero length.
         Self::write_marks_file(file, PlaceholderState::Dehydrated, item_id, ctag)?;
+        file.sync_all()?;
+        reset_to_sparse_size(file, before.apparent_size)?;
+        file.sync_all()?;
         let after = Occupancy::read_file(file)?;
         Ok(before.allocated.saturating_sub(after.allocated))
     }
@@ -261,23 +289,7 @@ impl Placeholder {
         item_id: &str,
         ctag: Option<&str>,
     ) -> Result<()> {
-        Self::mark_hydrated_file_with_hash(file, item_id, ctag, None)
-    }
-
-    /// Descriptor-bound hydrated marks for callers that already hashed the
-    /// exact bytes they published. Uploads use this to avoid reading a large
-    /// file twice while still making every durable xattr visible together.
-    pub(crate) fn mark_hydrated_file_with_hash(
-        file: &std::fs::File,
-        item_id: &str,
-        ctag: Option<&str>,
-        known_hash: Option<&str>,
-    ) -> Result<()> {
         Self::write_marks_file(file, PlaceholderState::Hydrated, item_id, ctag)?;
-        if let Some(hash) = known_hash {
-            let _ = set_xattr_file(file, XATTR_QUICKXOR, hash.as_bytes());
-            return Ok(());
-        }
         if let Ok(mut reader) = file.try_clone() {
             if reader.seek(SeekFrom::Start(0)).is_ok() {
                 if let Ok(hash) = crate::hash::quick_xor_reader(&mut reader) {
@@ -537,24 +549,71 @@ fn remove_xattr_file(file: &std::fs::File, name: &str) -> Result<()> {
     }
 }
 
-/// Punch a hole, releasing the blocks while keeping the file's length.
-fn punch_hole(file: &std::fs::File, offset: u64, len: u64) -> Result<()> {
-    // SAFETY: `file` owns a valid descriptor for the duration of the call.
-    let rc = unsafe {
-        libc::fallocate(
-            file.as_raw_fd(),
-            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            offset as libc::off_t,
-            len as libc::off_t,
-        )
-    };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(Error::other(format!(
-            "could not release blocks ({err}); \
-             the filesystem may not support hole punching"
-        )));
+fn content_layout_file(file: &std::fs::File) -> Result<ContentLayout> {
+    let size = file.metadata()?.len();
+    if size == 0 {
+        return Ok(ContentLayout::Empty);
     }
+
+    // lseek changes a file description's cursor, and dup/try_clone would share
+    // that cursor with the caller. Reopening the descriptor through procfs binds
+    // the probe to the same inode while giving it an independent cursor.
+    let probe_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let probe = std::fs::File::open(&probe_path).map_err(|error| {
+        Error::other(format!(
+            "could not open a private extent probe for {probe_path} ({error})"
+        ))
+    })?;
+    let Some(first_data) = seek_extent(&probe, 0, libc::SEEK_DATA)? else {
+        return Ok(ContentLayout::Sparse);
+    };
+    if first_data >= size {
+        return Ok(ContentLayout::Sparse);
+    }
+    if first_data > 0 {
+        return Ok(ContentLayout::Partial);
+    }
+
+    let Some(first_hole) = seek_extent(&probe, 0, libc::SEEK_HOLE)? else {
+        return Err(Error::other(
+            "filesystem returned no hole or logical EOF for a non-empty file",
+        ));
+    };
+    if first_hole >= size {
+        Ok(ContentLayout::Full)
+    } else {
+        Ok(ContentLayout::Partial)
+    }
+}
+
+fn seek_extent(file: &std::fs::File, offset: u64, whence: libc::c_int) -> Result<Option<u64>> {
+    let offset = libc::off_t::try_from(offset)
+        .map_err(|_| Error::other("extent offset exceeds the filesystem offset type"))?;
+    // SAFETY: `file` owns a valid regular-file descriptor and lseek has no
+    // pointer arguments. SEEK_DATA/SEEK_HOLE inspect extent metadata only.
+    let position = unsafe { libc::lseek(file.as_raw_fd(), offset, whence) };
+    if position >= 0 {
+        return Ok(Some(position as u64));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENXIO) {
+        Ok(None)
+    } else {
+        Err(Error::other(format!(
+            "could not inspect file extents ({error})"
+        )))
+    }
+}
+
+/// Discard every content extent while preserving this inode and logical size.
+///
+/// Hole punching cannot remove an unaligned fragment smaller than the
+/// filesystem block size; it may leave a tiny file as an allocated block full
+/// of zeroes. A truncate-to-zero cycle drops every extent first, and extending
+/// the empty file recreates the entire logical range as a hole.
+fn reset_to_sparse_size(file: &std::fs::File, size: u64) -> Result<()> {
+    file.set_len(0)?;
+    file.set_len(size)?;
     Ok(())
 }
 
@@ -566,6 +625,15 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    fn assert_no_content_blocks(path: &Path) {
+        let occupancy = Occupancy::read(path).unwrap();
+        let layout = Placeholder::content_layout(path).unwrap();
+        assert!(
+            layout.has_no_data(),
+            "{path:?} has {layout:?} content extents (occupancy: {occupancy:?})"
+        );
+    }
+
     #[test]
     fn a_placeholder_reports_its_full_size_but_occupies_nothing() {
         let dir = tmp();
@@ -573,9 +641,10 @@ mod tests {
         Placeholder::create(&path, 8 * 1024 * 1024, "ITEM1", Some("c1"), None).unwrap();
 
         let occupancy = Occupancy::read(&path).unwrap();
-        // This pair is the whole point: `ls` sees 8 MiB, `du` sees nothing.
+        // `ls` sees 8 MiB while the content range has no data extents. Some
+        // filesystems still charge `du` for an external xattr metadata block.
         assert_eq!(occupancy.apparent_size, 8 * 1024 * 1024);
-        assert_eq!(occupancy.allocated, 0);
+        assert_no_content_blocks(&path);
         assert!(occupancy.is_sparse());
 
         assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
@@ -629,14 +698,17 @@ mod tests {
         let data: Vec<u8> = (0..=255u8).cycle().take(64 * 1024).collect();
 
         Placeholder::create(&path, data.len() as u64, "ITEM1", Some("c1"), None).unwrap();
-        assert_eq!(Occupancy::read(&path).unwrap().allocated, 0);
+        assert_no_content_blocks(&path);
 
         Placeholder::fill(&path, 0, &data).unwrap();
         Placeholder::mark_hydrated(&path, "ITEM1", Some("c1")).unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), data);
         assert_eq!(Placeholder::state(&path), PlaceholderState::Hydrated);
-        assert!(Occupancy::read(&path).unwrap().allocated > 0);
+        assert_eq!(
+            Placeholder::content_layout(&path).unwrap(),
+            ContentLayout::Full
+        );
     }
 
     #[test]
@@ -689,15 +761,38 @@ mod tests {
 
         let before = Occupancy::read(&path).unwrap();
         assert!(before.allocated >= 2 * 1024 * 1024);
+        assert_eq!(
+            Placeholder::content_layout(&path).unwrap(),
+            ContentLayout::Full
+        );
 
         let freed = Placeholder::dehydrate(&path, "ITEM1", Some("c1")).unwrap();
-        assert!(freed >= 2 * 1024 * 1024, "freed only {freed} bytes");
 
         let after = Occupancy::read(&path).unwrap();
-        // The file is still there, still the right size, and now costs nothing.
+        assert_eq!(
+            freed,
+            before.allocated.saturating_sub(after.allocated),
+            "reported freed space must match the actual allocation change"
+        );
+        assert!(freed > 0, "dehydration did not release content blocks");
+        // The file is still there, still the right size, and now costs only
+        // whatever metadata/xattr overhead this filesystem requires.
         assert!(path.exists());
         assert_eq!(after.apparent_size, 2 * 1024 * 1024);
-        assert_eq!(after.allocated, 0);
+        assert_no_content_blocks(&path);
+        assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
+    }
+
+    #[test]
+    fn dehydrating_a_sub_block_file_removes_its_last_content_extent() {
+        let dir = tmp();
+        let path = dir.path().join("tiny.md");
+        std::fs::write(&path, b"twenty bytes of text!").unwrap();
+
+        Placeholder::dehydrate(&path, "ITEM1", Some("c1")).unwrap();
+
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 21);
+        assert_no_content_blocks(&path);
         assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
     }
 
@@ -709,7 +804,7 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
 
         Placeholder::dehydrate(&path, "ITEM1", Some("c1")).unwrap();
-        assert_eq!(Occupancy::read(&path).unwrap().allocated, 0);
+        assert_no_content_blocks(&path);
 
         Placeholder::fill(&path, 0, &data).unwrap();
         Placeholder::mark_hydrated(&path, "ITEM1", Some("c1")).unwrap();

@@ -134,12 +134,14 @@ impl Engine {
             file.set_times(times)?;
         }
         let local = LocalStat::from_metadata(&file.metadata()?);
+        let content_hash = Placeholder::content_hash_file(&file);
         self.store.commit_hydration(
             &account.id,
             &item_id,
             OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
             Some(local.size),
             Some(local.ino),
+            content_hash.as_deref(),
         )?;
         self.refresh_folder_ancestors(&account, &item_id)?;
         self.emit(SyncEvent::HydrationFinished {

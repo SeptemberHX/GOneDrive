@@ -8,7 +8,7 @@ use time::OffsetDateTime;
 
 use crate::db::{Account, ItemRecord, ItemState, OpKind};
 use crate::error::{Error, Result};
-use crate::hydrate::{Occupancy, Placeholder, PlaceholderState};
+use crate::hydrate::{Placeholder, PlaceholderState};
 use crate::sync::plan::{decide_local, LocalAction, LocalStat};
 
 use super::engine::{Engine, FullScanReport, SafetyStopKind, SyncEvent, SyncPhase, SyncSummary};
@@ -818,16 +818,16 @@ impl Engine {
         } else {
             false
         };
-        let fully_allocated = !Occupancy::read_file(&file)?.is_sparse();
+        let fully_materialized = Placeholder::content_layout_file(&file)?.is_fully_materialized();
         let safe_to_claim = exact_copy
-            || (completed_write && (state == PlaceholderState::Hydrated || fully_allocated));
+            || (completed_write && (state == PlaceholderState::Hydrated || fully_materialized));
         if !safe_to_claim {
             tracing::debug!(
                 path = %path.display(),
                 claimed_item_id = %claimed_id,
                 ?state,
                 completed_write,
-                fully_allocated,
+                fully_materialized,
                 "deferring an incomplete copied placeholder"
             );
             return Ok(false);

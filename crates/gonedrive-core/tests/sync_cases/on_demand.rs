@@ -659,7 +659,7 @@ async fn a_browsed_placeholder_can_still_be_freed() {
     // unsaved-changes guard: the bytes are cloud-owned cache, and refusing
     // made "free a file you merely looked at" impossible — found live as
     // `FreeUpSpace done files=0 kept=2`.
-    use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
 
     const CONTENT: &[u8] = &[7u8; 64 * 1024];
     let h = harness_with_a_downloaded_file(CONTENT).await;
@@ -673,11 +673,7 @@ async fn a_browsed_placeholder_can_still_be_freed() {
     let outcome = h.engine.free_space(Path::new("Docs")).unwrap();
     assert_eq!(outcome.files, 1, "skipped: {:?}", outcome.skipped);
     assert!(outcome.skipped.is_empty());
-    assert_eq!(
-        Occupancy::read(&path).unwrap().allocated,
-        0,
-        "cache punched"
-    );
+    assert_is_placeholder_on_disk(&path);
 
     // The guard still protects what it is for: a *hydrated* file with a real
     // local edit.

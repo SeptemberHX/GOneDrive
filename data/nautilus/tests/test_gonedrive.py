@@ -60,6 +60,19 @@ class StatusTests(unittest.TestCase):
         # not manage would put a OneDrive badge on an unrelated file.
         self.assertIsNone(ext.status_of(self.path))
 
+    def test_an_atomic_save_inside_the_sync_root_falls_back_to_available(self):
+        # GTK's replace-contents API creates a new inode without user xattrs.
+        # The provider is allowed to infer only after `_path_of` has proved the
+        # file lives in the configured sync root.
+        self.assertIs(
+            ext.status_of(self.path, managed_without_xattr=True), ext.AVAILABLE
+        )
+
+    def test_the_managed_fallback_never_claims_a_symlink(self):
+        link = os.path.join(self.dir.name, "link")
+        os.symlink(self.path, link)
+        self.assertIsNone(ext.status_of(link, managed_without_xattr=True))
+
     def test_a_placeholder_reads_as_online_only(self):
         self.mark(state="dehydrated")
         self.assertIs(ext.status_of(self.path), ext.ONLINE_ONLY)

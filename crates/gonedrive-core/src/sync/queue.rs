@@ -1,6 +1,5 @@
 //! Durable transfer and remote-mutation queue execution.
 
-use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -356,12 +355,14 @@ impl Engine {
         }
 
         let local = LocalStat::from_metadata(&published.metadata()?);
+        let content_hash = Placeholder::content_hash_file(&published);
         self.store.commit_hydration(
             &account.id,
             item_id,
             OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
             Some(local.size),
             Some(local.ino),
+            content_hash.as_deref(),
         )?;
         // The file manager marks were written before the stability check above,
         // so the synced emblem and database state become visible together.
@@ -424,12 +425,11 @@ impl Engine {
 
         let events = self.events.clone();
         let progress_name = name.clone();
-        // Bind the transient marker to the inode already checked above. A path
-        // replacement must not make cleanup mutate the replacement instead.
-        let _ = Placeholder::set_syncing_file(&source_file, true);
-        // Derive the stability token from the descriptor that will be hashed
-        // and marked, rather than a path lookup that could name a replaced
-        // inode by the time the upload starts.
+        // Derive the stability token from the descriptor that will be hashed,
+        // rather than a path lookup that could name a replaced inode by the
+        // time the upload starts. Uploads deliberately do not put a transient
+        // xattr on this descriptor: Linux reports xattr writes as external file
+        // changes, which makes editors warn immediately after their own save.
         let source_version = transfer::FileVersion::capture_file(&source_file)?;
         let result = transfer::upload_file_rooted(
             &rooted,
@@ -459,10 +459,9 @@ impl Engine {
             },
         )
         .await;
-        let _ = Placeholder::set_syncing_file(&source_file, false);
 
-        let item = match result {
-            Ok(item) => item,
+        let uploaded = match result {
+            Ok(uploaded) => uploaded,
             // If-Match rejected: the remote changed since our last pull, so our
             // upload would overwrite an edit we never saw. Preserve our local
             // copy under a conflict name and re-offer it; forget the stale
@@ -508,13 +507,8 @@ impl Engine {
         if !transfer::FileVersion::capture_rooted(&rooted, &path)?.same_content_as(source_version) {
             return Err(transfer::file_changed_error(&path, "uploading"));
         }
-        let content_hash = source_file.try_clone().ok().and_then(|mut file| {
-            file.seek(SeekFrom::Start(0)).ok()?;
-            crate::hash::quick_xor_reader(&mut file).ok()
-        });
-        if !transfer::FileVersion::capture_rooted(&rooted, &path)?.same_content_as(source_version) {
-            return Err(transfer::file_changed_error(&path, "hashing after upload"));
-        }
+        let item = uploaded.item;
+        let content_hash = uploaded.quickxor;
 
         // `Inherit`, never `Pinned`: stamping uploads as always-keep silently
         // converts everything the user ever created into pinned content. The
@@ -527,6 +521,18 @@ impl Engine {
             PinState::Inherit,
         );
         record.parent_id = Some(parent_id);
+        if record
+            .quickxor
+            .as_deref()
+            .is_some_and(|remote| remote != content_hash)
+        {
+            tracing::warn!(path = %path.display(), "upload response hash did not match the source hash");
+        }
+        // The transfer binds this hash to the exact stable source version it
+        // uploaded. Graph can omit hashes from a mutation response even though
+        // a later delta includes them; retaining our value lets that delta
+        // recognise its own upload echo instead of downloading the file back.
+        record.quickxor = Some(content_hash);
         let committed = self.store.upsert_item_after_mutation(
             &record,
             op.precondition.as_deref(),
@@ -552,26 +558,12 @@ impl Engine {
             }
         }
 
-        let default_pin = self.config.download_new.default_pin();
-        let pin = match self.store.effective_pin(&record.id, default_pin) {
-            Ok(pin) => pin,
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "could not resolve uploaded file retention policy");
-                default_pin
-            }
-        };
-        let marks = Placeholder::mark_hydrated_file_with_hash(
-            &source_file,
-            &record.id,
-            record.ctag.as_deref(),
-            content_hash.as_deref(),
-        )
-        .and_then(|()| Placeholder::set_pin_file(&source_file, pin.as_str()));
-        if let Err(error) = marks {
-            // As above, a local metadata failure must not turn a committed
-            // remote create into a duplicate retry. A later scan repairs marks.
-            tracing::warn!(path = %path.display(), %error, "could not publish uploaded placeholder marks");
-        }
+        // Do not publish xattrs onto an application's source inode here. GTK's
+        // GFileMonitor exposes every xattr change as an external modification;
+        // Apostrophe and similar editors then warn that their just-saved file
+        // was changed behind their back. Hydrated files are owned durably by
+        // their database path/inode/hash. Sparse placeholders still require and
+        // receive the full xattr protocol on creation and hydration.
         summary.uploaded += 1;
         self.emit(SyncEvent::ItemDone {
             name,

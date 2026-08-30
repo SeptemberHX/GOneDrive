@@ -15,6 +15,14 @@ fn remote_file(id: &str, parent: &str, name: &str, ctag: &str, size: u64) -> Dri
     .unwrap()
 }
 
+fn set_quickxor(item: &mut DriveItem, value: &str) {
+    item.file.as_mut().unwrap().hashes = Some(crate::models::Hashes {
+        quick_xor_hash: Some(value.to_string()),
+        sha1_hash: None,
+        sha256_hash: None,
+    });
+}
+
 fn remote_folder(id: &str, parent: &str, name: &str) -> DriveItem {
     serde_json::from_value(serde_json::json!({
         "id": id, "name": name, "folder": {"childCount": 0},
@@ -85,6 +93,36 @@ fn remote_only_change_downloads_over_the_local_copy() {
     let new = remote_file("F1", "R", "a.txt", "c2", 20);
     assert_eq!(
         decide_remote(&new, Some(&known), Some(&local)),
+        RemoteAction::Download { overwrite: true }
+    );
+}
+
+#[test]
+fn a_matching_content_hash_suppresses_an_upload_echo_with_a_new_ctag() {
+    let mut old = remote_file("F1", "R", "a.txt", "c1", 10);
+    set_quickxor(&mut old, "same-content");
+    let local = stat(10, old.effective_mtime().unwrap().unix_timestamp());
+    let known = synced_record(&old, &local);
+
+    let mut echoed = remote_file("F1", "R", "a.txt", "c2", 10);
+    set_quickxor(&mut echoed, "same-content");
+    assert_eq!(
+        decide_remote(&echoed, Some(&known), Some(&local)),
+        RemoteAction::Skip(SkipReason::UpToDate)
+    );
+}
+
+#[test]
+fn a_changed_content_hash_wins_even_when_the_ctag_did_not_move() {
+    let mut old = remote_file("F1", "R", "a.txt", "c1", 10);
+    set_quickxor(&mut old, "old-content");
+    let local = stat(10, old.effective_mtime().unwrap().unix_timestamp());
+    let known = synced_record(&old, &local);
+
+    let mut changed = remote_file("F1", "R", "a.txt", "c1", 10);
+    set_quickxor(&mut changed, "new-content");
+    assert_eq!(
+        decide_remote(&changed, Some(&known), Some(&local)),
         RemoteAction::Download { overwrite: true }
     );
 }

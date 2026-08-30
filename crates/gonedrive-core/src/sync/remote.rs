@@ -399,7 +399,9 @@ impl Engine {
                 // because a materialised file already exists — never punched
                 // it, leaving the *stale* bytes readable with no event ever
                 // fetching the new ones (a cloud edit the user silently never
-                // saw). Occupancy, not the state xattr, is the robust test: an
+                // saw). Content extents, not the state xattr or `st_blocks`,
+                // are the robust test: xattr metadata can make a tiny sparse
+                // placeholder look fully allocated, while an
                 // app that rewrites a file (LibreOffice's save-and-rename)
                 // strips our xattrs, but full allocation still means real
                 // content lives here.
@@ -409,8 +411,8 @@ impl Engine {
                 // the disk under it, so enumerating everything and downloading
                 // nothing is the only safe thing to do before the user chooses.
                 let materialised = local.as_ref().is_some_and(|l| !l.is_dir)
-                    && crate::hydrate::Occupancy::read(&path)
-                        .map(|o| o.apparent_size > 0 && o.allocated >= o.apparent_size)
+                    && Placeholder::content_layout(&path)
+                        .map(|layout| layout.is_fully_materialized())
                         .unwrap_or(false);
                 if materialised || self.wants_content(known.as_ref(), parent_id)? {
                     state = ItemState::DirtyRemote;
@@ -513,6 +515,15 @@ impl Engine {
             record.local_mtime = known.local_mtime;
             record.local_size = known.local_size;
             record.local_ino = known.local_ino;
+            if state == ItemState::DirtyRemote {
+                // Until the queued download atomically lands, these hashes
+                // describe the local byte version that is still on disk. The
+                // overwrite guard needs that baseline to distinguish an
+                // untouched old copy from a concurrent local edit. The newly
+                // downloaded bytes replace it in `commit_hydration`.
+                record.quickxor = known.quickxor.clone();
+                record.sha1 = known.sha1.clone();
+            }
         }
         self.store.upsert_item(&record)?;
 
@@ -550,7 +561,12 @@ impl Engine {
         if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
             return;
         }
-        if Placeholder::item_id_file(&file).is_some_and(|item_id| item_id != record.id) {
+        // Application atomic-save APIs replace the inode and intentionally do
+        // not preserve user xattrs. Reclaiming that new inode would emit a
+        // GFileMonitor attribute-change event after every successful upload,
+        // which editors report as an external modification. Only maintain
+        // marks on an inode that already proves it belongs to this item.
+        if Placeholder::item_id_file(&file).as_deref() != Some(record.id.as_str()) {
             return;
         }
         let Ok(pin) = self
@@ -562,13 +578,6 @@ impl Engine {
         let wanted = pin.as_str();
         if Placeholder::pin_file(&file).as_deref() != Some(wanted) {
             let _ = Placeholder::set_pin_file(&file, wanted);
-        }
-        // A file with content but no state mark predates this client knowing
-        // about placeholders; claim it so it renders correctly.
-        if Placeholder::state_file(&file) == PlaceholderState::Unmanaged
-            && record.state == ItemState::Synced
-        {
-            let _ = Placeholder::mark_hydrated_file(&file, &record.id, record.ctag.as_deref());
         }
     }
 

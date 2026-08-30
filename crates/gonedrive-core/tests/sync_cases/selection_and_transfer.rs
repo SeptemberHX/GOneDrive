@@ -527,6 +527,127 @@ async fn editing_a_synced_file_uploads_the_new_content() {
 }
 
 #[tokio::test]
+async fn an_atomic_editor_save_is_never_touched_or_downloaded_back_after_upload() {
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "Docs"),
+            file("F1", "D1", "notes.md", "c1", 3, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"old").await;
+    h.sync().await;
+
+    // Gio.File.replace_contents (used by Apostrophe) writes a sibling and
+    // renames it over the destination, producing a new inode with no xattrs.
+    let notes_path = h.path("Docs/notes.md");
+    let replacement = h.path("Docs/.notes.md.apostrophe-save");
+    let edited = b"edited in Apostrophe";
+    std::fs::write(&replacement, edited).unwrap();
+    std::fs::rename(&replacement, &notes_path).unwrap();
+    assert_eq!(
+        Placeholder::state(&notes_path),
+        PlaceholderState::Unmanaged
+    );
+    let source_ctime = ctime(&notes_path);
+    let source_mtime = mtime_rfc3339(&notes_path);
+    let source_hash = gonedrive_core::hash::quick_xor(edited);
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    let uploaded = json!({
+        "id": "F1", "name": "notes.md", "size": edited.len(),
+        "cTag": "c2", "eTag": "e2",
+        // Mutation responses are allowed to omit hashes. The daemon must keep
+        // the hash it calculated from the stable source descriptor.
+        "file": {"mimeType": "text/markdown"},
+        "parentReference": {"driveId": "drive1", "id": "D1"},
+        "fileSystemInfo": {"lastModifiedDateTime": source_mtime}
+    });
+    Mock::given(method("PUT"))
+        .and(path("/me/drive/items/F1/content"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(uploaded.clone()))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/F1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(uploaded))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.uploaded, 1);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(std::fs::read(&notes_path).unwrap(), edited);
+    assert_eq!(
+        ctime(&notes_path),
+        source_ctime,
+        "upload changed the editor's inode"
+    );
+    assert_eq!(
+        Placeholder::state(&notes_path),
+        PlaceholderState::Unmanaged
+    );
+    assert_eq!(
+        h.store.item("F1").unwrap().unwrap().quickxor.as_deref(),
+        Some(source_hash.as_str())
+    );
+
+    // OneDrive can echo the completed mutation later with a newer tag. The
+    // content hash proves that this is our own byte version, so no download may
+    // replace the inode Apostrophe is still monitoring.
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v2")),
+        vec![json!({
+            "id": "F1", "name": "notes.md", "size": edited.len(),
+            "cTag": "c3", "eTag": "e3",
+            "file": {
+                "mimeType": "text/markdown",
+                "hashes": {"quickXorHash": source_hash}
+            },
+            "parentReference": {"driveId": "drive1", "id": "D1"},
+            "fileSystemInfo": {"lastModifiedDateTime": source_mtime}
+        })],
+        "v3",
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/F1/content"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.downloaded, 0);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 0);
+    assert_eq!(std::fs::read(&notes_path).unwrap(), edited);
+    assert_eq!(
+        ctime(&notes_path),
+        source_ctime,
+        "upload echo changed the editor's inode"
+    );
+
+    // Avoiding post-save xattrs must not disable Files On-Demand actions. The
+    // database-bound inode and hash are sufficient to release this exact file.
+    let released = h.engine.free_space(Path::new("Docs/notes.md")).unwrap();
+    assert_eq!(released.files, 1, "skipped: {:?}", released.skipped);
+    assert_eq!(
+        Placeholder::state(&notes_path),
+        PlaceholderState::Dehydrated
+    );
+    assert_is_placeholder_on_disk(&notes_path);
+}
+
+#[tokio::test]
 async fn a_queued_upload_never_follows_a_replacement_symlink() {
     use std::os::unix::fs::symlink;
 
@@ -613,7 +734,9 @@ async fn a_brand_new_file_is_uploaded_by_name_and_refuses_to_clobber() {
     h.mock_delta(None, vec![root_item()], "v1").await;
     h.sync().await;
 
-    std::fs::write(h.path("fresh.txt"), b"new content").unwrap();
+    let uploaded = h.path("fresh.txt");
+    std::fs::write(&uploaded, b"new content").unwrap();
+    let source_ctime = ctime(&uploaded);
 
     h.server.reset().await;
     h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
@@ -639,13 +762,15 @@ async fn a_brand_new_file_is_uploaded_by_name_and_refuses_to_clobber() {
     let summary = h.sync().await;
     assert_eq!(summary.uploaded, 1);
     assert_eq!(summary.failed, 0);
-    assert_eq!(h.store.item("NEW").unwrap().unwrap().name, "fresh.txt");
-    let uploaded = h.path("fresh.txt");
-    assert_eq!(Placeholder::state(&uploaded), PlaceholderState::Hydrated);
-    assert_eq!(Placeholder::item_id(&uploaded).as_deref(), Some("NEW"));
-    assert_eq!(Placeholder::ctag(&uploaded).as_deref(), Some("cn"));
-    assert_eq!(Placeholder::pin(&uploaded).as_deref(), Some("pinned"));
-    assert!(Placeholder::content_hash(&uploaded).is_some());
+    let record = h.store.item("NEW").unwrap().unwrap();
+    assert_eq!(record.name, "fresh.txt");
+    assert_eq!(
+        record.quickxor.as_deref(),
+        Some(gonedrive_core::hash::quick_xor(b"new content").as_str())
+    );
+    assert_eq!(ctime(&uploaded), source_ctime, "upload mutated the source inode");
+    assert_eq!(Placeholder::state(&uploaded), PlaceholderState::Unmanaged);
+    assert!(Placeholder::item_id(&uploaded).is_none());
 }
 
 #[tokio::test]
@@ -860,17 +985,14 @@ async fn a_drifted_directory_timestamp_is_corrected_on_the_next_pass() {
 // Files on demand.
 // ---------------------------------------------------------------------------
 
-/// A placeholder still costs whatever the filesystem needs for its metadata —
-/// ext4 allocates a block for extended attributes that do not fit inline — so
-/// "occupies nothing" means "occupies only overhead", not literally zero.
-const PLACEHOLDER_OVERHEAD: u64 = 8 * 1024;
-
 fn assert_is_placeholder_on_disk(path: &Path) {
-    use gonedrive_core::hydrate::Occupancy;
+    use gonedrive_core::hydrate::{Occupancy, Placeholder};
+
     let occupancy = Occupancy::read(path).unwrap();
+    let layout = Placeholder::content_layout(path).unwrap();
     assert!(
-        occupancy.allocated <= PLACEHOLDER_OVERHEAD,
-        "{} still occupies {} of {} apparent",
+        layout.has_no_data(),
+        "{} has {layout:?} content extents ({} of {} bytes allocated)",
         path.display(),
         occupancy.allocated,
         occupancy.apparent_size

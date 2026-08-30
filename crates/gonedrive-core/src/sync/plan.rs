@@ -111,6 +111,19 @@ pub fn local_is_modified(known: &ItemRecord, local: &LocalStat) -> bool {
 /// on metadata edits — so comparing cTags avoids re-downloading a file whose
 /// only change was a rename.
 fn remote_content_changed(known: &ItemRecord, remote: &DriveItem) -> bool {
+    let remote_hashes = remote.hashes();
+    if let (Some(known), Some(remote)) = (
+        known.quickxor.as_deref(),
+        remote_hashes.and_then(|hashes| hashes.quick_xor_hash.as_deref()),
+    ) {
+        return known != remote;
+    }
+    if let (Some(known), Some(remote)) = (
+        known.sha1.as_deref(),
+        remote_hashes.and_then(|hashes| hashes.sha1_hash.as_deref()),
+    ) {
+        return known != remote;
+    }
     match (known.ctag.as_deref(), remote.ctag.as_deref()) {
         (Some(a), Some(b)) => a != b,
         // Personal OneDrive omits cTag on some item types; fall back to size

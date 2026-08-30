@@ -46,6 +46,11 @@ pub struct UploadTarget<'a> {
     pub session_key: &'a str,
 }
 
+pub(crate) struct UploadedFile {
+    pub(crate) item: DriveItem,
+    pub(crate) quickxor: String,
+}
+
 /// Upload a local file, resuming a previous attempt when one is recorded.
 ///
 /// Files under the 4 MiB simple-upload ceiling go in a single request; anything
@@ -60,7 +65,11 @@ pub async fn upload_file(
     target: UploadTarget<'_>,
     mut on_progress: impl FnMut(u64, u64) -> bool,
 ) -> Result<DriveItem> {
-    upload_file_inner(graph, store, config, source, target, &mut on_progress, None).await
+    Ok(
+        upload_file_inner(graph, store, config, source, target, &mut on_progress, None)
+            .await?
+            .item,
+    )
 }
 
 pub(crate) async fn upload_file_rooted(
@@ -71,7 +80,7 @@ pub(crate) async fn upload_file_rooted(
     source: &Path,
     target: UploadTarget<'_>,
     mut on_progress: impl FnMut(u64, u64) -> bool,
-) -> Result<DriveItem> {
+) -> Result<UploadedFile> {
     upload_file_inner(
         graph,
         store,
@@ -92,7 +101,7 @@ async fn upload_file_inner(
     target: UploadTarget<'_>,
     on_progress: &mut impl FnMut(u64, u64) -> bool,
     rooted: Option<&RootedFs>,
-) -> Result<DriveItem> {
+) -> Result<UploadedFile> {
     let path_version = capture(rooted, source)?;
     let mut source_file = match rooted {
         Some(rooted) => rooted.open_read(source)?,
@@ -131,6 +140,7 @@ async fn upload_file_inner(
         if !on_progress(size, size) {
             return Err(Error::Cancelled);
         }
+        let quickxor = crate::hash::quick_xor(&content);
         let item = graph
             .upload_simple(
                 target.parent_id,
@@ -144,7 +154,7 @@ async fn upload_file_inner(
         if capture(rooted, source)? != source_version {
             return Err(file_changed_error(source, "uploading"));
         }
-        return Ok(item);
+        return Ok(UploadedFile { item, quickxor });
     }
 
     let hash = crate::hash::quick_xor_reader(&mut source_file)?;
@@ -159,6 +169,7 @@ async fn upload_file_inner(
     if !capture(rooted, source)?.same_content_as(source_version) {
         return Err(file_changed_error(source, "preparing an upload session"));
     }
+    let quickxor = hash.clone();
     let item = upload_resumable(
         graph,
         store,
@@ -178,7 +189,7 @@ async fn upload_file_inner(
     if capture(rooted, source)? != source_version {
         return Err(file_changed_error(source, "uploading"));
     }
-    Ok(item)
+    Ok(UploadedFile { item, quickxor })
 }
 
 #[allow(clippy::too_many_arguments)]
