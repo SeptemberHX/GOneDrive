@@ -6,6 +6,7 @@
 //! chooser; settings live behind the header menu. Three window states share the
 //! shell: no daemon, signed out, and the panel itself.
 
+mod activity;
 mod builders;
 mod render;
 
@@ -96,7 +97,8 @@ impl Ui {
              .od-tile-grey{background:linear-gradient(160deg,#4a4a4d,#37373a);}\
              .od-tile-folder{background:linear-gradient(160deg,#3a6ea8,#2b5486);}\
              .od-tile-red{background:linear-gradient(160deg,#a33a2b,#7e2b20);}\
-             .od-tile-amber{background:linear-gradient(160deg,#9a7b2b,#6f5520);}",
+             .od-tile-amber{background:linear-gradient(160deg,#9a7b2b,#6f5520);}\
+             .od-reveal{color:#4a90d9;}",
         );
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(

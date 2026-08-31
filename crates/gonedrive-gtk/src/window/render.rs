@@ -1,12 +1,14 @@
 //! Rendering of daemon events into the persistent window widgets.
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gonedrive_ipc::{AccountInfo, Activity, FolderEntry, SyncStatus};
 use gtk::{gio, glib};
 
+use super::activity::row as activity_row;
 use super::{Command, Ui, UiEvent};
 
 impl Ui {
@@ -329,12 +331,13 @@ impl Ui {
         self.activity_empty.set_visible(items.is_empty());
         self.activity_list.set_visible(!items.is_empty());
         self.peek_group.set_visible(!items.is_empty());
+        let root = PathBuf::from(self.root_path.borrow().as_str());
 
         for item in items.iter().take(50) {
-            self.activity_list.append(&activity_row(item));
+            self.activity_list.append(&activity_row(item, &root));
         }
         for item in items.iter().take(2) {
-            self.peek_list.append(&activity_row(item));
+            self.peek_list.append(&activity_row(item, &root));
         }
     }
 }
@@ -348,61 +351,6 @@ fn file_icon(name: &str, is_folder: bool) -> gtk::Image {
     let image = gtk::Image::from_gicon(&gio::content_type_get_icon(&content_type));
     image.set_pixel_size(32);
     image
-}
-
-fn tile(icon: &str, variant: &str) -> gtk::Box {
-    let image = gtk::Image::from_icon_name(icon);
-    image.set_pixel_size(18);
-    image.set_halign(gtk::Align::Center);
-    image.set_valign(gtk::Align::Center);
-    image.set_hexpand(true);
-    image.set_vexpand(true);
-    let tile = gtk::Box::builder()
-        .width_request(34)
-        .height_request(34)
-        .halign(gtk::Align::Start)
-        .valign(gtk::Align::Center)
-        .hexpand(false)
-        .vexpand(false)
-        .build();
-    tile.add_css_class("od-tile");
-    tile.add_css_class(variant);
-    tile.append(&image);
-    tile
-}
-
-fn activity_row(item: &Activity) -> adw::ActionRow {
-    let (icon, variant, verb) = match item.kind.as_str() {
-        "downloaded" => ("go-down-symbolic", "od-tile-blue", "已下载"),
-        "uploaded" => ("go-up-symbolic", "od-tile-green", "已上传"),
-        "deleted" => ("user-trash-symbolic", "od-tile-grey", "已删除"),
-        "conflict" => ("dialog-warning-symbolic", "od-tile-amber", "冲突已保留两份"),
-        _ => ("dialog-error-symbolic", "od-tile-red", "失败"),
-    };
-    let event = if item.detail.is_empty() {
-        format!("{verb} · {}", relative_time(item.when))
-    } else {
-        format!("{verb} · {} · {}", relative_time(item.when), item.detail)
-    };
-    let path = if item.path.is_empty() {
-        "OneDrive/（旧记录未保存路径）"
-    } else {
-        &item.path
-    };
-    let subtitle = format!("{path}\n{event}");
-    // GObject may apply builder properties in canonical property order rather
-    // than call order. Build without untrusted strings, then disable markup
-    // before assigning either field so Graph/HTML errors are never parsed.
-    let row = adw::ActionRow::builder()
-        .title_lines(1)
-        .subtitle_lines(2)
-        .build();
-    row.set_use_markup(false);
-    row.set_title(&item.name);
-    row.set_subtitle(&subtitle);
-    row.set_tooltip_text(Some(path));
-    row.add_prefix(&tile(icon, variant));
-    row
 }
 
 fn format_pending_item(item: &gonedrive_ipc::PendingItem) -> String {
@@ -421,23 +369,6 @@ fn format_pending_item(item: &gonedrive_ipc::PendingItem) -> String {
     }
 }
 
-fn relative_time(when: i64) -> String {
-    let now = glib::DateTime::now_utc()
-        .map(|time| time.to_unix())
-        .unwrap_or(when);
-    let elapsed = now.saturating_sub(when);
-    match elapsed {
-        i64::MIN..=59 => "刚刚".into(),
-        60..=3599 => format!("{} 分钟前", elapsed / 60),
-        3600..=86_399 => format!("{} 小时前", elapsed / 3600),
-        _ => glib::DateTime::from_unix_utc(when)
-            .and_then(|time| time.to_local())
-            .and_then(|time| time.format("%-m月%-d日"))
-            .map(|text| text.to_string())
-            .unwrap_or_else(|_| format!("{} 天前", elapsed / 86_400)),
-    }
-}
-
 pub fn human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
@@ -450,60 +381,5 @@ pub fn human(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use gtk::glib::{self, LogLevels};
-
-    use super::*;
-
-    #[test]
-    fn activity_rows_are_safe_to_refresh_in_realized_lists() {
-        if gtk::init().is_err() {
-            // Headless package builders still compile the GTK crate.
-            return;
-        }
-
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .build();
-        let window = gtk::Window::new();
-        window.set_child(Some(&list));
-        window.present();
-        let context = glib::MainContext::default();
-        while context.pending() {
-            context.iteration(false);
-        }
-
-        let previous_fatal =
-            glib::log_set_always_fatal(LogLevels::LEVEL_WARNING | LogLevels::LEVEL_CRITICAL);
-        let detail = "graph error 411: <!DOCTYPE HTML><HTML><HEAD><META></HEAD></HTML>";
-        let row = activity_row(&Activity {
-            kind: "failed".into(),
-            name: "remote-error.html".into(),
-            path: "OneDrive/Test/remote-error.html".into(),
-            detail: detail.into(),
-            when: 0,
-        });
-        list.append(&row);
-        while context.pending() {
-            context.iteration(false);
-        }
-        list.remove(&row);
-        list.append(&row);
-        while context.pending() {
-            context.iteration(false);
-        }
-        glib::log_set_always_fatal(previous_fatal);
-
-        assert!(!row.uses_markup());
-        assert!(!row.is_subtitle_selectable());
-        assert_eq!(row.title(), "remote-error.html");
-        let subtitle = row.subtitle().expect("activity subtitle");
-        assert!(subtitle.contains("OneDrive/Test/remote-error.html"));
-        assert!(subtitle.contains(detail));
-        window.close();
     }
 }
