@@ -3,9 +3,10 @@
 #
 #   GONEDRIVE_CLIENT_ID=<your-entra-app-id> ./build-deb.sh
 #
-# Produces gonedrive_<version>_<arch>.deb in the repository root. The client id
-# is baked into the binaries at build time, so the package ships ready to sign
-# in — set it to your own Entra application (client) id.
+# Produces gonedrive_<version>_<arch>.deb in the repository root. When supplied,
+# the client id is baked into the binaries so the package ships ready to sign
+# in. Without it the package still builds; users must set `client_id` in their
+# config before starting the daemon.
 #
 # The package installs:
 #   /usr/bin/{gonedrived,gonedrive,gonedrive-hsm}
@@ -17,7 +18,11 @@ set -euo pipefail
 umask 022
 cd "$(dirname "$0")"
 
-: "${GONEDRIVE_CLIENT_ID:?set GONEDRIVE_CLIENT_ID to your Entra application (client) id}"
+if [ -z "${GONEDRIVE_CLIENT_ID:-}" ]; then
+    echo ">> GONEDRIVE_CLIENT_ID is unset; building a package that requires user configuration."
+else
+    echo ">> Building with the configured GONEDRIVE_CLIENT_ID (value hidden)."
+fi
 
 VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
 ARCH=$(dpkg --print-architecture)
@@ -128,4 +133,8 @@ dpkg-deb --root-owner-group --build "$STAGE" "$OUT"
 echo
 echo "Done: $OUT"
 echo "Install/update with:  sudo apt install --reinstall ./$OUT   (or: sudo dpkg -i $OUT)"
-echo "Then sign in:  gonedrived login   (or open GOnedrive and click 登录)"
+if [ -z "${GONEDRIVE_CLIENT_ID:-}" ]; then
+    echo "Before sign-in: set client_id in ~/.config/gonedrive/config.toml"
+else
+    echo "Then sign in:  gonedrived login   (or open GOnedrive and click 登录)"
+fi

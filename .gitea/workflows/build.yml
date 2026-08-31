@@ -3,9 +3,10 @@
 # Prerequisites on your Gitea instance:
 #   1. A registered act_runner with the `ubuntu-latest` label and Docker
 #      support (this job runs inside an ubuntu:25.04 container).
-#   2. A repository (or org) secret GONEDRIVE_CLIENT_ID = your Entra app id.
-#      It is baked into the binaries at build time; without it the package
-#      builds but cannot sign in.
+#   2. Optional: an Actions variable GONEDRIVE_CLIENT_ID containing your Entra
+#      app id (a secret with the same name is also accepted for compatibility).
+#      It is baked into the binaries; without it the package still builds, but
+#      users must configure a client_id before signing in.
 #
 # On every push/PR the .deb is attached as a build artifact. Pushing a tag
 # like `v0.1.0` additionally creates a Gitea Release and uploads the .deb to
@@ -68,18 +69,33 @@ jobs:
           key: cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-
 
+      # An Entra application id is public configuration, so an Actions variable
+      # is the natural place for it. Keep accepting the former secret setting so
+      # existing installations do not silently lose their baked-in client id.
+      - name: Resolve Entra client id
+        env:
+          CLIENT_ID_VARIABLE: ${{ vars.GONEDRIVE_CLIENT_ID }}
+          CLIENT_ID_SECRET: ${{ secrets.GONEDRIVE_CLIENT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -n "${CLIENT_ID_VARIABLE:-}" ]; then
+            printf 'GONEDRIVE_CLIENT_ID=%s\n' "$CLIENT_ID_VARIABLE" >> "$GITHUB_ENV"
+            echo "Using GONEDRIVE_CLIENT_ID from the Actions variable (value hidden)."
+          elif [ -n "${CLIENT_ID_SECRET:-}" ]; then
+            printf 'GONEDRIVE_CLIENT_ID=%s\n' "$CLIENT_ID_SECRET" >> "$GITHUB_ENV"
+            echo "Using GONEDRIVE_CLIENT_ID from the Actions secret (value hidden)."
+          else
+            echo "::warning::GONEDRIVE_CLIENT_ID is not configured; the package will require per-user client_id configuration."
+          fi
+
       # --- quality gates -------------------------------------------------
       - name: Format check
         run: cargo fmt --all --check
 
       - name: Clippy
-        env:
-          GONEDRIVE_CLIENT_ID: ${{ secrets.GONEDRIVE_CLIENT_ID }}
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        env:
-          GONEDRIVE_CLIENT_ID: ${{ secrets.GONEDRIVE_CLIENT_ID }}
         run: cargo test --workspace
 
       - name: Nautilus extension tests
@@ -87,8 +103,6 @@ jobs:
 
       # --- the actual deliverable ---------------------------------------
       - name: Build .deb
-        env:
-          GONEDRIVE_CLIENT_ID: ${{ secrets.GONEDRIVE_CLIENT_ID }}
         run: ./build-deb.sh
 
       - name: Upload .deb artifact
