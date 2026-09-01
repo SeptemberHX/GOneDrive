@@ -1,17 +1,16 @@
-# Gitea Actions — build, test and package GOnedrive into a .deb.
+# Gitea Actions — staged CI/CD for GOnedrive.
 #
-# Prerequisites on your Gitea instance:
+# The jobs are deliberately separate so a failure is visible at the right
+# stage and a later stage can be retried without rerunning unrelated work:
+#   lint -> test -> build -> release (tag pushes only)
+#
+# Prerequisites on the Gitea instance:
 #   1. A registered act_runner with the `ubuntu-latest` label and Docker
-#      support (this job runs inside an ubuntu:25.04 container).
-#   2. Optional: an Actions variable GONEDRIVE_CLIENT_ID containing your Entra
-#      app id (a secret with the same name is also accepted for compatibility).
-#      It is baked into the binaries; without it the package still builds, but
-#      users must configure a client_id before signing in.
-#
-# On every push/PR the .deb is attached as a build artifact. Pushing a tag
-# like `v0.1.0` additionally creates a Gitea Release and uploads the .deb to
-# it (using the auto-provided GITHUB_TOKEN, no extra secret needed).
-name: Build & package
+#      support (jobs run inside an ubuntu:25.04 container).
+#   2. Optional: an Actions variable GONEDRIVE_CLIENT_ID containing the Entra
+#      app id (a secret with the same name is also accepted). It is baked into
+#      the package; without it users must configure client_id locally.
+name: CI / CD
 
 on:
   push:
@@ -21,41 +20,35 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  # -----------------------------------------------------------------------
+  # Stage 1: source formatting and compiler lints.
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
-    # ubuntu:25.04 ships GTK 4.18 / libadwaita 1.7 — the floor the code targets
-    # (features v4_18 / v1_7). Binaries built here also run on newer GTK
-    # (e.g. 26.04's 4.22). Bump this tag to move the build base forward.
     container:
+      # Ubuntu 25.04 is the minimum supported GTK/libadwaita build base.
       image: ubuntu:25.04
     steps:
-      # This runs before actions/checkout on purpose: it is a plain shell step
-      # (needs no Node), and it installs the Node that the JavaScript-based
-      # actions below (checkout, cache, upload-artifact) require. ubuntu:25.04
-      # is a minimal image with no Node, so without this checkout fails with
-      # "node: command not found" (exit 127) — nektos/act issue #107.
-      - name: Install system build dependencies
+      # The container is intentionally minimal and has no Node. Install it
+      # before checkout because checkout/cache are JavaScript actions.
+      - name: Install system dependencies
         run: |
+          set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential pkg-config git curl ca-certificates \
-            libgtk-4-dev libadwaita-1-dev \
-            nodejs \
-            dpkg-dev jq
+            libgtk-4-dev libadwaita-1-dev nodejs
 
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust (stable + rustfmt + clippy)
         run: |
+          set -euo pipefail
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          # rustup-init's --component takes one value per flag; add both here,
-          # where `rustup component add` accepts several. (cargo/rustup are not
-          # yet on PATH this step — GITHUB_PATH applies to later steps — so call
-          # rustup by full path.)
           "$HOME/.cargo/bin/rustup" component add rustfmt clippy
 
       - name: Cache cargo + target
@@ -66,12 +59,103 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-
+          key: cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-lint-
 
-      # An Entra application id is public configuration, so an Actions variable
-      # is the natural place for it. Keep accepting the former secret setting so
-      # existing installations do not silently lose their baked-in client id.
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # -----------------------------------------------------------------------
+  # Stage 2: Rust and extension tests. It does not depend on a client id.
+  test:
+    name: Test
+    needs: lint
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:25.04
+    steps:
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates \
+            libgtk-4-dev libadwaita-1-dev nodejs python3
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-test-
+
+      - name: Rust tests
+        run: cargo test --workspace --all-targets
+
+      - name: Nautilus extension tests
+        run: python3 -m unittest discover -s data/nautilus/tests -v
+
+  # -----------------------------------------------------------------------
+  # Stage 3: produce the Debian package. The client id is resolved only in
+  # this job, so it never needs to cross an artifact or be printed by CI.
+  build:
+    name: Build .deb
+    needs: test
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:25.04
+    steps:
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates \
+            libgtk-4-dev libadwaita-1-dev nodejs dpkg-dev jq
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-build-
+
+      # An Entra application id is public configuration, so an Actions
+      # variable is preferred. Keep accepting the old secret setting for
+      # existing repositories and installations.
       - name: Resolve Entra client id
         env:
           CLIENT_ID_VARIABLE: ${{ vars.GONEDRIVE_CLIENT_ID }}
@@ -88,22 +172,20 @@ jobs:
             echo "::warning::GONEDRIVE_CLIENT_ID is not configured; the package will require per-user client_id configuration."
           fi
 
-      # --- quality gates -------------------------------------------------
-      - name: Format check
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace
-
-      - name: Nautilus extension tests
-        run: python3 -m unittest discover -s data/nautilus/tests -v
-
-      # --- the actual deliverable ---------------------------------------
       - name: Build .deb
         run: ./build-deb.sh
+
+      - name: Verify package
+        run: |
+          set -euo pipefail
+          deb=$(find . -maxdepth 1 -type f -name 'gonedrive_*.deb' -print -quit)
+          test -n "$deb"
+          dpkg-deb --info "$deb" >/dev/null
+          contents=$(mktemp)
+          dpkg-deb --contents "$deb" > "$contents"
+          grep -q '/usr/bin/gonedrived$' "$contents"
+          grep -q '/usr/bin/gonedrive-hsm$' "$contents"
+          sha256sum "$deb"
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v3
@@ -112,17 +194,42 @@ jobs:
           path: gonedrive_*.deb
           if-no-files-found: error
 
-      # --- release on tag ------------------------------------------------
+  # -----------------------------------------------------------------------
+  # Stage 4: publish only a tagged build. The package comes from the build
+  # stage; this job never recompiles source or resolves credentials.
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:25.04
+    steps:
+      - name: Install release tools
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            nodejs curl ca-certificates jq
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: gonedrive-deb
+          path: dist
+
       - name: Publish Gitea Release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          deb=$(ls gonedrive_*.deb | head -1)
-          echo "Releasing $deb as $TAG"
+          deb=$(find dist -type f -name 'gonedrive_*.deb' -print -quit)
+          test -n "$deb"
+          echo "Releasing $(basename "$deb") as $TAG"
+
           # Create the release, or reuse it if the tag was released before.
           rid=$(curl -sf -X POST "$API/releases" \
                  -H "Authorization: token $TOKEN" \
@@ -133,7 +240,9 @@ jobs:
             rid=$(curl -sf "$API/releases/tags/$TAG" \
                    -H "Authorization: token $TOKEN" | jq -r '.id')
           fi
+          test -n "$rid" && test "$rid" != "null"
           curl -sf -X POST "$API/releases/$rid/assets?name=$(basename "$deb")" \
             -H "Authorization: token $TOKEN" \
-            -F "attachment=@$deb;type=application/vnd.debian.binary-package" >/dev/null
-          echo "Attached $deb to release $TAG (id $rid)"
+            -F "attachment=@$deb;type=application/vnd.debian.binary-package" \
+            >/dev/null
+          echo "Attached $(basename "$deb") to release $TAG (id $rid)"
