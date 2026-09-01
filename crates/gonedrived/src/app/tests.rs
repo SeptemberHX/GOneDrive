@@ -6,9 +6,40 @@ use gonedrive_ipc::reader_policy::FILE_MANAGER_COPY_READER;
 
 use super::{
     core_error_status, decide_stage, is_browsing_reader, missing_account_retry_due, outbound_scope,
-    pending_snapshot, phase_completion_state, phase_state, remote_poll_ready, sync_barrier_ready,
-    update_pending_status, PathLocks, StagePlan, KEYRING_LOCKED_MESSAGE, PARTIAL_HYDRATION_CEILING,
+    pending_snapshot, phase_completion_state, phase_state, remote_poll_ready,
+    summary_has_reportable_activity, sync_barrier_ready, update_pending_status, PathLocks,
+    StagePlan, KEYRING_LOCKED_MESSAGE, PARTIAL_HYDRATION_CEILING,
 };
+
+#[test]
+fn routine_delta_enumeration_does_not_generate_an_info_log() {
+    use gonedrive_core::sync::engine::SyncSummary;
+
+    let routine = SyncSummary {
+        enumerated: 1,
+        not_downloaded: 1,
+        still_queued: 3,
+        ..Default::default()
+    };
+    assert!(!summary_has_reportable_activity(&routine));
+
+    for reportable in [
+        SyncSummary {
+            downloaded: 1,
+            ..Default::default()
+        },
+        SyncSummary {
+            failed: 1,
+            ..Default::default()
+        },
+        SyncSummary {
+            refused_deletions: 1,
+            ..Default::default()
+        },
+    ] {
+        assert!(summary_has_reportable_activity(&reportable));
+    }
+}
 
 #[test]
 fn pending_status_comes_from_the_whole_durable_queue_with_paths() {
@@ -183,6 +214,80 @@ async fn hydration_locks_cover_the_whole_request_for_one_path() {
         .await
         .expect("second request should proceed after Filled releases the first")
         .unwrap();
+}
+
+#[tokio::test]
+async fn overlapping_space_operations_acquire_path_locks_without_deadlock() {
+    let locks = Arc::new(PathLocks::default());
+    let left = locks.clone();
+    let right = locks.clone();
+    let first = tokio::spawn(async move {
+        let paths = vec![
+            std::path::PathBuf::from("/tmp/b"),
+            std::path::PathBuf::from("/tmp/a"),
+        ];
+        let _guards = left.acquire_many(&paths).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    });
+    let second = tokio::spawn(async move {
+        let paths = vec![
+            std::path::PathBuf::from("/tmp/a"),
+            std::path::PathBuf::from("/tmp/b"),
+        ];
+        let _guards = right.acquire_many(&paths).await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        first.await.unwrap();
+        second.await.unwrap();
+    })
+    .await
+    .expect("overlapping subtree releases must not deadlock");
+}
+
+#[tokio::test]
+async fn release_barrier_keeps_late_events_blocked_until_every_release_finishes() {
+    let locks = PathLocks::default();
+    let path = std::path::PathBuf::from("/tmp/releasing");
+
+    // Two overlapping operations must not let the first completion clear the
+    // protection that the second operation still needs.
+    let first = locks.begin_release(std::slice::from_ref(&path));
+    let second = locks.begin_release(std::slice::from_ref(&path));
+    assert!(locks.is_releasing(&path));
+
+    drop(first);
+    assert!(locks.is_releasing(&path));
+    drop(second);
+    assert!(!locks.is_releasing(&path));
+}
+
+#[tokio::test]
+async fn a_queued_hydration_observes_the_release_barrier_after_waiting_for_the_path() {
+    let locks = Arc::new(PathLocks::default());
+    let path = std::path::PathBuf::from("/tmp/releasing");
+    let first = locks.acquire(&path).await;
+    let _release = locks.begin_release(std::slice::from_ref(&path));
+
+    let waiting = locks.clone();
+    let path_for_task = path.clone();
+    let task = tokio::spawn(async move {
+        let _guard = waiting.acquire(&path_for_task).await;
+        waiting.is_releasing(&path_for_task)
+    });
+    let mut task = task;
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut task)
+        .await
+        .is_err());
+    drop(first);
+
+    // The worker can acquire the path only after the in-flight operation has
+    // drained, but it still sees the barrier and must refuse a new fill.
+    let observed = tokio::time::timeout(Duration::from_secs(1), &mut task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(observed);
 }
 
 #[test]

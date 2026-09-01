@@ -51,6 +51,133 @@ async fn materialize_all_builds_a_browsable_placeholder_tree() {
 }
 
 #[tokio::test]
+async fn on_demand_population_stops_at_each_opened_directory_boundary() {
+    use gonedrive_core::hydrate::{DirectoryPopulation, Placeholder, PlaceholderState};
+
+    let h = Harness::with_config(Config {
+        client_id: "test".into(),
+        download_new: DownloadPolicy::Never,
+        on_demand: true,
+        ..Config::default()
+    })
+    .await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("A", ROOT, "A"),
+            file("A-FILE", "A", "a.txt", "c1", 10, "2026-08-20T10:00:00Z"),
+            folder("B", "A", "B"),
+            file("B-FILE", "B", "b.txt", "c1", 20, "2026-08-20T10:00:00Z"),
+            folder("C", "B", "C"),
+            file("C-FILE", "C", "c.txt", "c1", 30, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    assert_eq!(h.sync().await.failed, 0);
+
+    assert!(h.path("A").is_dir(), "the root's direct folder is published");
+    assert_eq!(
+        Placeholder::directory_population(&h.path("A")),
+        DirectoryPopulation::Partial
+    );
+    assert!(h.engine.folder_needs_population(Path::new("A")).unwrap());
+    assert!(!h.path("A/a.txt").exists());
+    assert!(!h.path("A/B").exists());
+
+    let first = h.engine.populate_folder(Path::new("A")).await.unwrap();
+    assert!(!h.engine.folder_needs_population(Path::new("A")).unwrap());
+    assert_eq!(first.files, 1);
+    assert_eq!(
+        Placeholder::directory_population(&h.path("A")),
+        DirectoryPopulation::Populated
+    );
+    assert_eq!(
+        Placeholder::state(&h.path("A/a.txt")),
+        PlaceholderState::Dehydrated
+    );
+    assert_eq!(
+        Placeholder::directory_population(&h.path("A/B")),
+        DirectoryPopulation::Partial
+    );
+    assert!(
+        !h.path("A/B/b.txt").exists() && !h.path("A/B/C").exists(),
+        "opening A must not recursively publish B's children"
+    );
+
+    let second = h.engine.populate_folder(Path::new("A/B")).await.unwrap();
+    assert_eq!(second.files, 1);
+    assert!(h.path("A/B/b.txt").exists());
+    assert!(h.path("A/B/C").is_dir());
+    assert!(
+        !h.path("A/B/C/c.txt").exists(),
+        "the next unopened directory remains metadata-only"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_folder_snapshot_cannot_roll_back_a_newer_delta() {
+    use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
+
+    let h = Harness::with_config(Config {
+        client_id: "test".into(),
+        download_new: DownloadPolicy::Never,
+        on_demand: true,
+        ..Config::default()
+    })
+    .await;
+    let protector = Arc::new(TestPlaceholderProtector::default());
+    h.engine.set_placeholder_protector(protector);
+    h.mock_delta(None, vec![folder("A", ROOT, "A")], "v1")
+        .await;
+    assert_eq!(h.sync().await.failed, 0);
+
+    h.server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/A/children"))
+        .and(query_param("$top", "1000"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(300))
+                .set_body_json(json!({
+                    "value": [file(
+                        "F", "A", "report.bin", "c1", 10,
+                        "2026-08-20T10:00:00Z"
+                    )]
+                })),
+        )
+        .mount(&h.server)
+        .await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![file(
+            "F",
+            "A",
+            "report.bin",
+            "c2",
+            20,
+            "2026-08-21T10:00:00Z",
+        )],
+        "v2",
+    )
+    .await;
+
+    let (population, delta) = tokio::join!(
+        h.engine.populate_folder(Path::new("A")),
+        h.engine.sync_remote()
+    );
+    population.unwrap();
+    delta.unwrap();
+
+    let path = h.path("A/report.bin");
+    assert_eq!(h.store.item("F").unwrap().unwrap().ctag.as_deref(), Some("c2"));
+    assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
+    assert_eq!(Placeholder::ctag(&path).as_deref(), Some("c2"));
+    assert_eq!(Occupancy::read(&path).unwrap().apparent_size, 20);
+}
+
+#[tokio::test]
 async fn on_demand_mode_places_new_files_from_delta() {
     // With the tree materialised, a file that appears later in a delta must
     // become a placeholder immediately, not wait for a full re-materialisation.
@@ -66,6 +193,10 @@ async fn on_demand_mode_places_new_files_from_delta() {
     h.mock_delta(None, vec![root_item(), folder("D1", ROOT, "Docs")], "v1")
         .await;
     h.sync().await;
+    h.engine
+        .populate_folder(Path::new("Docs"))
+        .await
+        .unwrap();
 
     h.server.reset().await;
     h.mock_delta(
@@ -110,6 +241,14 @@ async fn enabling_on_demand_at_runtime_applies_to_later_delta_items() {
     // This is what the MaterializeTree command does in a running daemon. The
     // mode must affect later polling without requiring a process restart.
     h.engine.enable_on_demand();
+    h.engine
+        .populate_folder(Path::new(""))
+        .await
+        .unwrap();
+    h.engine
+        .populate_folder(Path::new("Docs"))
+        .await
+        .unwrap();
 
     h.server.reset().await;
     h.mock_delta(
@@ -162,6 +301,14 @@ async fn a_web_restore_rebuilds_the_local_on_demand_subtree() {
     )
     .await;
     assert_eq!(h.sync().await.failed, 0);
+    h.engine
+        .populate_folder(Path::new("Todo"))
+        .await
+        .unwrap();
+    h.engine
+        .populate_folder(Path::new("Todo/2025 报销"))
+        .await
+        .unwrap();
     assert!(h.path("Todo/2025 报销/receipt.pdf").exists());
 
     // State immediately before this incident's web restore: the client's
@@ -189,8 +336,18 @@ async fn a_web_restore_rebuilds_the_local_on_demand_subtree() {
     .await;
     assert_eq!(h.sync().await.failed, 0);
 
-    let restored = h.path("Todo/2025 报销/receipt.pdf");
-    assert!(restored.exists(), "the restored cloud path must be visible again");
+    let restored_folder = h.path("Todo/2025 报销");
+    let restored = restored_folder.join("receipt.pdf");
+    assert!(restored_folder.is_dir(), "the restored folder must be visible again");
+    assert!(
+        !restored.exists(),
+        "a restored partial folder must not recursively publish descendants"
+    );
+    h.engine
+        .populate_folder(Path::new("Todo/2025 报销"))
+        .await
+        .unwrap();
+    assert!(restored.exists(), "opening the restored folder publishes its file");
     assert_eq!(Placeholder::state(&restored), PlaceholderState::Dehydrated);
     assert_eq!(Placeholder::item_id(&restored).as_deref(), Some("F1"));
 }
@@ -220,7 +377,11 @@ async fn a_remote_change_to_a_placeholder_refreshes_it_silently() {
         "v1",
     )
     .await;
-    h.sync().await; // on-demand: report.bin becomes a placeholder
+    h.sync().await;
+    h.engine
+        .populate_folder(Path::new("Docs"))
+        .await
+        .unwrap();
     let path = h.path("Docs/report.bin");
     assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
     assert_eq!(Occupancy::read(&path).unwrap().apparent_size, 1000);

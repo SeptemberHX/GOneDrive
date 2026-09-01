@@ -263,7 +263,12 @@ impl Ui {
                 ("<span foreground='#4aa3e8'>☁</span>", "仅在线", "")
             };
             let size = if entry.is_folder {
-                format!("{dot} {word}{extra} · {} 项", entry.items)
+                let count = if entry.items_known {
+                    format!("{} 项", entry.items)
+                } else {
+                    "项目数未知".into()
+                };
+                format!("{dot} {word}{extra} · {count}")
             } else {
                 format!("{dot} {word}{extra} · {}", human(entry.bytes))
             };

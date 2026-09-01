@@ -20,7 +20,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{watch, Mutex};
 
-use crate::app::{App, HydrationCapabilities, StageOutcome};
+use crate::app::{App, HydrationCapabilities, HydrationRequest, StageOutcome};
 
 use gonedrive_ipc::reader_policy::is_background_reader as background_reader;
 use registration::{fail_pending_marks, HelperFeatures, MarkWaiters, WatchedFiles};
@@ -34,6 +34,7 @@ pub struct HsmClient {
     next_request: AtomicU64,
     pending_marks: Arc<Mutex<MarkWaiters>>,
     watched: Arc<Mutex<WatchedFiles>>,
+    watched_directories: Arc<Mutex<WatchedFiles>>,
     features: watch::Receiver<HelperFeatures>,
     registration: Mutex<()>,
 }
@@ -47,7 +48,7 @@ struct HandlerState {
     features_tx: watch::Sender<HelperFeatures>,
     ready_tx: watch::Sender<bool>,
     pending_marks: Arc<Mutex<MarkWaiters>>,
-    watched: Arc<Mutex<WatchedFiles>>,
+    watched_directories: Arc<Mutex<WatchedFiles>>,
 }
 
 impl HsmClient {
@@ -78,12 +79,14 @@ impl HsmClient {
         let (features_tx, features) = watch::channel(HelperFeatures::default());
         let pending_marks = Arc::new(Mutex::new(HashMap::new()));
         let watched = Arc::new(Mutex::new(HashMap::new()));
+        let watched_directories = Arc::new(Mutex::new(HashMap::new()));
         let client = Self {
             writer: writer.clone(),
             closed,
             next_request: AtomicU64::new(1),
             pending_marks: pending_marks.clone(),
             watched: watched.clone(),
+            watched_directories: watched_directories.clone(),
             features,
             registration: Mutex::new(()),
         };
@@ -98,7 +101,7 @@ impl HsmClient {
             features_tx,
             ready_tx,
             pending_marks,
-            watched,
+            watched_directories,
         };
         tokio::spawn(async move {
             let mut reader = BufReader::new(read_half);
@@ -248,7 +251,7 @@ async fn handle(state: HandlerState, frame: Vec<u8>) {
         features_tx,
         ready_tx,
         pending_marks,
-        watched,
+        watched_directories,
     } = state;
     let event: Event = match serde_json::from_slice(&frame) {
         Ok(event) => event,
@@ -268,10 +271,9 @@ async fn handle(state: HandlerState, frame: Vec<u8>) {
             is_open,
         } => {
             let path = PathBuf::from(path);
-            // The single most useful line in this log: it names the process
-            // that keeps pulling files down. "gedit" is the user; an indexer
-            // or thumbnailer here belongs on the refusal list above.
-            tracing::info!(
+            // Range reads are extremely frequent (one large file can issue
+            // tens of thousands), so retain this diagnostic only at debug.
+            tracing::debug!(
                 path = %path.display(),
                 reader = %if reader.is_empty() { "unknown" } else { &reader },
                 offset,
@@ -282,7 +284,7 @@ async fn handle(state: HandlerState, frame: Vec<u8>) {
             // Policy lives here, unprivileged: a background sweep gets its
             // read refused before a byte is fetched or a window is shown.
             if let Some(matched) = background_reader(&reader) {
-                tracing::info!(reader = matched, "refusing a background reader");
+                tracing::debug!(reader = matched, "refusing a background reader");
                 let mut reply = match serde_json::to_string(&Request::Hydrated {
                     id,
                     ok: false,
@@ -309,17 +311,18 @@ async fn handle(state: HandlerState, frame: Vec<u8>) {
             let copy_detection =
                 file_manager_copy_detection.load(std::sync::atomic::Ordering::Relaxed);
             let (ok, source, offset, full) = match app
-                .stage_for(
-                    &path,
+                .stage_for(HydrationRequest {
+                    request_id: id,
+                    path: &path,
                     offset,
                     length,
-                    &reader,
+                    reader: &reader,
                     is_open,
-                    HydrationCapabilities {
+                    capabilities: HydrationCapabilities {
                         partial: allow_partial,
                         file_manager_copy_detection: copy_detection,
                     },
-                )
+                })
                 .await
             {
                 // Fill this window from a staged file.
@@ -357,37 +360,55 @@ async fn handle(state: HandlerState, frame: Vec<u8>) {
             let _ = writer.write_all(reply.as_bytes()).await;
             let _ = writer.flush().await;
         }
-        Event::Filled { ok, path, full, .. } => {
+        Event::Filled { id, ok, path, full } => {
             let path = PathBuf::from(path);
             // Remove this request's exact unique hand-off. Deriving the
             // ordinary download partial from `path` here once deleted an
             // unrelated scheduled download racing the same file.
-            app.cleanup_hydration_staging(&path).await;
+            app.cleanup_hydration_staging(&path, id).await;
             if ok && full {
-                watched.lock().await.remove(&path);
-                if let Err(e) = app.finish_hydration(&path).await {
+                if let Err(e) = app.finish_hydration(&path, id).await {
                     tracing::warn!(path = %path.display(), error = %e, "could not finalise");
                 }
             } else if ok {
                 // A range fill completes nothing — the file stays a placeholder
                 // — but the pwrite moved its mtime to now. Put the record's time
                 // back so browsing or a thumbnail never restamps a file.
-                if let Err(e) = app.restore_mtime(&path).await {
+                if let Err(e) = app.restore_mtime(&path, id).await {
                     tracing::debug!(path = %path.display(), error = %e, "could not restore mtime");
                 }
             } else if !full {
                 // A negotiated file-manager browse refusal did not start a
                 // hydration. It is an expected offline result, not a failed
                 // transfer and therefore has no state or UI event to unwind.
-            } else if let Err(e) = app.fail_hydration(&path).await {
+            } else if let Err(e) = app.fail_hydration(&path, id).await {
                 tracing::debug!(path = %path.display(), error = %e, "could not reset hydration");
             }
+        }
+        Event::DirectoryOpened {
+            id,
+            path,
+            reader,
+            pid,
+        } => {
+            let path = PathBuf::from(path);
+            let ok =
+                populate_opened_directory(&app, &watched_directories, &path, &reader, pid).await;
+            let mut reply = match serde_json::to_string(&Request::DirectoryPopulated { id, ok }) {
+                Ok(reply) => reply,
+                Err(_) => return,
+            };
+            reply.push('\n');
+            let mut writer = writer.lock().await;
+            let _ = writer.write_all(reply.as_bytes()).await;
+            let _ = writer.flush().await;
         }
         Event::Features {
             partial_hydration: partial,
             batch_marks,
             mark_sweeps,
             file_manager_copy_detection: copy_detection,
+            directory_open_notifications,
         } => {
             partial_hydration.store(partial, std::sync::atomic::Ordering::Relaxed);
             file_manager_copy_detection.store(copy_detection, std::sync::atomic::Ordering::Relaxed);
@@ -395,12 +416,14 @@ async fn handle(state: HandlerState, frame: Vec<u8>) {
                 received: true,
                 batch_marks,
                 mark_sweeps,
+                directory_open_notifications,
             });
             tracing::info!(
                 partial_hydration = partial,
                 batch_marks,
                 mark_sweeps,
                 file_manager_copy_detection = copy_detection,
+                directory_open_notifications,
                 "helper features"
             );
         }
@@ -446,6 +469,63 @@ async fn handle(state: HandlerState, frame: Vec<u8>) {
         }
         Event::Error { message } => tracing::warn!(message, "helper reported an error"),
         Event::Ok => {}
+    }
+}
+
+async fn populate_opened_directory(
+    app: &Arc<App>,
+    watched_directories: &Mutex<WatchedFiles>,
+    path: &Path,
+    reader: &str,
+    pid: i32,
+) -> bool {
+    if background_reader(reader).is_some() {
+        return true;
+    }
+    let watched_parent = match path.parent() {
+        Some(parent) => watched_directories.lock().await.contains_key(parent),
+        None => false,
+    };
+    if !watched_parent {
+        tracing::warn!(path = %path.display(), pid, reader, "helper reported an untracked directory open");
+        return false;
+    }
+    if gonedrive_core::hydrate::Placeholder::directory_population(path)
+        != gonedrive_core::hydrate::DirectoryPopulation::Partial
+    {
+        return true;
+    }
+    if gonedrive_ipc::reader_policy::is_file_manager_reader(reader) {
+        match app.desktop_open_decision(path).await {
+            crate::open_intent::OpenDecision::Explicit => {}
+            crate::open_intent::OpenDecision::Prefetch => {
+                tracing::debug!(path = %path.display(), pid, reader, "file-manager directory prefetch stayed offline");
+                return true;
+            }
+            crate::open_intent::OpenDecision::Unavailable => {
+                tracing::debug!(path = %path.display(), "desktop intent monitor unavailable; using compatibility population");
+            }
+        }
+    }
+    let Ok(relative) = path.strip_prefix(&app.config.sync_root) else {
+        tracing::warn!(path = %path.display(), "helper reported a directory outside the sync root");
+        return false;
+    };
+    tracing::debug!(path = %path.display(), pid, reader, "foreground directory population");
+    match app.populate_folder(relative).await {
+        Ok(outcome) => {
+            tracing::debug!(
+                path = %path.display(),
+                files = outcome.files,
+                skipped = outcome.skipped.len(),
+                "directory populated"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "could not populate opened directory");
+            false
+        }
     }
 }
 

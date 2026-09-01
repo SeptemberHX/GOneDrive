@@ -8,6 +8,7 @@ pub use upload::{file_fingerprint, upload_file, UploadTarget};
 use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
 
@@ -63,6 +64,12 @@ use std::time::Duration;
 
 /// Suffix for the temporary file a download is written to.
 const PARTIAL_SUFFIX: &str = ".gonedrive-partial";
+
+/// Linux filesystems commonly cap one directory entry at 255 bytes. A valid
+/// remote name can sit right at that boundary, so appending our scratch suffix
+/// verbatim would make the *internal* name invalid even though the destination
+/// itself is representable.
+const LOCAL_NAME_MAX_BYTES: usize = 255;
 
 /// Identity and high-resolution timestamps for a local file at one instant.
 ///
@@ -510,7 +517,20 @@ pub fn staging_sibling(path: &Path) -> PathBuf {
     let mut name = std::ffi::OsString::from(".");
     name.push(path.file_name().unwrap_or_default());
     name.push(PARTIAL_SUFFIX);
-    path.with_file_name(name)
+    if os_name_len(&name) <= LOCAL_NAME_MAX_BYTES {
+        return path.with_file_name(name);
+    }
+
+    // Downloads resume through this deterministic name after a restart. Hash
+    // only the destination component: siblings share a directory, and distinct
+    // long names still receive distinct scratch files without leaking length.
+    let original = os_name_bytes(path.file_name().unwrap_or_default());
+    let digest = Sha256::digest(original);
+    path.with_file_name(format!(
+        ".gonedrive-download-{}{}",
+        hex::encode(&digest[..16]),
+        PARTIAL_SUFFIX
+    ))
 }
 
 /// A unique hand-off file for one fanotify hydration request.
@@ -520,14 +540,38 @@ pub fn staging_sibling(path: &Path) -> PathBuf {
 /// download's staging name: the helper deletes its hand-off after filling, and
 /// deleting an unrelated background download at that point corrupts both.
 pub fn hydration_staging_sibling(path: &Path) -> PathBuf {
+    unique_staging_sibling(path, "hydration")
+}
+
+/// A hidden, unique sibling used to publish a safety-locked placeholder with a
+/// single no-replace rename. It retains the ordinary partial suffix so both the
+/// scanner and startup janitor treat a crash residue as internal scratch.
+pub fn placeholder_staging_sibling(path: &Path) -> PathBuf {
+    unique_staging_sibling(path, "placeholder")
+}
+
+fn unique_staging_sibling(path: &Path, purpose: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut name = std::ffi::OsString::from(".");
-    name.push(path.file_name().unwrap_or_default());
-    name.push(format!(".gonedrive-hydration-{}-{id}", std::process::id()));
-    name.push(PARTIAL_SUFFIX);
-    path.with_file_name(name)
+    // These hand-offs never resume and NEXT already provides uniqueness, so
+    // carrying the user-visible name serves no purpose and can exceed NAME_MAX.
+    path.with_file_name(format!(
+        ".gonedrive-{purpose}-{}-{id}{}",
+        std::process::id(),
+        PARTIAL_SUFFIX
+    ))
+}
+
+#[cfg(unix)]
+fn os_name_bytes(name: &std::ffi::OsStr) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt;
+    name.as_bytes()
+}
+
+#[cfg(unix)]
+fn os_name_len(name: &std::ffi::OsStr) -> usize {
+    os_name_bytes(name).len()
 }
 
 #[cfg(test)]

@@ -24,7 +24,7 @@ mod items;
 mod pending;
 mod uploads;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 14;
 
 const ACTIVITY_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS activity (
@@ -219,6 +219,9 @@ pub struct ItemRecord {
     pub parent_id: Option<String>,
     pub name: String,
     pub is_folder: bool,
+    /// Graph's direct child count for a folder. It is `None` when the remote
+    /// response omitted the facet; it is never a recursive subtree total.
+    pub child_count: Option<u64>,
     pub size: u64,
     pub etag: Option<String>,
     pub ctag: Option<String>,
@@ -261,6 +264,7 @@ impl ItemRecord {
             parent_id: None,
             name: name.into(),
             is_folder: false,
+            child_count: None,
             size: 0,
             etag: None,
             ctag: None,
@@ -467,6 +471,125 @@ impl Store {
             if version < 10 {
                 tx.execute_batch("ALTER TABLE activity ADD COLUMN path TEXT NOT NULL DEFAULT '';")?;
             }
+            if version < 11 {
+                // Initial delta enumeration can take minutes on a large drive.
+                // Remember which final-per-id rows have already been applied so
+                // each page can become visible without reprocessing every older
+                // page. A replacement occurrence resets `applied` in
+                // `stage_delta_page`, preserving Graph's last-occurrence rule.
+                tx.execute_batch(
+                    "ALTER TABLE delta_staging
+                         ADD COLUMN applied INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE delta_staging
+                         ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;
+                     CREATE INDEX delta_staging_pending
+                         ON delta_staging(account_id, applied, deleted, sequence);
+
+                     CREATE TABLE remote_exclusions (
+                         account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                         item_id    TEXT NOT NULL,
+                         parent_id  TEXT,
+                         reason     TEXT NOT NULL,
+                         seen_gen   INTEGER NOT NULL DEFAULT 0,
+                         PRIMARY KEY (account_id, item_id)
+                     );
+                     CREATE INDEX remote_exclusions_by_parent
+                         ON remote_exclusions(account_id, parent_id);",
+                )?;
+                // Existing v10 batches already contain serialized DriveItems.
+                // Derive tombstones with a structured parser; leaving every old
+                // row at the column default would let an incomplete legacy
+                // batch apply remote deletions as progressive upserts.
+                let tombstones = {
+                    let mut stmt =
+                        tx.prepare("SELECT account_id, item_id, payload FROM delta_staging")?;
+                    let rows = stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?;
+                    let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+                    rows.into_iter()
+                        .filter_map(|(account_id, item_id, payload)| {
+                            serde_json::from_str::<serde_json::Value>(&payload)
+                                .ok()?
+                                .get("deleted")
+                                .is_some_and(|facet| !facet.is_null())
+                                .then_some((account_id, item_id))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for (account_id, item_id) in tombstones {
+                    tx.execute(
+                        "UPDATE delta_staging SET deleted = 1
+                          WHERE account_id = ?1 AND item_id = ?2",
+                        params![account_id, item_id],
+                    )?;
+                }
+            }
+            if version < 12 {
+                // Directory placeholders are independently populated. Keeping
+                // this state in SQLite as well as an xattr lets delta decide
+                // whether to publish a child without opening the directory;
+                // an open would itself look like a user browse to inotify and
+                // recursively populate the tree during a background pass.
+                tx.execute_batch(
+                    "CREATE TABLE folder_population (
+                         account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                         item_id    TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                         populated INTEGER NOT NULL CHECK (populated IN (0, 1)),
+                         PRIMARY KEY (account_id, item_id)
+                     );",
+                )?;
+            }
+            if version < 13 {
+                // A delta item can arrive without an ancestor that this lazy
+                // client has indexed yet. Keeping the exact payload lets the
+                // global cursor advance without losing the item, while local
+                // reconciliation can freeze that remote identity until its
+                // parent chain becomes known and the change is replayed.
+                tx.execute_batch(
+                    "CREATE TABLE deferred_remote_changes (
+                         account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                         item_id    TEXT NOT NULL,
+                         parent_id  TEXT,
+                         payload    TEXT NOT NULL,
+                         updated_at INTEGER NOT NULL,
+                         PRIMARY KEY (account_id, item_id)
+                     );
+                     CREATE INDEX deferred_remote_by_parent
+                         ON deferred_remote_changes(account_id, parent_id);",
+                )?;
+            }
+            if version < 14 {
+                // A lazy tree does not index a folder's children until that
+                // folder is opened. Keep Graph's direct childCount on the
+                // folder itself so a parent listing can show a useful count
+                // without recursively fetching or publishing the subtree.
+                // The small migration fixture used by older tests has no
+                // `items` table; tolerate that partial schema and let the
+                // base schema create the column when a real store is opened.
+                let has_items: bool = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                          WHERE type = 'table' AND name = 'items'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if has_items {
+                    let columns = {
+                        let mut stmt = tx.prepare("PRAGMA table_info(items)")?;
+                        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                        rows.collect::<std::result::Result<Vec<_>, _>>()?
+                    };
+                    if !columns.iter().any(|name| name == "child_count") {
+                        tx.execute_batch("ALTER TABLE items ADD COLUMN child_count INTEGER")?;
+                    }
+                }
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
             Ok(())
@@ -655,6 +778,9 @@ CREATE TABLE IF NOT EXISTS items (
     name         TEXT NOT NULL,
     name_folded  TEXT NOT NULL,
     is_folder    INTEGER NOT NULL,
+    -- Graph's direct folder childCount. NULL means the service did not include
+    -- a summary yet; it is deliberately not a recursive subtree count.
+    child_count  INTEGER,
     size         INTEGER NOT NULL DEFAULT 0,
     etag         TEXT,
     ctag         TEXT,

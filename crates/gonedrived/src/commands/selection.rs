@@ -62,7 +62,11 @@ pub(crate) fn list(path: PathBuf) -> Result<()> {
             entry.item.name.clone()
         };
         let count = if entry.item.is_folder {
-            format!("{} item(s)", entry.items)
+            if entry.items_known {
+                format!("{} item(s)", entry.items)
+            } else {
+                "item count unavailable".into()
+            }
         } else {
             String::new()
         };

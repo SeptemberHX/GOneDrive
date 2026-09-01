@@ -92,6 +92,12 @@ pub struct Config {
     /// Present remote files as sparse placeholders and hydrate them on access.
     pub on_demand: bool,
 
+    /// Keep desktop indexers out of the sync root. Linux indexers do not
+    /// understand cloud placeholders and recursively opening partial folders
+    /// would both waste power and accidentally populate the whole namespace.
+    /// The daemon implements this with the standard `.trackerignore` marker.
+    pub exclude_desktop_indexer: bool,
+
     /// Storage-sense style automatic space recovery: when free space drops
     /// below this, downloaded-but-unpinned files are turned back into
     /// placeholders, least recently used first, until it is above it again.
@@ -166,6 +172,7 @@ impl Default for Config {
             download_limit_bytes_per_sec: 0,
             upload_limit_bytes_per_sec: 0,
             on_demand: false,
+            exclude_desktop_indexer: true,
             download_new: DownloadPolicy::Never,
             mass_delete_fraction: 0.5,
             mass_delete_min: 10,

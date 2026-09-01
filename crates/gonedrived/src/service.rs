@@ -81,6 +81,28 @@ impl DaemonService {
             ),
         })
     }
+
+    /// Browsing the root is safe and necessary; unlike mutation actions this
+    /// accepts the empty relative path while retaining the same confinement.
+    async fn browse_relative(&self, path: &str) -> zbus::fdo::Result<std::path::PathBuf> {
+        let accounts = self
+            .app
+            .accounts()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let root = accounts
+            .first()
+            .map(|a| std::path::PathBuf::from(&a.root_path))
+            .ok_or_else(|| zbus::fdo::Error::Failed("no account is signed in".into()))?;
+        match confine_to_root(&root, path) {
+            Ok(relative) => Ok(relative),
+            Err(ConfineError::WholeRoot) => Ok(std::path::PathBuf::new()),
+            Err(ConfineError::Outside) => Err(zbus::fdo::Error::InvalidArgs(format!(
+                "{path} is outside {}",
+                root.display()
+            ))),
+        }
+    }
 }
 
 #[interface(name = "org.gonedrive.Daemon1")]
@@ -237,6 +259,23 @@ impl DaemonService {
             .make_on_demand(&relative)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(outcome.files)
+    }
+
+    async fn populate_folder(&self, path: &str) -> zbus::fdo::Result<u64> {
+        let relative = self.browse_relative(path).await?;
+        let outcome = self
+            .app
+            .populate_folder(&relative)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        if !outcome.skipped.is_empty() {
+            tracing::warn!(
+                path = %relative.display(),
+                skipped = outcome.skipped.len(),
+                "some directory entries could not be populated"
+            );
+        }
         Ok(outcome.files)
     }
 

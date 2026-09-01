@@ -1145,6 +1145,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "xattr",
  "zbus",
 ]
 

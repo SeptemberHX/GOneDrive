@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::app::App;
 use crate::commands::load_config;
@@ -15,8 +15,30 @@ use crate::{hsm_client, service, watcher};
 const HSM_REGISTRATION_RETRY: Duration = Duration::from_secs(30);
 
 pub(crate) async fn run() -> Result<()> {
-    let config = load_config()?;
+    let config_exists = gonedrive_core::config::config_file().exists();
+    let mut config = load_config()?;
+    apply_first_run_defaults(&mut config, config_exists);
     let app = App::new(config).await?;
+
+    // The UI can sign in after this process has started. Establish the watch
+    // before that happens so the first session has the same real-time local
+    // change handling as every later restart.
+    std::fs::create_dir_all(&app.config.sync_root).with_context(|| {
+        format!(
+            "could not create sync root {}",
+            app.config.sync_root.display()
+        )
+    })?;
+
+    // Linux desktop indexers do not understand partial cloud directories.
+    // Process-aware HSM callbacks refuse to populate for them, while the
+    // standard exclusion avoids the otherwise pointless recursive namespace
+    // walk and permission-event traffic in the first place.
+    if let Err(error) =
+        crate::indexer::ensure_policy(&app.config.sync_root, app.config.exclude_desktop_indexer)
+    {
+        tracing::warn!(%error, "could not apply desktop-indexer policy");
+    }
 
     let has_configured_account = !app.store.accounts()?.is_empty();
     let accounts = app.load_accounts().await?;
@@ -45,26 +67,22 @@ pub(crate) async fn run() -> Result<()> {
 
     // Keep the watcher alive for the daemon's lifetime; dropping it stops the
     // watch and the client silently falls back to poll-only.
-    let (_watcher, local_changes, open_writes) = if has_configured_account {
-        watcher::check_watch_limit(&app.config.sync_root);
-        match LocalWatcher::start(
-            &app.config.sync_root,
-            Duration::from_millis(app.config.local_debounce_ms),
-        ) {
-            Ok((watcher, changes)) => {
-                let open_writes = watcher.open_writes();
-                (Some(watcher), Some(changes), open_writes)
-            }
-            Err(e) => {
-                // Not fatal: the periodic scan still converges, just less
-                // promptly, and saying so beats appearing to work perfectly.
-                tracing::warn!(error = %e, "watching for local changes failed; \
-                                            falling back to periodic scans only");
-                (None, None, watcher::OpenWrites::default())
-            }
+    watcher::check_watch_limit(&app.config.sync_root);
+    let (_watcher, local_changes, open_writes) = match LocalWatcher::start(
+        &app.config.sync_root,
+        Duration::from_millis(app.config.local_debounce_ms),
+    ) {
+        Ok((watcher, changes)) => {
+            let open_writes = watcher.open_writes();
+            (Some(watcher), Some(changes), open_writes)
         }
-    } else {
-        (None, None, watcher::OpenWrites::default())
+        Err(e) => {
+            // Not fatal: the periodic scan still converges, just less
+            // promptly, and saying so beats appearing to work perfectly.
+            tracing::warn!(error = %e, "watching for local changes failed; \
+                                        falling back to periodic scans only");
+            (None, None, watcher::OpenWrites::default())
+        }
     };
 
     app.clone()
@@ -72,6 +90,16 @@ pub(crate) async fn run() -> Result<()> {
         .await;
     drop(connection);
     Ok(())
+}
+
+/// The desktop client promises a Windows-style browsable placeholder tree.
+/// Keep one-shot CLI commands conservative, but make a brand-new daemon
+/// profile honour that promise. Once a configuration exists its explicit
+/// choice always wins; a successful login persists this first-run value.
+fn apply_first_run_defaults(config: &mut gonedrive_core::config::Config, config_exists: bool) {
+    if !config_exists {
+        config.on_demand = true;
+    }
 }
 
 /// Keep the daemon attached to the files-on-demand helper.
@@ -196,7 +224,29 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use gonedrive_core::config::Config;
+
+    use super::apply_first_run_defaults;
+
     const USER_UNIT: &str = include_str!("../../../data/gonedrived.service");
+
+    #[test]
+    fn a_new_daemon_profile_starts_in_files_on_demand_mode() {
+        let mut config = Config::default();
+
+        apply_first_run_defaults(&mut config, false);
+
+        assert!(config.on_demand);
+    }
+
+    #[test]
+    fn an_explicit_selective_sync_setting_is_preserved() {
+        let mut config = Config::default();
+
+        apply_first_run_defaults(&mut config, true);
+
+        assert!(!config.on_demand);
+    }
 
     #[test]
     fn user_unit_keeps_openat2_create_available() {
@@ -206,5 +256,11 @@ mod tests {
                 .any(|line| line.trim() == "RestrictSUIDSGID=true"),
             "RestrictSUIDSGID makes systemd reject RootedFs openat2(O_CREAT) calls"
         );
+    }
+
+    #[test]
+    fn user_unit_bounds_journal_writes() {
+        assert!(USER_UNIT.contains("LogRateLimitIntervalSec=1min"));
+        assert!(USER_UNIT.contains("LogRateLimitBurst=30"));
     }
 }

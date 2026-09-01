@@ -6,10 +6,10 @@ use time::OffsetDateTime;
 
 use crate::db::{Account, ItemState, PinState, Store};
 use crate::error::{Error, Result};
-use crate::hydrate::{Placeholder, PlaceholderState};
+use crate::hydrate::{DirectoryPopulation, Placeholder, PlaceholderState};
 use crate::sync::plan::LocalStat;
 
-use super::super::engine::{Engine, FreeSpaceOutcome};
+use super::super::engine::{Engine, FreeSpaceOutcome, SyncEvent};
 use super::super::rooted_fs::RootedFs;
 use super::super::transfer;
 
@@ -46,40 +46,33 @@ pub fn placeholder_inventory_for_account(
     // hydration interrupted by a crash leaves the record saying `Hydrating`
     // while the file on disk is still empty, and trusting the record there
     // would leave that file unwatched and silently readable as zeroes.
-    for state in [
-        ItemState::Dehydrated,
-        ItemState::Hydrating,
-        ItemState::Error,
-    ] {
-        for record in store.items_in_state(&account.id, state)? {
-            if record.is_folder {
+    for record in store.placeholder_inventory_candidates(&account.id)? {
+        let Some(path) = store.local_path(account, &record.id)? else {
+            continue;
+        };
+        let file = match rooted.open_read(&path) {
+            Ok(file) => file,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                if missing_placeholder_was_published(store, account, &rooted, &record, &path)? {
+                    inventory.missing.push(record.id);
+                }
                 continue;
             }
-            let Some(path) = store.local_path(account, &record.id)? else {
-                continue;
-            };
-            let file = match rooted.open_read(&path) {
-                Ok(file) => file,
-                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                    inventory.missing.push(record.id);
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                use std::os::unix::fs::MetadataExt;
+                let path_file = rooted.open_path(&path)?;
+                if path_file.metadata()?.mode() & 0o7777 == 0 {
+                    inventory.existing.push(path);
                     continue;
                 }
-                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    use std::os::unix::fs::MetadataExt;
-                    let path_file = rooted.open_path(&path)?;
-                    if path_file.metadata()?.mode() & 0o7777 == 0 {
-                        inventory.existing.push(path);
-                        continue;
-                    }
-                    return Err(Error::Io(error));
-                }
-                Err(error) => return Err(error),
-            };
-            if Placeholder::item_id_file(&file).as_deref() == Some(&record.id)
-                && Placeholder::state_file(&file) == PlaceholderState::Dehydrated
-            {
-                inventory.existing.push(path);
+                return Err(Error::Io(error));
             }
+            Err(error) => return Err(error),
+        };
+        if Placeholder::item_id_file(&file).as_deref() == Some(&record.id)
+            && Placeholder::state_file(&file) == PlaceholderState::Dehydrated
+        {
+            inventory.existing.push(path);
         }
     }
     inventory.existing.sort();
@@ -87,6 +80,79 @@ pub fn placeholder_inventory_for_account(
     inventory.missing.sort();
     inventory.missing.dedup();
     Ok(inventory)
+}
+
+/// Populated directories that define lazy-enumeration boundaries for their
+/// direct child directories. One mark on a populated parent covers any number
+/// of partial children, keeping startup work proportional to browsed folders.
+pub fn population_watch_directories_for_account(
+    store: &Store,
+    account: &Account,
+) -> Result<Vec<PathBuf>> {
+    let rooted = RootedFs::open(&account.root_local_path)?;
+    let mut paths = Vec::new();
+    for record in store.population_watch_candidates(&account.id)? {
+        let Some(path) = store.local_path(account, &record.id)? else {
+            continue;
+        };
+        let dir = match rooted.open_read(&path) {
+            Ok(dir) if dir.metadata()?.is_dir() => dir,
+            Ok(_) => continue,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if Placeholder::item_id_file(&dir).as_deref() == Some(record.id.as_str())
+            && Placeholder::directory_population_file(&dir) == DirectoryPopulation::Populated
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn missing_placeholder_was_published(
+    store: &Store,
+    account: &Account,
+    rooted: &RootedFs,
+    record: &crate::db::ItemRecord,
+    path: &Path,
+) -> Result<bool> {
+    // Once an inode was observed, its absence needs repair/reconciliation even
+    // if its parent later became partial. The normal case for lazy metadata has
+    // no local observation and is governed by its parent's population marker.
+    if record.local_ino.is_some() {
+        return Ok(true);
+    }
+    if record.parent_id.as_deref() == account.root_item_id.as_deref() {
+        return Ok(true);
+    }
+    let Some(parent_id) = record.parent_id.as_deref() else {
+        return Ok(false);
+    };
+    if store.folder_population(&account.id, parent_id)? == Some(false) {
+        return Ok(false);
+    }
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    let dir = match rooted.open_read(parent) {
+        Ok(dir) if dir.metadata()?.is_dir() => dir,
+        Ok(_) => return Ok(false),
+        // No population row means a pre-lazy tree. Preserve its historical
+        // repair behaviour; only an explicit partial row proves the inode was
+        // intentionally never published.
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    Ok(match Placeholder::directory_population_file(&dir) {
+        DirectoryPopulation::Populated => true,
+        DirectoryPopulation::Partial => false,
+        DirectoryPopulation::Unmanaged => {
+            Placeholder::item_id_file(&dir).as_deref() == Some(parent_id)
+        }
+    })
 }
 
 impl Engine {
@@ -219,14 +285,218 @@ impl Engine {
         Ok(outcome)
     }
 
-    /// Materialise the whole drive as a browsable placeholder tree.
+    /// Publish one directory's direct children and mark that directory fully
+    /// populated. Remote metadata for deeper descendants stays in SQLite until
+    /// their own parent is browsed, matching Cloud Files' FETCH_PLACEHOLDERS
+    /// contract without making first login create the whole drive's inodes.
+    pub async fn populate_folder(&self, relative: &Path) -> Result<FreeSpaceOutcome> {
+        let _population = self.folder_population.lock().await;
+        let account = self.account()?;
+        let rooted = self.rooted(&account)?;
+        let root_id = account.root_item_id.clone().ok_or_else(|| {
+            Error::other("the drive has not been enumerated yet; run a sync first")
+        })?;
+        let mut target = self
+            .store
+            .item_at_path(&self.account_id, &root_id, relative)?
+            .ok_or_else(|| Error::other(format!("no such folder: {}", relative.display())))?;
+        if !target.is_folder {
+            return Err(Error::other(format!(
+                "{} is not a folder",
+                relative.display()
+            )));
+        }
+        let target_path = self
+            .store
+            .local_path(&account, &target.id)?
+            .ok_or_else(|| Error::other(format!("no local path for {}", target.id)))?;
+        rooted.ensure_dir(&target_path)?;
+        let target_dir = rooted.open_read(&target_path)?;
+        if !target_dir.metadata()?.is_dir() {
+            return Err(Error::other(format!(
+                "{} is occupied by a file",
+                target_path.display()
+            )));
+        }
+
+        // Repeated InfoProvider callbacks are common while Nautilus redraws.
+        // Once populated, delta itself maintains direct additions and removals.
+        let disk_population = Placeholder::directory_population_file(&target_dir);
+        if disk_population == DirectoryPopulation::Populated {
+            self.store
+                .set_folder_population(&self.account_id, &target.id, true)?;
+            self.record_directory_local_stat(&target.id, &target_dir)?;
+            return Ok(FreeSpaceOutcome::default());
+        }
+
+        // A partial directory intentionally has no complete child set in SQLite.
+        // Fetch only its direct children; the delta cursor was established first
+        // and reconciles changes that race this non-snapshot pagination.
+        if disk_population == DirectoryPopulation::Partial
+            || self.store.folder_population(&self.account_id, &target.id)? == Some(false)
+        {
+            let mut summary = super::super::engine::SyncSummary::default();
+            self.fetch_folder_children(&account, &target.id, &mut summary)
+                .await?;
+            target = self
+                .store
+                .item(&target.id)?
+                .ok_or_else(|| Error::other("folder disappeared while it was populated"))?;
+        }
+
+        let mut outcome = FreeSpaceOutcome::default();
+        for child in self.store.children(&self.account_id, &target.id)? {
+            let Some(path) = self.store.local_path(&account, &child.id)? else {
+                continue;
+            };
+            let result = if child.is_folder {
+                self.publish_child_directory(&rooted, &child, &path)
+                    .map(|()| None)
+            } else {
+                self.publish_child_placeholder(&account, &rooted, &child, &path)
+                    .map(Some)
+            };
+            match result {
+                Ok(Some(path)) => {
+                    outcome.files = outcome.files.saturating_add(1);
+                    outcome.paths.push(path);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let detail = error.to_string();
+                    let _ = self.store.set_item_state(&child.id, ItemState::Error);
+                    self.emit(SyncEvent::Failed {
+                        name: child.name,
+                        path: Some(path.clone()),
+                        error: detail.clone(),
+                    });
+                    outcome.skipped.push((path, detail));
+                }
+            }
+        }
+
+        // New file placeholders are published fail-closed (mode 000) until the
+        // HSM has registered their exact inodes. Do not advertise this directory
+        // as populated before that acknowledgement: otherwise a failed HSM call
+        // leaves visible but unreadable entries and a later browse has no reason
+        // to retry the population request.
+        self.protect_pending_placeholders().await?;
+
+        if Placeholder::state_file(&target_dir) == PlaceholderState::Unmanaged {
+            Placeholder::mark_dir_file(&target_dir, PlaceholderState::Dehydrated, &target.id)?;
+        }
+        Placeholder::set_directory_population_file(&target_dir, DirectoryPopulation::Populated)?;
+        self.store
+            .set_folder_population(&self.account_id, &target.id, true)?;
+        self.mark_dir(&target.id)?;
+        let _ = self.recompute_folder_mark(&account, &target.id);
+        self.stamp_directories(&account)?;
+        self.record_directory_local_stat(&target.id, &target_dir)?;
+        Ok(outcome)
+    }
+
+    fn publish_child_directory(
+        &self,
+        rooted: &RootedFs,
+        child: &crate::db::ItemRecord,
+        path: &Path,
+    ) -> Result<()> {
+        let expected_population = match self.store.folder_population(&self.account_id, &child.id)? {
+            Some(false) => DirectoryPopulation::Partial,
+            // `None` is a directory indexed by a pre-partial-population full
+            // delta. Its child set is already complete and must stay usable
+            // offline when an existing profile enables files-on-demand.
+            Some(true) | None => DirectoryPopulation::Populated,
+        };
+        match rooted.open_read(path) {
+            Ok(dir) if dir.metadata()?.is_dir() => {
+                Placeholder::mark_dir_file(&dir, PlaceholderState::Dehydrated, &child.id)?;
+                if Placeholder::directory_population_file(&dir) == DirectoryPopulation::Unmanaged {
+                    Placeholder::set_directory_population_file(&dir, expected_population)?;
+                }
+            }
+            Ok(_) => {
+                return Err(Error::other(format!(
+                    "{} must be a directory but is occupied by a file",
+                    path.display()
+                )))
+            }
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                rooted.ensure_dir(path)?;
+                let dir = rooted.open_read(path)?;
+                Placeholder::mark_dir_file(&dir, PlaceholderState::Dehydrated, &child.id)?;
+                Placeholder::set_directory_population_file(&dir, expected_population)?;
+            }
+            Err(error) => return Err(error),
+        }
+        let population = Placeholder::directory_population_file(&rooted.open_read(path)?);
+        self.store.set_folder_population(
+            &self.account_id,
+            &child.id,
+            population == DirectoryPopulation::Populated,
+        )?;
+        let dir = rooted.open_read(path)?;
+        self.record_directory_local_stat(&child.id, &dir)?;
+        self.mark_dir(&child.id)
+    }
+
+    fn record_directory_local_stat(&self, item_id: &str, dir: &std::fs::File) -> Result<()> {
+        let local = LocalStat::from_metadata(&dir.metadata()?);
+        self.store.set_local_stat(
+            item_id,
+            OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
+            Some(local.size),
+            Some(local.ino),
+        )?;
+        Ok(())
+    }
+
+    fn publish_child_placeholder(
+        &self,
+        account: &Account,
+        rooted: &RootedFs,
+        child: &crate::db::ItemRecord,
+        path: &Path,
+    ) -> Result<PathBuf> {
+        match rooted.open_read(path) {
+            Ok(file)
+                if file.metadata()?.is_file()
+                    && Placeholder::state_file(&file) == PlaceholderState::Dehydrated
+                    && Placeholder::item_id_file(&file).as_deref() == Some(&child.id) =>
+            {
+                return Ok(path.to_path_buf())
+            }
+            Ok(_) => {
+                return Err(Error::other(format!(
+                    "{} is occupied by local content",
+                    path.display()
+                )))
+            }
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.create_placeholder_at(
+            account,
+            path,
+            child.size,
+            &child.id,
+            child.ctag.as_deref(),
+            child.remote_mtime,
+        )?;
+        self.store
+            .set_item_state(&child.id, ItemState::Dehydrated)?;
+        self.note_placeholder(path);
+        Ok(path.to_path_buf())
+    }
+
+    /// Materialise every item currently indexed as a placeholder tree.
     ///
     /// This is the difference between selective sync and true files-on-demand:
     /// every folder becomes a real (near-free) directory and every file a
-    /// sparse placeholder, so the entire OneDrive is visible and navigable in
-    /// any file manager, offline, with no per-folder network round-trip —
-    /// exactly what Windows does. Content still arrives only when a file is
-    /// opened.
+    /// sparse placeholder. In the normal partial-population mode, deeper
+    /// folders are indexed only after their parent is opened; callers that
+    /// explicitly want a complete tree must populate those folders first.
+    /// Content still arrives only when a file is opened.
     ///
     /// Idempotent and resumable: anything already on disk is left as it is, so
     /// a run interrupted half-way simply continues next time. `progress` is
@@ -268,6 +538,9 @@ impl Engine {
                     let _ =
                         Placeholder::mark_dir_file(&dir, PlaceholderState::Dehydrated, &folder.id);
                 }
+                Placeholder::set_directory_population_file(&dir, DirectoryPopulation::Populated)?;
+                self.store
+                    .set_folder_population(&self.account_id, &folder.id, true)?;
             }
         }
 

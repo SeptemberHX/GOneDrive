@@ -1,4 +1,31 @@
 #[tokio::test]
+async fn population_watch_inventory_trusts_the_published_directory_xattr() {
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState, XATTR_POPULATION};
+    use gonedrive_core::sync::population_watch_directories_for_account;
+    use std::os::unix::fs::MetadataExt;
+
+    let h = Harness::metadata_only().await;
+    Placeholder::mark_dir(&h.root, PlaceholderState::Dehydrated, ROOT).unwrap();
+    xattr::set(&h.root, XATTR_POPULATION, b"populated").unwrap();
+    let metadata = std::fs::metadata(&h.root).unwrap();
+    h.store
+        .set_local_stat(ROOT, None, Some(metadata.len()), Some(metadata.ino()))
+        .unwrap();
+    h.store.set_folder_population(ACCOUNT, ROOT, true).unwrap();
+    let account = h.store.accounts().unwrap().pop().unwrap();
+
+    assert_eq!(
+        population_watch_directories_for_account(&h.store, &account).unwrap(),
+        vec![h.root.clone()]
+    );
+
+    xattr::set(&h.root, XATTR_POPULATION, b"partial").unwrap();
+    assert!(population_watch_directories_for_account(&h.store, &account)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn placeholders_can_be_created_for_files_never_downloaded() {
     use gonedrive_core::hydrate::{Occupancy, Placeholder, PlaceholderState};
 
@@ -314,6 +341,36 @@ async fn helper_finished_hydration_retires_the_same_queued_download() {
 
     assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 0);
     assert_eq!(std::fs::read(path).unwrap(), CONTENT);
+}
+
+#[tokio::test]
+async fn duplicate_helper_completion_is_idempotent() {
+    use gonedrive_core::hydrate::Placeholder;
+    use gonedrive_core::sync::engine::SyncEvent;
+
+    const CONTENT: &[u8] = &[0x35; 64 * 1024];
+    let h = harness_with_a_downloaded_file(CONTENT).await;
+    let path = h.path("Docs/big.bin");
+    h.engine.free_space(Path::new("Docs")).unwrap();
+    Placeholder::fill(&path, 0, CONTENT).unwrap();
+
+    // The first completion commits the bytes and emits one notification.
+    let mut events = h.engine.subscribe();
+    h.engine.finish_hydration(&path).unwrap();
+    assert!(matches!(
+        events.try_recv(),
+        Ok(SyncEvent::HydrationFinished { ok: true, .. })
+    ));
+
+    // A duplicate Filled event must be a no-op.  In production this is the
+    // helper's final-range fast path arriving after the first completion; a
+    // second state transition used to make release-space appear ineffective.
+    h.engine.finish_hydration(&path).unwrap();
+    assert!(events.try_recv().is_err());
+    assert_eq!(
+        h.store.item("F1").unwrap().unwrap().state,
+        gonedrive_core::db::ItemState::Synced
+    );
 }
 
 #[tokio::test]

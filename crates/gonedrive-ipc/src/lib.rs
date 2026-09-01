@@ -78,6 +78,9 @@ pub struct FolderEntry {
     pub bytes: u64,
     /// Direct children for a folder, or one for a file.
     pub items: u64,
+    /// Whether `items` is authoritative. `false` is reserved for legacy or
+    /// incomplete metadata where Graph did not provide a child count yet.
+    pub items_known: bool,
 }
 
 /// What the daemon is doing right now.
@@ -166,6 +169,9 @@ pub trait Daemon {
     /// Create placeholders for never-downloaded files under a path. Returns
     /// how many were created.
     fn make_on_demand(&self, path: &str) -> zbus::Result<u64>;
+
+    /// Publish one partial directory's direct children for file-manager browse.
+    fn populate_folder(&self, path: &str) -> zbus::Result<u64>;
 
     /// Present the whole drive as a browsable placeholder tree (true
     /// files-on-demand). Returns how many placeholders are now watched.
@@ -265,6 +271,12 @@ pub mod hsm {
         Watch { id: u64, path: String },
         /// Register several placeholders in one bounded round trip.
         WatchBatch { id: u64, paths: Vec<String> },
+        /// Notify the daemon when a direct child directory of this populated
+        /// directory is opened. One parent mark covers any number of partial
+        /// children without a whole-drive or recursive kernel mark.
+        WatchDirectory { id: u64, path: String },
+        /// Register several populated directory boundaries in one round trip.
+        WatchDirectoryBatch { id: u64, paths: Vec<String> },
         /// Start a complete mark-set declaration after reconnecting. Existing
         /// marks remain armed until the matching commit succeeds.
         BeginWatchSet { id: u64 },
@@ -298,6 +310,10 @@ pub mod hsm {
             #[serde(default = "default_true")]
             full: bool,
         },
+        /// Answer to a process-blocking [`Event::DirectoryOpened`] request.
+        /// Failure affects only that open; the directory stays partial and a
+        /// later foreground open can retry population.
+        DirectoryPopulated { id: u64, ok: bool },
         /// Liveness probe, also used to confirm the helper's version.
         Ping,
         /// Ask what the helper can do. A helper that predates this variant
@@ -331,12 +347,27 @@ pub mod hsm {
         /// The content was written and the reader released. The daemon
         /// finalises its own bookkeeping on seeing this — but only for a
         /// `full` fill; a range fill changes nothing about the file's state.
+        /// `id` echoes the corresponding [`Event::Hydrate`] request. A zero
+        /// id is an ownership token; zero is accepted on the wire for older
+        /// helpers but is not allowed to complete a newer in-flight request.
         Filled {
             id: u64,
             ok: bool,
             path: String,
             #[serde(default = "default_true")]
             full: bool,
+        },
+        /// A foreground process opened an incomplete directory. The helper
+        /// has already filtered the daemon itself and known background
+        /// indexers; the daemon should publish only this directory's direct
+        /// children and leave child directories incomplete.
+        DirectoryOpened {
+            id: u64,
+            path: String,
+            #[serde(default)]
+            reader: String,
+            #[serde(default)]
+            pid: i32,
         },
         /// Answer to [`Request::Features`].
         Features {
@@ -354,6 +385,11 @@ pub mod hsm {
             /// sniffing by observing the copy's writable destination descriptor.
             #[serde(default)]
             file_manager_copy_detection: bool,
+            /// Whether non-blocking, process-aware directory-open marks are
+            /// supported. Missing means false for compatibility with helpers
+            /// installed by an older package.
+            #[serde(default)]
+            directory_open_notifications: bool,
         },
         /// Completion of a watch/unwatch request. A request id makes concurrent
         /// registrations unambiguous and lets the daemon refuse to create a
@@ -478,6 +514,62 @@ pub mod hsm {
                     batch_marks: false,
                     mark_sweeps: false,
                     file_manager_copy_detection: false,
+                    directory_open_notifications: false,
+                }
+            ));
+        }
+
+        #[test]
+        fn directory_population_messages_round_trip() {
+            let request = Request::WatchDirectoryBatch {
+                id: 19,
+                paths: vec!["/tmp/cloud/partial".into()],
+            };
+            let encoded = serde_json::to_string(&request).unwrap();
+            let parsed: Request = serde_json::from_str(&encoded).unwrap();
+            assert!(matches!(
+                parsed,
+                Request::WatchDirectoryBatch { id: 19, paths } if paths.len() == 1
+            ));
+
+            let event = Event::DirectoryOpened {
+                id: 23,
+                path: "/tmp/cloud/partial".into(),
+                reader: "nautilus".into(),
+                pid: 123,
+            };
+            let encoded = serde_json::to_string(&event).unwrap();
+            let parsed: Event = serde_json::from_str(&encoded).unwrap();
+            assert!(matches!(
+                parsed,
+                Event::DirectoryOpened { id: 23, reader, pid: 123, .. } if reader == "nautilus"
+            ));
+
+            let reply = Request::DirectoryPopulated { id: 23, ok: true };
+            let encoded = serde_json::to_string(&reply).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&encoded).unwrap(),
+                Request::DirectoryPopulated { id: 23, ok: true }
+            ));
+        }
+
+        #[test]
+        fn hydration_completion_preserves_its_request_id() {
+            let event = Event::Filled {
+                id: 91,
+                ok: true,
+                path: "/tmp/placeholder".into(),
+                full: true,
+            };
+            let encoded = serde_json::to_string(&event).unwrap();
+            let parsed: Event = serde_json::from_str(&encoded).unwrap();
+            assert!(matches!(
+                parsed,
+                Event::Filled {
+                    id: 91,
+                    ok: true,
+                    full: true,
+                    ..
                 }
             ));
         }

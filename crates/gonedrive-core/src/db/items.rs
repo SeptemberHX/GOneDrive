@@ -127,12 +127,71 @@ impl Store {
         })
     }
 
-    /// Direct item count and direct-file bytes for every folder immediately
-    /// below `parent_id`.
+    /// Whether this directory's direct children have been published locally.
+    /// `None` identifies a tree created by a pre-partial-population release;
+    /// the caller may inspect its xattr once and persist the adopted state.
+    pub fn folder_population(&self, account_id: &str, item_id: &str) -> Result<Option<bool>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT populated FROM folder_population
+                      WHERE account_id = ?1 AND item_id = ?2",
+                    params![account_id, item_id],
+                    |row| row.get::<_, i64>(0).map(|value| value != 0),
+                )
+                .optional()?)
+        })
+    }
+
+    pub fn set_folder_population(
+        &self,
+        account_id: &str,
+        item_id: &str,
+        populated: bool,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO folder_population (account_id, item_id, populated)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(account_id, item_id) DO UPDATE SET
+                   populated = excluded.populated",
+                params![account_id, item_id, i64::from(populated)],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record the exact number of direct children observed after a complete
+    /// Graph children pagination. A failed/incomplete page must not call this,
+    /// otherwise a transient response could make a non-empty folder look
+    /// empty until the next remote change.
+    pub fn set_folder_child_count(
+        &self,
+        account_id: &str,
+        item_id: &str,
+        child_count: u64,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE items
+                    SET child_count = ?3
+                  WHERE account_id = ?1 AND id = ?2 AND is_folder = 1",
+                params![
+                    account_id,
+                    item_id,
+                    i64::try_from(child_count).unwrap_or(i64::MAX)
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Direct item count and direct-file bytes for every *known/populated*
+    /// folder immediately below `parent_id`.
     ///
-    /// Folder browsing deliberately stops at two levels: callers list the
-    /// parent's children, then use this aggregate to annotate those child
-    /// folders. A recursive subtree query here makes opening a top-level folder
+    /// A partial folder is intentionally omitted; callers use its remote
+    /// `child_count` instead because its children have not been indexed yet.
+    /// A recursive subtree query here would make opening a top-level folder
     /// proportional to the size of the entire drive.
     pub fn direct_child_summaries(
         &self,
@@ -148,9 +207,13 @@ impl Store {
                    LEFT JOIN items child
                      ON child.account_id = folder.account_id
                     AND child.parent_id = folder.id
+                   LEFT JOIN folder_population population
+                     ON population.account_id = folder.account_id
+                    AND population.item_id = folder.id
                   WHERE folder.account_id = ?1
                     AND folder.parent_id = ?2
                     AND folder.is_folder = 1
+                    AND (population.populated IS NULL OR population.populated = 1)
                   GROUP BY folder.id",
             )?;
             let rows = stmt.query_map(params![account_id, parent_id], |row| {
@@ -169,6 +232,63 @@ impl Store {
                 "{ITEM_COLUMNS} WHERE account_id = ?1 AND state = ?2"
             ))?;
             let rows = stmt.query_map(params![account_id, state.as_str()], row_to_item)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Files that can plausibly have a local placeholder. Deep metadata-only
+    /// descendants of partial directories are excluded before any pathname is
+    /// derived or opened, keeping HSM startup proportional to the published
+    /// namespace instead of the whole cloud drive.
+    pub fn placeholder_inventory_candidates(&self, account_id: &str) -> Result<Vec<ItemRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "WITH RECURSIVE partial_tree(id) AS (
+                     SELECT item_id FROM folder_population
+                      WHERE account_id = ?1 AND populated = 0
+                     UNION ALL
+                     SELECT child.id
+                       FROM items child
+                       JOIN partial_tree parent ON child.parent_id = parent.id
+                      WHERE child.account_id = ?1 AND child.is_folder = 1
+                 )
+                 {ITEM_COLUMNS}
+                   WHERE account_id = ?1
+                     AND is_folder = 0
+                     AND state IN ('dehydrated', 'hydrating', 'error')
+                     AND (
+                       local_ino IS NOT NULL
+                       OR parent_id NOT IN (SELECT id FROM partial_tree)
+                     )"
+            ))?;
+            let rows = stmt.query_map(params![account_id], row_to_item)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Populated directories whose direct partial children need open events.
+    /// `local_ino` excludes metadata-only descendants learned from delta, so
+    /// rebuilding ephemeral population boundaries is proportional to folders
+    /// the user has actually browsed rather than the whole remote drive.
+    pub fn population_watch_candidates(&self, account_id: &str) -> Result<Vec<ItemRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "{ITEM_COLUMNS}
+                  WHERE account_id = ?1
+                    AND id IN (
+                      SELECT items.id
+                        FROM items
+                        JOIN folder_population population
+                          ON population.account_id = items.account_id
+                         AND population.item_id = items.id
+                       WHERE items.account_id = ?1
+                         AND items.is_folder = 1
+                         AND items.local_ino IS NOT NULL
+                         AND population.populated = 1
+                    )
+                  ORDER BY id"
+            ))?;
+            let rows = stmt.query_map(params![account_id], row_to_item)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }
@@ -282,6 +402,50 @@ impl Store {
             )?;
             tx.commit()?;
             Ok(())
+        })
+    }
+
+    /// Commit a hydration only when this item has not already reached the
+    /// synced state.  The helper can report the same `Filled` event more than
+    /// once (for example when a final range read races the materialised-range
+    /// fast path).  Making the state transition conditional gives concurrent
+    /// completions one winner and prevents duplicate completion side effects.
+    pub fn commit_hydration_once(
+        &self,
+        account_id: &str,
+        id: &str,
+        mtime: Option<OffsetDateTime>,
+        size: Option<u64>,
+        ino: Option<u64>,
+        quickxor: Option<&str>,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let changed = tx.execute(
+                "UPDATE items
+                    SET local_mtime = ?3, local_size = ?4, local_ino = ?5,
+                        quickxor = COALESCE(?6, quickxor),
+                        state = 'synced', updated_at = ?7
+                  WHERE id = ?1 AND account_id = ?2 AND state <> 'synced'",
+                params![
+                    id,
+                    account_id,
+                    mtime.map(|t| t.unix_timestamp()),
+                    size.map(|v| v as i64),
+                    ino.map(|v| v as i64),
+                    quickxor,
+                    now()
+                ],
+            )?;
+            if changed > 0 {
+                tx.execute(
+                    "DELETE FROM pending_ops
+                      WHERE account_id = ?1 AND item_id = ?2 AND kind = 'download'",
+                    params![account_id, id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed > 0)
         })
     }
 
@@ -768,15 +932,20 @@ impl Store {
 fn upsert_item_on(conn: &Connection, item: &ItemRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO items
-           (id, account_id, parent_id, name, name_folded, is_folder, size, etag, ctag,
+           (id, account_id, parent_id, name, name_folded, is_folder, child_count, size, etag, ctag,
             quickxor, sha1, remote_mtime, local_mtime, local_size, local_ino,
             state, pin_state, updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
          ON CONFLICT(id) DO UPDATE SET
            parent_id = excluded.parent_id,
            name = excluded.name,
            name_folded = excluded.name_folded,
            is_folder = excluded.is_folder,
+           child_count = CASE
+               WHEN excluded.is_folder != 0
+               THEN COALESCE(excluded.child_count, items.child_count)
+               ELSE NULL
+           END,
            size = excluded.size,
            etag = excluded.etag,
            ctag = excluded.ctag,
@@ -792,6 +961,8 @@ fn upsert_item_on(conn: &Connection, item: &ItemRecord) -> Result<()> {
             item.name,
             fold_case(&item.name),
             item.is_folder as i64,
+            item.child_count
+                .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
             item.size as i64,
             item.etag,
             item.ctag,
@@ -812,7 +983,8 @@ fn upsert_item_on(conn: &Connection, item: &ItemRecord) -> Result<()> {
 /// Note the deliberate omission of `local_*` from the UPDATE clause above:
 /// a delta page describes the *remote* item and must not clobber what we
 /// observed on disk. Local stats are written only by `set_local_stat`.
-const ITEM_COLUMNS: &str = "SELECT id, account_id, parent_id, name, is_folder, size, etag, ctag,
+const ITEM_COLUMNS: &str =
+    "SELECT id, account_id, parent_id, name, is_folder, child_count, size, etag, ctag,
         quickxor, sha1, remote_mtime, local_mtime, local_size, local_ino, state, pin_state
    FROM items";
 
@@ -826,16 +998,17 @@ fn row_to_item(row: &Row<'_>) -> rusqlite::Result<ItemRecord> {
         parent_id: row.get(2)?,
         name: row.get(3)?,
         is_folder: row.get::<_, i64>(4)? != 0,
-        size: row.get::<_, i64>(5)? as u64,
-        etag: row.get(6)?,
-        ctag: row.get(7)?,
-        quickxor: row.get(8)?,
-        sha1: row.get(9)?,
-        remote_mtime: to_time(row.get(10)?),
-        local_mtime: to_time(row.get(11)?),
-        local_size: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
-        local_ino: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
-        state: ItemState::parse(&row.get::<_, String>(14)?),
-        pin_state: PinState::parse(&row.get::<_, String>(15)?),
+        child_count: row.get::<_, Option<i64>>(5)?.map(|v| v.max(0) as u64),
+        size: row.get::<_, i64>(6)? as u64,
+        etag: row.get(7)?,
+        ctag: row.get(8)?,
+        quickxor: row.get(9)?,
+        sha1: row.get(10)?,
+        remote_mtime: to_time(row.get(11)?),
+        local_mtime: to_time(row.get(12)?),
+        local_size: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+        local_ino: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
+        state: ItemState::parse(&row.get::<_, String>(15)?),
+        pin_state: PinState::parse(&row.get::<_, String>(16)?),
     })
 }

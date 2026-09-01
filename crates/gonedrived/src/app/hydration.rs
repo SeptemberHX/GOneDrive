@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use gonedrive_core::sync::engine::Engine;
 use gonedrive_core::sync::{
     lock_unwatched_placeholder_for_account, materialise_placeholder_for_account,
-    placeholder_inventory_for_account,
+    placeholder_inventory_for_account, population_watch_directories_for_account,
 };
 use gonedrive_core::Error;
 use gonedrive_ipc::{Activity, Hydration};
@@ -17,15 +17,16 @@ use super::{decide_stage, ensure_progress_window, App, InFlight, StagePlan, ACTI
 use crate::open_intent::OpenDecision;
 
 impl App {
-    pub async fn stage_for(
-        &self,
-        path: &std::path::Path,
-        offset: u64,
-        length: u64,
-        reader: &str,
-        is_open: bool,
-        capabilities: HydrationCapabilities,
-    ) -> Result<StageOutcome> {
+    pub async fn stage_for(&self, request: HydrationRequest<'_>) -> Result<StageOutcome> {
+        let HydrationRequest {
+            request_id,
+            path,
+            offset,
+            length,
+            reader,
+            is_open,
+            capabilities,
+        } = request;
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let mut plan = decide_stage(
             is_open,
@@ -51,13 +52,34 @@ impl App {
             StagePlan::DenyBrowse => return Ok(StageOutcome::Deny),
             StagePlan::Full | StagePlan::Range { .. } => {}
         }
-        let Some(cancel) = self.begin_hydration(path, plan.shows_progress()).await else {
-            // Another request for this path completed while we waited for the
-            // per-path lock. Its real bytes are already under the blocked
-            // reader, so do not stage or record the same download again.
-            return Ok(StageOutcome::Allow);
+        let cancel = match self
+            .begin_hydration(path, plan.shows_progress(), request_id)
+            .await
+        {
+            HydrationStart::Started(cancel) => cancel,
+            HydrationStart::AlreadyMaterialized => {
+                // Another request for this path completed while we waited for
+                // the per-path lock. Its real bytes are already under the
+                // blocked reader, so do not stage or record the same download
+                // again.
+                return Ok(StageOutcome::Allow);
+            }
+            HydrationStart::Releasing => {
+                // A permission event may have been queued in fanotify before
+                // the user asked to release this file. It must not turn the
+                // freshly-created placeholder back into a download after the
+                // release returns. Denying this one blocked read is safe and
+                // lets a later, genuinely new open retry normally.
+                tracing::debug!(path = %path.display(), "denying hydration while space is being released");
+                return Ok(StageOutcome::Deny);
+            }
         };
 
+        // Queue transfers and explicit space release share this gate.  The
+        // per-path guard is acquired first (and retained in `InFlight`), so a
+        // release and a blocked read cannot deadlock while waiting in opposite
+        // orders.
+        let _download_gate = self.download_gate.lock().await;
         let result = match plan {
             // Let the open proceed untouched; the reads that follow drive
             // hydration. Keeps a media player streaming instead of pulling the
@@ -88,11 +110,11 @@ impl App {
                 }
             }
         };
-        if result.is_err() {
-            self.hydrations.write().await.remove(path);
-        } else if let Ok(StageOutcome::Fill(staged, _, _)) = &result {
+        if let Ok(StageOutcome::Fill(staged, _, _)) = &result {
             if let Some(entry) = self.hydrations.write().await.get_mut(path) {
-                entry.staged = Some(staged.clone());
+                if entry.request_id == request_id {
+                    entry.staged = Some(staged.clone());
+                }
             }
         }
         result
@@ -126,17 +148,22 @@ impl App {
         &self,
         path: &std::path::Path,
         visible: bool,
-    ) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        request_id: u64,
+    ) -> HydrationStart {
         let guard = self.hydration_locks.acquire(path).await;
+        if self.hydration_locks.is_releasing(path) {
+            return HydrationStart::Releasing;
+        }
         if gonedrive_core::hydrate::Placeholder::state(path)
             == gonedrive_core::hydrate::PlaceholderState::Hydrated
         {
-            return None;
+            return HydrationStart::AlreadyMaterialized;
         }
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.hydrations.write().await.insert(
             path.to_path_buf(),
             InFlight {
+                request_id,
                 hydration: Hydration {
                     path: path.to_string_lossy().into_owned(),
                     name: path
@@ -151,9 +178,10 @@ impl App {
                 cancel: cancel.clone(),
                 staged: None,
                 _path_guard: guard,
+                finishing: false,
             },
         );
-        Some(cancel)
+        HydrationStart::Started(cancel)
     }
 
     /// What was synced recently, newest first.
@@ -197,13 +225,23 @@ impl App {
     /// Remove the exact unique hand-off file used by this request. The helper
     /// consumes an already-open descriptor and deliberately never unlinks an
     /// untrusted pathname; ownership of cleanup stays on this daemon.
-    pub async fn cleanup_hydration_staging(&self, path: &std::path::Path) {
-        let staged = self
-            .hydrations
-            .write()
-            .await
-            .get_mut(path)
-            .and_then(|entry| entry.staged.take());
+    pub async fn cleanup_hydration_staging(&self, path: &std::path::Path, request_id: u64) {
+        let staged = {
+            let mut hydrations = self.hydrations.write().await;
+            let Some(entry) = hydrations.get_mut(path) else {
+                return;
+            };
+            if entry.request_id != request_id {
+                tracing::debug!(
+                    path = %path.display(),
+                    request_id,
+                    current = entry.request_id,
+                    "ignoring stale hydration staging cleanup"
+                );
+                return;
+            }
+            entry.staged.take()
+        };
         if let Some(staged) = staged {
             self.remove_staged_file(&staged).await;
         }
@@ -245,7 +283,68 @@ impl App {
     }
 
     /// Record that the helper finished filling a placeholder.
-    pub async fn finish_hydration(&self, path: &std::path::Path) -> Result<()> {
+    pub async fn finish_hydration(&self, path: &std::path::Path, request_id: u64) -> Result<()> {
+        // Claim the completion before doing any filesystem or database work.
+        // A final-range fast path in the helper can send duplicate `Filled`
+        // messages; only the request that owns this entry may publish the
+        // hydrated state and its activity event.  An absent entry is a stale
+        // completion (for example one that arrived after a space release),
+        // except for the helper's materialised-range fast path: that path
+        // deliberately keeps its mark until this acknowledgement so the
+        // release operation cannot lose protection in between.
+        let fast_path_completion = {
+            let mut hydrations = self.hydrations.write().await;
+            match hydrations.get_mut(path) {
+                None => true,
+                Some(entry) if entry.request_id != request_id => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        request_id,
+                        current = entry.request_id,
+                        "ignoring stale hydration completion"
+                    );
+                    return Ok(());
+                }
+                Some(entry) if entry.finishing => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        request_id,
+                        "ignoring duplicate hydration completion"
+                    );
+                    return Ok(());
+                }
+                Some(entry) => {
+                    entry.finishing = true;
+                    false
+                }
+            }
+        };
+
+        if fast_path_completion {
+            // Serialize the fallback with a new request or a space release
+            // before deciding which inode may be unwatched. The fast-path
+            // event carries no daemon map entry, so a path-only unwatch without
+            // this guard could retire a mark installed for a replacement inode.
+            let _path_guard = self.hydration_locks.acquire(path).await;
+            if !self.hydrations.read().await.contains_key(path)
+                && gonedrive_core::hydrate::Placeholder::state(path)
+                    == gonedrive_core::hydrate::PlaceholderState::Hydrated
+            {
+                if let Some(hsm) = self.hsm.read().await.clone() {
+                    if let Err(error) = hsm.unwatch(path).await {
+                        tracing::debug!(
+                            path = %path.display(),
+                            %error,
+                            "could not retire a materialised-range mark"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(path = %path.display(), "ignoring stale hydration completion");
+            }
+            return Ok(());
+        }
+
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         let mut result = Ok(());
         for engine in engines {
@@ -254,7 +353,17 @@ impl App {
                 break;
             }
         }
-        self.hydrations.write().await.remove(path);
+        if result.is_ok() {
+            // Keep the in-flight entry (and its path guard) alive while the
+            // kernel mark is retired. A stale completion must not be able to
+            // orphan the current mark and trigger another callback later.
+            if let Some(hsm) = self.hsm.read().await.clone() {
+                if let Err(error) = hsm.unwatch(path).await {
+                    tracing::warn!(path = %path.display(), %error, "could not retire hydration mark");
+                }
+            }
+        }
+        self.remove_hydration_if_current(path, request_id).await;
         if result.is_ok() {
             self.refresh_pending_status().await;
         }
@@ -263,27 +372,77 @@ impl App {
 
     /// Release a failed per-path hydration and put its database state back to
     /// dehydrated so a later reader can retry it.
-    pub async fn fail_hydration(&self, path: &std::path::Path) -> Result<()> {
+    pub async fn fail_hydration(&self, path: &std::path::Path, request_id: u64) -> Result<()> {
+        if !self.claim_hydration_completion(path, request_id).await {
+            return Ok(());
+        }
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         for engine in engines {
             if engine.fail_hydration(path).is_ok() {
                 break;
             }
         }
-        self.hydrations.write().await.remove(path);
+        self.remove_hydration_if_current(path, request_id).await;
         Ok(())
     }
 
     /// Put a placeholder's mtime back after a partial range fill moved it.
-    pub async fn restore_mtime(&self, path: &std::path::Path) -> Result<()> {
+    pub async fn restore_mtime(&self, path: &std::path::Path, request_id: u64) -> Result<()> {
+        if !self.claim_hydration_completion(path, request_id).await {
+            return Ok(());
+        }
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         for engine in engines {
             if engine.restore_mtime(path).is_ok() {
                 break;
             }
         }
-        self.hydrations.write().await.remove(path);
+        self.remove_hydration_if_current(path, request_id).await;
         Ok(())
+    }
+
+    /// Claim one terminal helper callback. Keeping `finishing` set until the
+    /// caller removes the entry prevents duplicate callbacks from racing the
+    /// filesystem/database work or replacing the path guard underneath it.
+    async fn claim_hydration_completion(&self, path: &std::path::Path, request_id: u64) -> bool {
+        let mut hydrations = self.hydrations.write().await;
+        let Some(entry) = hydrations.get_mut(path) else {
+            tracing::debug!(
+                path = %path.display(),
+                request_id,
+                "ignoring stale hydration completion"
+            );
+            return false;
+        };
+        if entry.request_id != request_id {
+            tracing::debug!(
+                path = %path.display(),
+                request_id,
+                current = entry.request_id,
+                "ignoring stale hydration completion"
+            );
+            return false;
+        }
+        if entry.finishing {
+            tracing::debug!(
+                path = %path.display(),
+                request_id,
+                "ignoring duplicate hydration completion"
+            );
+            return false;
+        }
+        entry.finishing = true;
+        true
+    }
+
+    async fn remove_hydration_if_current(&self, path: &std::path::Path, request_id: u64) {
+        let mut hydrations = self.hydrations.write().await;
+        if hydrations
+            .get(path)
+            .is_some_and(|entry| entry.request_id == request_id)
+        {
+            hydrations.remove(path);
+        }
     }
 
     /// Fill a placeholder directly (FetchNow, the CLI, the context menu).
@@ -294,6 +453,15 @@ impl App {
     /// same bytes. So the watch comes off first; it goes back on only if the
     /// fill fails and the file is still empty.
     pub async fn hydrate(&self, path: &std::path::Path) -> Result<u64> {
+        // FetchNow/context-menu downloads and fanotify hydration must not race
+        // a user-requested space release on the same inode.
+        let _path_guard = self.hydration_locks.acquire(path).await;
+        if self.hydration_locks.is_releasing(path) {
+            anyhow::bail!(
+                "{} is being released; try again after it completes",
+                path.display()
+            );
+        }
         let hsm = self.hsm.read().await.clone();
         if let Some(hsm) = &hsm {
             hsm.unwatch(path).await.with_context(|| {
@@ -301,7 +469,10 @@ impl App {
             })?;
         }
 
-        let result = self.hydrate_inner(path).await;
+        let result = {
+            let _download_gate = self.download_gate.lock().await;
+            self.hydrate_inner(path).await
+        };
 
         if result.is_ok() {
             self.refresh_pending_status().await;
@@ -451,35 +622,87 @@ impl App {
         // the daemon's own pid, so keeping the mark through fallocate is safe;
         // publishing holes first and discovering fanotify_mark failed is not.
         let candidates = engine.subtree_local_files(relative)?;
-        let mut newly_protected: Vec<(std::path::PathBuf, bool)> = Vec::new();
-        for path in &candidates {
-            let was_dehydrated = gonedrive_core::hydrate::Placeholder::state(path)
-                == gonedrive_core::hydrate::PlaceholderState::Dehydrated;
-            if let Err(error) = hsm.watch(path).await {
-                for (protected, was_dehydrated) in newly_protected {
-                    if !was_dehydrated {
-                        let _ = hsm.unwatch(&protected).await;
+        // Mark the whole candidate set before waiting on any path lock.  A
+        // permission event that is already queued in fanotify can otherwise
+        // arrive after the holes are punched and start a fresh hydration.
+        let _release_barrier = self.hydration_locks.begin_release(&candidates);
+        // Hold the guards until both the marks and the holes are durable.  This
+        // makes a queued HSM completion wait instead of restoring the file
+        // immediately after the release call returns.
+        let result = async {
+            let _path_guards = self.hydration_locks.acquire_many(&candidates).await;
+            let mut newly_protected: Vec<(std::path::PathBuf, bool)> = Vec::new();
+            for path in &candidates {
+                let was_dehydrated = gonedrive_core::hydrate::Placeholder::state(path)
+                    == gonedrive_core::hydrate::PlaceholderState::Dehydrated;
+                if let Err(error) = hsm.watch(path).await {
+                    if let Err(lock_error) = self.lock_unwatched_placeholder(path).await {
+                        tracing::error!(
+                            path = %path.display(),
+                            error = %lock_error,
+                            "could not safety-lock an unprotected placeholder"
+                        );
+                    }
+                    for (protected, was_dehydrated) in newly_protected {
+                        if !was_dehydrated {
+                            let _ = hsm.unwatch(&protected).await;
+                        }
+                    }
+                    return Err(error).with_context(|| {
+                        format!("could not protect {} before freeing it", path.display())
+                    });
+                }
+                newly_protected.push((path.clone(), was_dehydrated));
+            }
+            // A scheduler download may have removed its durable row just before
+            // this call.  Serialise the actual transfer with the destructive
+            // release so it cannot publish bytes after the holes are punched.
+            let transfer_result = {
+                let _download_gate = self.download_gate.lock().await;
+                engine.free_space(relative)
+            };
+
+            // A queued fast-path read can retire a mark while the file is
+            // still fully materialised. Reconcile the final state after the
+            // holes are made so every surviving placeholder is protected even
+            // when no daemon hydration callback was involved.
+            let dehydrated: Vec<_> = candidates
+                .iter()
+                .filter(|path| {
+                    gonedrive_core::hydrate::Placeholder::state(path)
+                        == gonedrive_core::hydrate::PlaceholderState::Dehydrated
+                })
+                .cloned()
+                .collect();
+            let protection_error = if dehydrated.is_empty() {
+                None
+            } else {
+                self.protect_placeholders(&hsm, &dehydrated)
+                    .await
+                    .err()
+            };
+            // Files the safety checks skipped remain hydrated and should not
+            // keep a permission mark. Successfully dehydrated files retain the
+            // mark that was installed before their blocks were released.
+            for path in &candidates {
+                if gonedrive_core::hydrate::Placeholder::state(path)
+                    != gonedrive_core::hydrate::PlaceholderState::Dehydrated
+                {
+                    if let Err(e) = hsm.unwatch(path).await {
+                        tracing::warn!(path = %path.display(), error = %e, "could not remove unused mark");
                     }
                 }
-                return Err(error).with_context(|| {
-                    format!("could not protect {} before freeing it", path.display())
-                });
             }
-            newly_protected.push((path.clone(), was_dehydrated));
-        }
-        let outcome = engine.free_space(relative)?;
-        // Files the safety checks skipped remain hydrated and should not keep a
-        // permission mark. Successfully dehydrated files retain the mark that
-        // was installed before their blocks were released.
-        for path in candidates {
-            if gonedrive_core::hydrate::Placeholder::state(&path)
-                != gonedrive_core::hydrate::PlaceholderState::Dehydrated
-            {
-                if let Err(e) = hsm.unwatch(&path).await {
-                    tracing::warn!(path = %path.display(), error = %e, "could not remove unused mark");
+            if let Some(error) = protection_error {
+                tracing::error!(%error, "could not re-protect placeholders after release");
+                if transfer_result.is_ok() {
+                    return Err(error);
                 }
             }
+            Ok(transfer_result?)
         }
+        .await;
+        let outcome = result?;
         self.refresh_pending_status().await;
         Ok(outcome)
     }
@@ -503,6 +726,23 @@ impl App {
         let engine = engines
             .first()
             .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
+
+        // The chooser is a real user navigation boundary.  A partial folder
+        // has only its Graph childCount in the database, so listing it without
+        // this step would render an apparently empty directory.  Reuse the
+        // same bounded population path as Nautilus: one direct page (A+1),
+        // with each child folder left partial.  If the network or helper is
+        // unavailable, keep the cached listing path alive; the caller can
+        // still show any rows already known and retry on the next navigation.
+        if engine.folder_needs_population(relative)? {
+            if let Err(error) = self.populate_folder(relative).await {
+                tracing::debug!(
+                    path = %relative.display(),
+                    %error,
+                    "could not populate folder for chooser listing; using cached metadata"
+                );
+            }
+        }
         Ok(engine
             .list(relative)?
             .into_iter()
@@ -513,6 +753,7 @@ impl App {
                 explicit: entry.explicit,
                 bytes: entry.bytes,
                 items: entry.items,
+                items_known: entry.items_known,
             })
             .collect())
     }
@@ -548,10 +789,36 @@ impl App {
         Ok(outcome)
     }
 
+    /// Populate one directory, Cloud Files style: metadata is already local,
+    /// only its direct child inodes are published and protected here.
+    pub async fn populate_folder(
+        &self,
+        relative: &std::path::Path,
+    ) -> Result<gonedrive_core::sync::FreeSpaceOutcome> {
+        let hsm = self.require_hsm().await?;
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        let engine = engines
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no account is signed in"))?;
+
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            anyhow::bail!("folder population path must stay below the sync root");
+        }
+        let target = self.config.sync_root.join(relative);
+        let outcome = engine.populate_folder(relative).await?;
+        self.protect_placeholders(&hsm, &outcome.paths).await?;
+        hsm.watch_directory_paths(&[target]).await?;
+        Ok(outcome)
+    }
+
     /// Protect a batch through the client's serialized, bounded registration
     /// path. Any file that cannot be marked is made unreadable before this
     /// returns; a zero-readable sparse file must never outlive an attempt.
-    async fn protect_placeholders(
+    pub(super) async fn protect_placeholders(
         &self,
         hsm: &crate::hsm_client::HsmClient,
         paths: &[std::path::PathBuf],
@@ -597,6 +864,27 @@ impl App {
         })
         .await
         .context("placeholder inventory worker failed")?
+    }
+
+    /// Populated directory boundaries that need process-aware direct-child
+    /// open notifications. This remains local-only and works while Graph or
+    /// the token service is offline.
+    pub(crate) async fn population_watch_inventory(&self) -> Result<Vec<std::path::PathBuf>> {
+        if !self.config.on_demand {
+            return Ok(Vec::new());
+        }
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut paths = Vec::new();
+            for account in store.accounts()? {
+                paths.extend(population_watch_directories_for_account(&store, &account)?);
+            }
+            paths.sort();
+            paths.dedup();
+            Ok(paths)
+        })
+        .await
+        .context("directory population inventory worker failed")?
     }
 
     /// Recreate only placeholders found missing by the startup inventory, then
@@ -657,10 +945,14 @@ impl App {
             .iter()
             .flat_map(|engine| engine.take_placeholder_marks())
             .collect();
-        if paths.is_empty() {
+        let directories = self.population_watch_inventory().await?;
+        if paths.is_empty() && directories.is_empty() {
             return Ok(0);
         }
         let Some(hsm) = self.hsm.read().await.clone() else {
+            if paths.is_empty() {
+                return Ok(0);
+            }
             let mut cleanup_errors = crate::failure_summary::FailureSummary::default();
             for path in &paths {
                 if let Err(error) = self.lock_unwatched_placeholder(path).await {
@@ -679,7 +971,8 @@ impl App {
             anyhow::bail!("files-on-demand helper is unavailable; safety-locked up to {} unprotected placeholder(s){detail}", paths.len());
         };
         self.protect_placeholders(&hsm, &paths).await?;
-        Ok(paths.len())
+        let watched_directories = hsm.watch_directory_paths(&directories).await?;
+        Ok(paths.len().saturating_add(watched_directories))
     }
 
     pub(super) async fn reconcile_placeholder_report(
@@ -715,6 +1008,25 @@ pub(crate) enum StageOutcome {
     Allow,
     Deny,
     Fill(std::path::PathBuf, u64, bool),
+}
+
+/// All context belonging to one fanotify read. Keeping the correlation ID
+/// beside the reader policy prevents a completion from being accidentally
+/// applied to a later request for the same path.
+pub(crate) struct HydrationRequest<'a> {
+    pub(crate) request_id: u64,
+    pub(crate) path: &'a std::path::Path,
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    pub(crate) reader: &'a str,
+    pub(crate) is_open: bool,
+    pub(crate) capabilities: HydrationCapabilities,
+}
+
+enum HydrationStart {
+    Started(Arc<std::sync::atomic::AtomicBool>),
+    AlreadyMaterialized,
+    Releasing,
 }
 
 #[derive(Debug, Clone, Copy)]

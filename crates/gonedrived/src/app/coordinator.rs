@@ -455,9 +455,11 @@ impl App {
                 let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
                 let deadline = Instant::now() + TRANSFER_SLICE;
                 let tx = transfer_tx.clone();
+                let download_gate = self.download_gate.clone();
                 download_work = false;
                 download_transfer_running = true;
                 tokio::spawn(async move {
+                    let _download_gate = download_gate.lock().await;
                     let mut results = Vec::with_capacity(engines.len());
                     for engine in engines {
                         results.push(engine.transfer_slice(deadline, QueueScope::Downloads).await);

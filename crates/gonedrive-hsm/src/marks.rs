@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::fanotify::descriptor_path;
 use crate::file_handle::{object_is_gone, ReopenableFile};
-use crate::{FileIdentity, MarkEntry, Shared};
+use crate::{FileIdentity, MarkEntry, MarkKind, Shared};
 
 /// Both lookup directions live under one lock so registration, replacement,
 /// event validation, and explicit unwatch always observe one coherent set.
@@ -27,6 +27,19 @@ pub(super) struct MarkRegistry {
 impl MarkRegistry {
     pub(super) fn get(&self, identity: &FileIdentity) -> Option<&MarkEntry> {
         self.by_identity.get(identity)
+    }
+
+    /// Resolve an unmarked child-directory event through its exact populated
+    /// parent mark. FAN_EVENT_ON_CHILD reports the child's descriptor, not the
+    /// marked parent's identity, so this reverse lookup is the authorization
+    /// boundary for non-permission directory notifications.
+    pub(super) fn population_parent(&self, uid: u32, child: &Path) -> Option<Arc<Path>> {
+        let parent = child.parent()?;
+        self.identities_for_path(uid, parent)
+            .into_iter()
+            .filter_map(|identity| self.by_identity.get(&identity))
+            .find(|entry| entry.kind == MarkKind::PopulationDirectory)
+            .map(|entry| entry.path.clone())
     }
 
     fn insert(&mut self, identity: FileIdentity, entry: MarkEntry) {
@@ -57,11 +70,16 @@ impl MarkRegistry {
         identity: FileIdentity,
         uid: u32,
         path: &Path,
+        kind: MarkKind,
         sweep: Option<u64>,
     ) -> bool {
         let Some(mut entry) = self.remove(&identity) else {
             return false;
         };
+        if entry.kind != kind {
+            self.insert(identity, entry);
+            return false;
+        }
         entry.uid = uid;
         entry.path = Arc::from(path);
         if let Some(sweep) = sweep {
@@ -126,6 +144,15 @@ fn validate_path(path: &Path) -> Result<()> {
 /// Open and authorise the exact inode in one operation. No symlink component is
 /// followed, and every later operation uses the returned descriptor.
 pub(super) fn open_authorised(path: &Path, uid: u32, access: i32) -> Result<AuthorisedFile> {
+    open_authorised_kind(path, uid, access, MarkKind::Placeholder)
+}
+
+fn open_authorised_kind(
+    path: &Path,
+    uid: u32,
+    access: i32,
+    kind: MarkKind,
+) -> Result<AuthorisedFile> {
     validate_path(path)?;
     let path_bytes = path.as_os_str().as_encoded_bytes();
     let c_path = std::ffi::CString::new(path_bytes)
@@ -162,8 +189,16 @@ pub(super) fn open_authorised(path: &Path, uid: u32, access: i32) -> Result<Auth
     let meta = file
         .metadata()
         .with_context(|| format!("cannot stat {}", path.display()))?;
-    if !meta.file_type().is_file() {
-        bail!("{} is not a regular file", path.display());
+    let expected_type = match kind {
+        MarkKind::Placeholder => meta.file_type().is_file(),
+        MarkKind::PopulationDirectory => meta.file_type().is_dir(),
+    };
+    if !expected_type {
+        let expected = match kind {
+            MarkKind::Placeholder => "a regular file",
+            MarkKind::PopulationDirectory => "a directory",
+        };
+        bail!("{} is not {expected}", path.display());
     }
     if meta.uid() != uid {
         bail!(
@@ -182,11 +217,28 @@ pub(super) fn open_authorised(path: &Path, uid: u32, access: i32) -> Result<Auth
 }
 
 pub(super) fn install_mark(shared: &Arc<Shared>, path: &Path, uid: u32) -> Result<FileIdentity> {
-    let target = open_authorised(path, uid, libc::O_PATH)?;
+    install_typed_mark(shared, path, uid, MarkKind::Placeholder)
+}
+
+pub(super) fn install_directory_mark(
+    shared: &Arc<Shared>,
+    path: &Path,
+    uid: u32,
+) -> Result<FileIdentity> {
+    install_typed_mark(shared, path, uid, MarkKind::PopulationDirectory)
+}
+
+fn install_typed_mark(
+    shared: &Arc<Shared>,
+    path: &Path,
+    uid: u32,
+    kind: MarkKind,
+) -> Result<FileIdentity> {
+    let target = open_authorised_kind(path, uid, libc::O_PATH, kind)?;
     let sweep = shared.sweeps.lock().unwrap().get(&uid).copied();
     let existing_stale = {
         let mut marks = shared.marks.lock().unwrap();
-        if marks.refresh(target.identity, uid, path, sweep) {
+        if marks.refresh(target.identity, uid, path, kind, sweep) {
             // Inode marks survive a rename. Refresh the path without another
             // syscall so watcher reconciliation naturally follows the inode.
             let stale = marks
@@ -202,23 +254,35 @@ pub(super) fn install_mark(shared: &Arc<Shared>, path: &Path, uid: u32) -> Resul
     };
     if let Some(stale) = existing_stale {
         retire_stale_marks(shared, stale);
-        restore_locked_placeholder(&target.file)
-            .with_context(|| format!("could not unlock protected {}", path.display()))?;
+        if kind == MarkKind::Placeholder {
+            restore_locked_placeholder(&target.file)
+                .with_context(|| format!("could not unlock protected {}", path.display()))?;
+        }
         return Ok(target.identity);
     }
 
     // Open a safety-locked placeholder before installing its permission mark.
     // Reopening it afterwards would itself block on the new mark before the
     // registry entry exists. The descriptor remains bound to this exact inode.
-    let locked = LockedPlaceholder::prepare(&target.file)
-        .with_context(|| format!("could not inspect safety lock on {}", path.display()))?;
-    shared
-        .fan
-        .watch_fd(target.file.as_raw_fd())
-        .with_context(|| format!("could not watch {}", path.display()))?;
+    let locked = if kind == MarkKind::Placeholder {
+        LockedPlaceholder::prepare(&target.file)
+            .with_context(|| format!("could not inspect safety lock on {}", path.display()))?
+    } else {
+        None
+    };
+    match kind {
+        MarkKind::Placeholder => shared.fan.watch_fd(target.file.as_raw_fd()),
+        MarkKind::PopulationDirectory => shared.fan.watch_directory_fd(target.file.as_raw_fd()),
+    }
+    .with_context(|| format!("could not watch {}", path.display()))?;
     if let Some(locked) = locked {
         if let Err(error) = locked.restore() {
-            let _ = shared.fan.unwatch_fd(target.file.as_raw_fd());
+            let _ = match kind {
+                MarkKind::Placeholder => shared.fan.unwatch_fd(target.file.as_raw_fd()),
+                MarkKind::PopulationDirectory => {
+                    shared.fan.unwatch_directory_fd(target.file.as_raw_fd())
+                }
+            };
             return Err(error)
                 .with_context(|| format!("could not unlock protected {}", path.display()));
         }
@@ -239,13 +303,14 @@ pub(super) fn install_mark(shared: &Arc<Shared>, path: &Path, uid: u32) -> Resul
         let mut marks = shared.marks.lock().unwrap();
         // Another connection may have installed the same inode while the
         // persistent handle was captured. Reuse its entry and drop ours.
-        if !marks.refresh(target.identity, uid, path, sweep) {
+        if !marks.refresh(target.identity, uid, path, kind, sweep) {
             marks.insert(
                 target.identity,
                 MarkEntry {
                     uid,
                     path: Arc::from(path),
                     file,
+                    kind,
                     sweep: sweep.unwrap_or(0),
                 },
             );
@@ -260,7 +325,7 @@ pub(super) fn install_mark(shared: &Arc<Shared>, path: &Path, uid: u32) -> Resul
     // A concurrent registration may have won after fanotify_mark. Adding the
     // same inode mark is idempotent; dropping our duplicate handle is enough.
     retire_stale_marks(shared, stale);
-    tracing::debug!(path = %path.display(), uid, "watching");
+    tracing::debug!(path = %path.display(), uid, ?kind, "watching");
     Ok(target.identity)
 }
 
@@ -440,7 +505,11 @@ pub(super) fn remove_mark_by_event_fd(
 }
 
 fn unwatch_entry(shared: &Arc<Shared>, entry: &MarkEntry) -> std::io::Result<()> {
-    match entry.file.with_fd(|fd| shared.fan.unwatch_fd(fd)) {
+    let result = entry.file.with_fd(|fd| match entry.kind {
+        MarkKind::Placeholder => shared.fan.unwatch_fd(fd),
+        MarkKind::PopulationDirectory => shared.fan.unwatch_directory_fd(fd),
+    });
+    match result {
         Ok(()) => Ok(()),
         Err(error) if object_is_gone(&error) => Ok(()),
         Err(error) => Err(error),
@@ -466,10 +535,15 @@ mod tests {
     use super::*;
 
     fn entry(uid: u32, path: &str, sweep: u64) -> MarkEntry {
+        entry_with_kind(uid, path, sweep, MarkKind::Placeholder)
+    }
+
+    fn entry_with_kind(uid: u32, path: &str, sweep: u64, kind: MarkKind) -> MarkEntry {
         MarkEntry {
             uid,
             path: Arc::from(Path::new(path)),
             file: ReopenableFile::Descriptor(tempfile::tempfile().unwrap()),
+            kind,
             sweep,
         }
     }
@@ -514,12 +588,33 @@ mod tests {
         let mut marks = MarkRegistry::default();
         marks.insert(identity, entry(1000, old.to_str().unwrap(), 3));
 
-        assert!(marks.refresh(identity, 1000, new, Some(4)));
+        assert!(marks.refresh(identity, 1000, new, MarkKind::Placeholder, Some(4)));
         assert!(marks.identities_for_path(1000, old).is_empty());
         assert_eq!(marks.identities_for_path(1000, new), vec![identity]);
         let refreshed = marks.get(&identity).unwrap();
         assert_eq!(refreshed.path.as_ref(), new);
         assert_eq!(refreshed.sweep, 4);
+    }
+
+    #[test]
+    fn a_population_mark_authorises_only_direct_children_for_its_uid() {
+        let parent = FileIdentity { dev: 1, ino: 9 };
+        let mut marks = MarkRegistry::default();
+        marks.insert(
+            parent,
+            entry_with_kind(1000, "/sync/Populated", 1, MarkKind::PopulationDirectory),
+        );
+
+        assert_eq!(
+            marks.population_parent(1000, Path::new("/sync/Populated/Partial")),
+            Some(Arc::from(Path::new("/sync/Populated")))
+        );
+        assert!(marks
+            .population_parent(1000, Path::new("/sync/Populated/Partial/Grandchild"))
+            .is_none());
+        assert!(marks
+            .population_parent(1001, Path::new("/sync/Populated/Partial"))
+            .is_none());
     }
 
     #[test]

@@ -4,6 +4,15 @@ Linux 上的 OneDrive 客户端，目标是对标 Windows 官方客户端的两�
 
 当前状态：**M1 + M2 核心已完成** —— OAuth 登录、双向同步、冲突保留、GTK 界面，以及**按需下载**（占位文件、自动回填、释放空间）均已在真实账户上跑通。
 
+图形界面新建的配置默认启用按需文件：首次登录先持久化 Graph 的 `token=latest`
+变化基线，再只列出根目录的直属项；第一次打开一个云端文件夹时才列出并缓存它的
+直属项。不会为了显示根目录先读取六位数的整盘历史元数据。配置文件中明确设置
+`on_demand = false` 可改用传统全量元数据同步。
+
+Linux 的桌面索引器不了解云占位目录，递归枚举会被误认为逐层浏览。默认配置因此在
+watcher 和首次 Graph 请求之前创建 `.trackerignore`；可用
+`gonedrived indexer --include` 显式恢复桌面索引，这个选择会写回配置并跨重启保留。
+
 ---
 
 ## 它和现有方案的区别
@@ -147,6 +156,22 @@ crates/gonedrive-gtk/    GTK4 前端：纯 D-Bus 客户端
 
 **deltaLink 原样存储。** 服务端明确说它是不透明值；从中抠出 token 自己拼 URL 是 410 的常见来源。收到 410 `resyncRequired` 时走完整重枚举 + 代际扫除 —— 因为重枚举只报告"存在什么"，从不报告"什么被删了"。
 
+**目录按 CFAPI 的“未完全填充目录 + FULL 单目录填充”语义工作。** 这里的 FULL 是
+“一次返回当前目录的全部直属项”，不是首次遍历整盘；新建的子目录仍为 Partial，等它
+自己被枚举时才填充。新账户先取得并落盘 `delta?token=latest`，然后用 `/children` 填
+根目录，绝不递归到叶子。children 分页不是全盘快照，所以游标必须先落盘；children 与
+delta 的本地提交也严格排序为“目录快照在前、后续变化在后”，慢响应不能把新版本回滚。
+单项无法表示时保存原始 payload 延期重放，相关路径冻结，但全局 delta 游标继续推进。
+只有旧数据恢复或 410 游标失效才进行完整重枚举。GOnedrive 对齐的是 Microsoft 公开的
+CFAPI/Graph 行为契约，不声称复刻 OneDrive 客户端未公开的内部实现。
+
+Linux 没有 CFAPI 的 `FETCH_PLACEHOLDERS` 回调。GOnedrive 用 HSM 的 process-aware
+fanotify permission event 映射这个边界：每个**已填充父目录**只有一个直属子目录 mark，
+不因它包含十万个 Partial 子目录而注册十万次；前台程序打开某个 Partial 子目录时，该次
+open 等待其直属项全部落盘后再继续。完成填充的子目录随后成为新的单一边界。daemon 自身
+和后台索引器的访问直接放行且不触网，普通 inotify 只负责本地写入/删除/重命名，绝不参与
+目录填充判定。
+
 **待下载的项不会被误判为本地删除。** 一个已记录但还没写到磁盘的项，看起来和用户删掉的文件一模一样。把它删到远端会摧毁用户从未碰过的数据，所以只有确认曾经落过盘（有 inode 记录）的项才会触发远端删除。
 
 **OneDrive 拒绝的文件名会被跳过并上报，绝不自动改名。** 背着用户重命名他们的文件，比拒绝同步更糟。
@@ -159,7 +184,10 @@ crates/gonedrive-gtk/    GTK4 前端：纯 D-Bus 客户端
 cargo test --workspace
 ```
 
-86 项测试，其中 13 项是端到端集成测试：用 `wiremock` 起一个假 Graph，驱动真实的引擎、真实的数据库、真实的文件系统，覆盖首次全量同步、增量、远端改动、远端删除、本地新增、本地删除、目录创建、双端冲突、410 重同步、429 限流退避、非法文件名，以及"待下载不能被误判为本地删除"这条守卫。
+端到端集成测试用 `wiremock` 起一个假 Graph，驱动真实的引擎、数据库和文件系统，覆盖
+lazy 首登、目录 Partial/Populated 边界、children/delta 并发顺序、增量、远端删除、
+本地新增、双端冲突、单项延期、410 重同步、429 限流退避，以及“待下载不能被误判为
+本地删除”等数据安全守卫。
 
 单元测试覆盖冲突判定矩阵的每一格、delta 拓扑排序、路径推导、大小写冲突、分片边界（4 MiB 阈值、320 KiB 倍数），以及 OAuth loopback 回调的 state 校验和错误透传。
 
@@ -219,8 +247,8 @@ gonedrived fetch 文档/报告.docx    # 手动回填
 - 托盘依赖桌面的 StatusNotifierWatcher（GNOME 需 AppIndicator 扩展）。watcher 不在时每 30 秒自动重试注册，不影响其他功能。
 - 双击打开未下载的文件时，会弹出小进度窗口显示各文件进度、可取消；由守护进程按需拉起，全部完成后自动消失。
 - **部分回填**：规则只有一句 —— **看，不改变任何东西；用，才下载**。文件管理器（按进程名识别）的任何读取都按范围喂给它、永不翻转文件状态，与文件大小无关；已在盘上的范围直接本地供给，重复浏览零流量；浏览留下的缓存随时可被"释放空间"整体冲掉。真实使用者（编辑器、`cat`、复制）读小文件或读出嗅探窗之外时才全量下载并翻转状态。老 helper 经 Features 握手自动降级为全量，绝不会错把范围当整文件。
-- 后台索引器（tracker/baloo/updatedb 等）的读取被直接拒绝，既不下载也不弹窗；拒绝名单同时存在于守护进程侧（改名单无需 root）与 helper 侧（兜底）。
-- helper 升级/重启时守护进程自动重连并重新注册全部占位文件。
+- 后台索引器（tracker/baloo/updatedb 等）的文件读取被直接拒绝，既不下载也不弹窗；GNOME `localsearch` 还会递归打开目录，因此同步根默认带 `.trackerignore`，从源头避免它触发目录填充和无效 Graph 请求。拒绝名单同时存在于守护进程侧（改名单无需 root）与 helper 侧（兜底）。
+- helper 升级/重启时守护进程自动重连，并重建占位文件 mark 与已浏览目录的 population boundary。
 
 调试辅助：`GONEDRIVE_SNAPSHOT=/path.png`（离屏渲染当前窗口后退出）、`GONEDRIVE_PAGE=activity|settings`（预选页）、`GONEDRIVE_NO_TRAY=1`。
 
@@ -279,9 +307,11 @@ nautilus -q                        # 重启文件管理器
 - **内核 ≥ 6.14 + CAP_SYS_ADMIN**（fanotify 预读钩子）；FUSE 兜底与 libcloudproviders 侧栏在路线图上
 - 托盘依赖桌面的 StatusNotifierWatcher；它缺席时 30 秒周期自愈重试
 
-## 读日志，代替人肉排查
+## 按需开启诊断日志
 
-守护进程的日志把每一件外部可见的事都写成一行可 grep 的记录——出问题先看日志，而不是重演操作：
+正式包默认只记录警告和错误，且两个 systemd 服务各自限制为每分钟最多 30 条，避免
+范围回填或重复故障持续写满 journal。需要排查时可通过 `RUST_LOG` 临时打开详细日志；
+以下命令查看当前服务日志：
 
 ```bash
 journalctl --user -u gonedrived -f      # 用户服务方式运行时
@@ -292,12 +322,12 @@ journalctl -u gonedrive-hsm -f          # 特权 helper（含读者进程名）
 |---|---|
 | `FreeUpSpace requested path=…` / `… done files=N freed=N` | 谁的哪次释放、动了多少 —— 右键误伤直接对账 |
 | `SetPinState requested … / done queued_files=…` | 每次选择/取消选择及其代价 |
-| `on-demand read path=… reader=nautilus length=16384` | **哪个进程**在触发按需下载、要了哪个范围 |
-| `staged range … bytes=16384` / `hydrated range` | 部分回填：只取了嗅探窗口，文件仍是占位 |
+| `on-demand read path=… reader=nautilus length=16384` | debug：**哪个进程**在触发按需读取、要了哪个范围 |
+| `staged range … bytes=16384` / `hydrated range` | debug：部分回填，只取嗅探窗口，文件仍是占位 |
 | `staging content size=…` / `hydrated` | 全量回填 |
 | `refusing a background reader` | 索引器/缩略图器被拒，未产生流量 |
 | `refusing to upload a placeholder` | 上传守卫拦下了空洞文件 |
-| `sync pass finished downloaded=… uploaded=…` | 每轮同步的完整账目 |
+| `sync pass finished downloaded=… uploaded=…` | 有实际结果的同步账目；空轮询只在 debug 出现 |
 | `repaired a stale hydrating record` | 崩溃残留被自动纠正 |
 
 四起真实事故（误伤兄弟文件、整盘释放、进文件夹触发下载、暂存文件残留）都已固化为

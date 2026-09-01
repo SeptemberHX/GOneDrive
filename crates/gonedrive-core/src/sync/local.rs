@@ -9,6 +9,7 @@ use time::OffsetDateTime;
 use crate::db::{Account, ItemRecord, ItemState, OpKind};
 use crate::error::{Error, Result};
 use crate::hydrate::{Placeholder, PlaceholderState};
+use crate::models::DriveItem;
 use crate::sync::plan::{decide_local, LocalAction, LocalStat};
 
 use super::engine::{Engine, FullScanReport, SafetyStopKind, SyncEvent, SyncPhase, SyncSummary};
@@ -323,6 +324,10 @@ impl Engine {
         let mut appeared: Vec<(std::path::PathBuf, LocalStat)> = Vec::new();
         let mut vanished: Vec<ItemRecord> = Vec::new();
         let by_inode = self.store.items_by_inode(&self.account_id)?;
+        // A remote move/update whose parent has not been indexed yet is kept
+        // durably for replay. Until then, no local observation of that same id
+        // may upload or delete against the older remote location/version.
+        let (deferred_remote, deferred_paths) = self.deferred_remote_guards(&account)?;
         let mut moved_ids = std::collections::HashSet::new();
 
         while let Some((parent_id, dir)) = stack.pop() {
@@ -348,6 +353,16 @@ impl Engine {
                 if let Some(record) = record {
                     self.store
                         .cancel_pending_delete(&self.account_id, &record.id)?;
+                }
+                if record.is_some_and(|record| deferred_remote.contains(&record.id)) {
+                    continue;
+                }
+                let entry_path = dir.join(name);
+                if deferred_paths.contains(&entry_path) {
+                    // A remote item is waiting for this exact path to become
+                    // representable. Treat the whole local subtree as frozen so
+                    // it cannot be uploaded under the stale/competing identity.
+                    continue;
                 }
                 // Unknown indexer markers are not uploaded; known ones are
                 // still counted in `entries`/`on_disk`, so they are not
@@ -375,7 +390,7 @@ impl Engine {
                 // either as "locally modified" queues an upload of zeroes over
                 // the real file in the cloud. Nothing about them is ours to
                 // upload, so they only recurse (below) and refresh marks.
-                let path = dir.join(name);
+                let path = entry_path;
                 if !stat.is_dir {
                     let expected_id = record.map(|record| record.id.as_str());
                     if placeholder_claim(&rooted, &path)
@@ -429,6 +444,9 @@ impl Engine {
                         let new_path = dir.join(name);
                         let moved = self.moved_candidate(&account, &by_inode, &new_path, stat)?;
                         if let Some((known, old_path)) = moved {
+                            if deferred_remote.contains(&known.id) {
+                                continue;
+                            }
                             self.store.enqueue_move(
                                 &self.account_id,
                                 &known.id,
@@ -539,6 +557,9 @@ impl Engine {
                 if on_disk.contains(folded) {
                     continue;
                 }
+                if deferred_remote.contains(&record.id) {
+                    continue;
+                }
                 // A record that never had a local observation was never written
                 // to disk in the first place — its download is still pending,
                 // and deleting it remotely would be catastrophic.
@@ -580,6 +601,9 @@ impl Engine {
             let moved = self.moved_candidate(&account, &by_inode, path, stat)?;
             match moved {
                 Some((record, old_path)) => {
+                    if deferred_remote.contains(&record.id) {
+                        continue;
+                    }
                     moved_ids.insert(record.id.clone());
                     let is_placeholder = !stat.is_dir
                         && owned_placeholder_state(&rooted, path, &record.id)
@@ -725,6 +749,32 @@ impl Engine {
             .into_iter()
             .map(|(path, id)| (Some(id), path))
             .collect())
+    }
+
+    /// Remote changes that could not be projected locally must not race local
+    /// reconciliation. Guard the old known path (moves/tombstones) and the new
+    /// payload path (collisions) until deferred replay succeeds.
+    fn deferred_remote_guards(
+        &self,
+        account: &Account,
+    ) -> Result<(HashSet<String>, HashSet<PathBuf>)> {
+        let mut ids = HashSet::new();
+        let mut paths = HashSet::new();
+        for payload in self.store.deferred_remote_payloads(&self.account_id)? {
+            let item: DriveItem = serde_json::from_str(&payload)?;
+            ids.insert(item.id.clone());
+            if let Some(known) = self.store.item(&item.id)? {
+                if let Some(path) = self.store.local_path(account, &known.id)? {
+                    paths.insert(path);
+                }
+            }
+            if let (Some(parent_id), Some(name)) = (item.parent_id(), item.name.as_deref()) {
+                if let Some(parent) = self.store.relative_path(parent_id)? {
+                    paths.insert(account.root_local_path.join(parent).join(name));
+                }
+            }
+        }
+        Ok((ids, paths))
     }
 
     /// Match a new path to a stable known inode without mistaking a conflict

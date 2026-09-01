@@ -65,6 +65,48 @@ fn hydration_staging_is_unique_and_still_hidden_from_scans() {
     assert_eq!(first.parent(), path.parent());
 }
 
+#[test]
+fn long_destination_names_get_bounded_deterministic_scratch_names() {
+    use std::os::unix::ffi::OsStrExt;
+
+    // The destination itself fits ext4, but adding our old suffix did not.
+    let destination = PathBuf::from("/a").join("x".repeat(245));
+    let first = staging_sibling(&destination);
+    let second = staging_sibling(&destination);
+
+    assert_eq!(first, second, "restart must find the same partial download");
+    assert!(first.file_name().unwrap().as_bytes().len() <= 255);
+    assert!(first
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .ends_with(PARTIAL_SUFFIX));
+}
+
+#[test]
+fn multibyte_names_and_unique_handoffs_never_exceed_name_max() {
+    use std::os::unix::ffi::OsStrExt;
+
+    // 80 CJK code points are only 80 visible characters but 240 UTF-8 bytes.
+    let destination = PathBuf::from("/a").join("文".repeat(80));
+    for scratch in [
+        staging_sibling(&destination),
+        hydration_staging_sibling(&destination),
+        placeholder_staging_sibling(&destination),
+    ] {
+        assert!(
+            scratch.file_name().unwrap().as_bytes().len() <= 255,
+            "{} is too long",
+            scratch.display()
+        );
+        assert!(scratch
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(PARTIAL_SUFFIX));
+    }
+}
+
 #[tokio::test]
 async fn an_interrupted_download_resumes_from_its_partial() {
     use wiremock::matchers::{header, method, path};

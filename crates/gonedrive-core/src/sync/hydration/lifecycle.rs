@@ -123,6 +123,16 @@ impl Engine {
         let (account, record, file) = self.open_owned_placeholder(path, true)?;
         let item_id = record.id.clone();
 
+        // A fanotify worker may emit a second completion for the same inode
+        // when a final range read discovers that the whole file is already
+        // materialised.  A synced database row is authoritative here even if
+        // its xattr was subsequently changed to `dehydrated` by a release:
+        // a fresh hydration always moves the row to `hydrating` first, so a
+        // stale completion must never re-materialise the released file.
+        if record.state == ItemState::Synced {
+            return Ok(());
+        }
+
         Placeholder::mark_hydrated_file(&file, &item_id, record.ctag.as_deref())?;
         let pin = self
             .store
@@ -135,7 +145,7 @@ impl Engine {
         }
         let local = LocalStat::from_metadata(&file.metadata()?);
         let content_hash = Placeholder::content_hash_file(&file);
-        self.store.commit_hydration(
+        let committed = self.store.commit_hydration_once(
             &account.id,
             &item_id,
             OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
@@ -143,6 +153,13 @@ impl Engine {
             Some(local.ino),
             content_hash.as_deref(),
         )?;
+        if !committed {
+            // Another completion won the state transition while this one was
+            // collecting metadata.  Keep the operation idempotent: the bytes
+            // and xattrs are already published, but do not emit a second UI or
+            // activity notification.
+            return Ok(());
+        }
         self.refresh_folder_ancestors(&account, &item_id)?;
         self.emit(SyncEvent::HydrationFinished {
             path: path.to_path_buf(),

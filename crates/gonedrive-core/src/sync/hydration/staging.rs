@@ -155,10 +155,10 @@ impl Engine {
         if let Err(e) = result {
             let _ = rooted.remove_file(&staged);
             let _ = rooted.remove_file(&transfer::staging_sibling(&staged));
-            self.emit(SyncEvent::HydrationFinished {
-                path: path.to_path_buf(),
-                ok: false,
-            });
+            // The fanotify helper owns the completion handshake.  Emitting a
+            // failure here as well races that handshake and can make the
+            // daemon remove a newer in-flight request for the same path.
+            // `Event::Filled { ok: false, id }` performs the single unwind.
             return Err(e);
         }
         Ok(staged)
@@ -200,7 +200,7 @@ impl Engine {
         use tokio::io::AsyncWriteExt;
         staged_file.write_all(&bytes).await?;
         staged_file.sync_all().await?;
-        tracing::info!(
+        tracing::debug!(
             path = %path.display(),
             offset,
             bytes = bytes.len(),

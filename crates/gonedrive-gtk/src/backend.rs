@@ -434,12 +434,12 @@ async fn handle(
             let ok = if keep {
                 proxy.set_pin_state(&path, "pinned").await.is_ok()
             } else {
-                // Deselecting means "not on this device": stop future
-                // downloads AND give the space back, the way unticking a
-                // folder behaves on Windows.
-                let a = proxy.set_pin_state(&path, "unpinned").await.is_ok();
-                let b = proxy.free_up_space(&path).await.is_ok();
-                a && b
+                // FreeUpSpace is the atomic deselect operation: the daemon
+                // cancels queued downloads and commits `unpinned + dehydrated`
+                // under its per-path/download gates. Sending a separate
+                // SetPinState first leaves a window in which the coordinator
+                // can start the very download we are about to release.
+                proxy.free_up_space(&path).await.is_ok()
             };
             ok
         }

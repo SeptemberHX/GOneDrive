@@ -10,8 +10,8 @@ use anyhow::{bail, Result};
 use gonedrive_ipc::hsm::{Event, Request, WatchOutcome, MAX_FRAME_SIZE, MAX_WATCH_BATCH};
 
 use crate::marks::{
-    begin_mark_sweep, cancel_mark_sweep, commit_mark_sweep, install_mark, open_authorised,
-    remove_marks_for_path,
+    begin_mark_sweep, cancel_mark_sweep, commit_mark_sweep, install_directory_mark, install_mark,
+    open_authorised, remove_marks_for_path,
 };
 use crate::worker::fail_pending_for_uid;
 use crate::{ClientSession, FileIdentity, Reply, Shared};
@@ -231,6 +231,7 @@ fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
                     batch_marks: true,
                     mark_sweeps: true,
                     file_manager_copy_detection: true,
+                    directory_open_notifications: true,
                 },
             );
         }
@@ -267,6 +268,50 @@ fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
             }
             let results = parallel_map_ordered(&paths, WATCH_BATCH_WORKERS, |path| {
                 mark_outcome(install_mark(shared, Path::new(path), uid))
+            });
+            let _ = shared.send(
+                uid,
+                &Event::WatchBatchResult {
+                    id,
+                    ok: true,
+                    message: None,
+                    results,
+                },
+            );
+        }
+        Request::WatchDirectory { id, path } => {
+            let path = PathBuf::from(path);
+            let result = install_directory_mark(shared, &path, uid);
+            let identity = result.as_ref().ok().copied();
+            let _ = shared.send(
+                uid,
+                &Event::WatchResult {
+                    id,
+                    ok: result.is_ok(),
+                    message: result.err().map(|error| format!("{error:#}")),
+                    dev: identity.map(|identity| identity.dev),
+                    ino: identity.map(|identity| identity.ino),
+                },
+            );
+        }
+        Request::WatchDirectoryBatch { id, paths } => {
+            if paths.len() > MAX_WATCH_BATCH {
+                let _ = shared.send(
+                    uid,
+                    &Event::WatchBatchResult {
+                        id,
+                        ok: false,
+                        message: Some(format!(
+                            "directory watch batch has {} paths; maximum is {MAX_WATCH_BATCH}",
+                            paths.len()
+                        )),
+                        results: Vec::new(),
+                    },
+                );
+                return;
+            }
+            let results = parallel_map_ordered(&paths, WATCH_BATCH_WORKERS, |path| {
+                mark_outcome(install_directory_mark(shared, Path::new(path), uid))
             });
             let _ = shared.send(
                 uid,
@@ -339,6 +384,21 @@ fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
             };
             if let Some(pending) = shared.pending.lock().unwrap().remove(&id) {
                 let _ = pending.reply.send(reply);
+            }
+        }
+        Request::DirectoryPopulated { id, ok } => {
+            let belongs_to_client = shared
+                .pending
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|pending| pending.uid == uid);
+            if !belongs_to_client {
+                tracing::warn!(uid, id, "ignoring a directory reply for another session");
+                return;
+            }
+            if let Some(pending) = shared.pending.lock().unwrap().remove(&id) {
+                let _ = pending.reply.send(Reply::DirectoryPopulated(ok));
             }
         }
     }

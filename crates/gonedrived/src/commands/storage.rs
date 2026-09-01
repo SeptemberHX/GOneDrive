@@ -247,6 +247,7 @@ pub(crate) async fn fetch(path: PathBuf) -> Result<()> {
 
 /// Add or remove the marker desktop indexers look for.
 pub(crate) fn indexer(include: bool) -> Result<()> {
+    let mut config = gonedrive_core::config::Config::load()?;
     let store = Store::open(&gonedrive_core::config::state_db_path())?;
     let root = store
         .accounts()?
@@ -259,52 +260,25 @@ pub(crate) fn indexer(include: bool) -> Result<()> {
     // list is `ignored-directories-with-content` in its GSettings schema. The
     // file is deliberately excluded from sync, because it describes a choice
     // made on *this* machine.
-    let marker = root.join(".trackerignore");
+    let marker = root.join(crate::indexer::MARKER_NAME);
 
     if include {
-        match std::fs::remove_file(&marker) {
-            Ok(()) => println!("Removed {}.", marker.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                println!("{} was not excluded.", root.display());
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
+        if crate::indexer::remove_marker(&root)? {
+            println!("Removed {}.", marker.display());
+        } else {
+            println!("{} was not excluded.", root.display());
         }
+        config.exclude_desktop_indexer = false;
+        config.save()?;
         println!("The file indexer will walk {} again.", root.display());
         println!();
         println!("Reads from indexers are still refused by the helper, so this");
         println!("will not download your drive — but it will cost a lot of");
         println!("pointless work on both sides.");
     } else {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&marker)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = std::fs::symlink_metadata(&marker)?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
-                    anyhow::bail!(
-                        "refusing to replace non-regular marker {}",
-                        marker.display()
-                    );
-                }
-                println!("{} is already excluded.", root.display());
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
-        };
-        file.write_all(
-            b"# GOnedrive: tells desktop file indexers to skip this folder.\n\
-              # Placeholders look like ordinary files, so an indexing pass would\n\
-              # download the entire drive.\n\
-              # Undo with: gonedrived indexer --include\n",
-        )?;
+        crate::indexer::ensure_marker(&root)?;
+        config.exclude_desktop_indexer = true;
+        config.save()?;
         println!("Excluded {} from the file indexer.", root.display());
         println!();
         println!("Trade-off: desktop search will no longer find these files.");

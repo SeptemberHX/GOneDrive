@@ -1,17 +1,17 @@
 //! Remote delta collection and application to the local sync tree.
 
+mod delta;
+
 use std::path::{Path, PathBuf};
 
 use time::OffsetDateTime;
 
 use crate::db::{Account, ItemRecord, ItemState, OpKind, PinState};
 use crate::error::{Error, Result};
-use crate::hydrate::{Placeholder, PlaceholderState};
+use crate::hydrate::{DirectoryPopulation, Placeholder, PlaceholderState};
 use crate::models::DriveItem;
 use crate::names::{conflict_copy_name, split_extension};
-use crate::sync::plan::{
-    decide_remote, partition_delta, record_from_remote, RemoteAction, SkipReason,
-};
+use crate::sync::plan::{decide_remote, record_from_remote, RemoteAction, SkipReason};
 
 use super::engine::{stat_of, Engine, SyncEvent, SyncSummary};
 use super::transfer;
@@ -41,182 +41,21 @@ impl Engine {
         Ok(())
     }
 
-    // ---- remote -> local --------------------------------------------------
-
-    async fn pull_remote(&self, summary: &mut SyncSummary) -> Result<()> {
-        let account = self.account()?;
-        let initial_link = account.enum_link.clone().or(account.delta_link.clone());
-        if self.store.delta_batch(&self.account_id)?.is_none() {
-            self.store
-                .begin_delta_batch(&self.account_id, "incremental", None)?;
-        }
-        let batch = self
-            .collect_delta_batch("incremental", initial_link.as_deref())
-            .await?;
-        self.apply_staged_delta(&account, summary)?;
-        summary.enumerated = batch.item_count;
-        self.store
-            .finish_delta_batch(&self.account_id, batch.delta_link.as_deref())?;
-        Ok(())
-    }
-
-    /// Re-enumerate the whole drive after the service rejected our deltaLink.
-    ///
-    /// Anything the enumeration does not mention is gone remotely, which a
-    /// plain re-run of delta cannot tell us — a fresh enumeration reports what
-    /// exists, never what was removed.
-    async fn full_resync(&self, summary: &mut SyncSummary) -> Result<()> {
-        let account = self.account()?;
-        let existing = self.store.delta_batch(&self.account_id)?;
-        let (generation, initial_link) = match existing {
-            Some(batch) if batch.mode == "full" => {
-                let generation = batch
-                    .generation
-                    .ok_or_else(|| Error::other("full delta batch has no generation"))?;
-                (generation, account.enum_link.clone())
-            }
-            Some(_) => {
-                self.store.abort_delta_batch(&self.account_id)?;
-                let generation = self.store.begin_resync(&self.account_id)?;
-                self.store
-                    .begin_delta_batch(&self.account_id, "full", Some(generation))?;
-                (generation, None)
-            }
-            None => {
-                let generation = self.store.begin_resync(&self.account_id)?;
-                self.store
-                    .begin_delta_batch(&self.account_id, "full", Some(generation))?;
-                (generation, None)
-            }
-        };
-        let batch = self
-            .collect_delta_batch("full", initial_link.as_deref())
-            .await?;
-        let seen = self.apply_staged_delta(&account, summary)?;
-        self.store.mark_seen(&seen, generation)?;
-        summary.enumerated = batch.item_count;
-
-        // Sweep what the enumeration never mentioned.
-        for stale in self
-            .store
-            .items_missed_by_resync(&self.account_id, generation)?
-        {
-            let Some(path) = self.store.local_path(&account, &stale.id)? else {
-                self.store.delete_subtree(&stale.id)?;
-                continue;
-            };
-            // The item is gone from the server, so the local copy would
-            // normally be removed. But a resync must honour the same guarantee
-            // the delta tombstone path does (KeepLocalAndReupload): a local file
-            // carrying edits that were never uploaded is preserved and
-            // re-offered, never deleted. Without this the sweep silently loses
-            // an unsaved edit the ordinary delete path would have kept.
-            if !stale.is_folder {
-                if let Some(local) = stat_of(&path) {
-                    if crate::sync::plan::local_is_modified(&stale, &local) {
-                        self.store.delete_subtree(&stale.id)?;
-                        self.store.enqueue(
-                            &self.account_id,
-                            OpKind::Upload,
-                            None,
-                            Some(&path),
-                            None,
-                        )?;
-                        continue;
-                    }
-                }
-            }
-            self.remove_local(&stale, &path, summary)?;
-        }
-        self.store
-            .finish_delta_batch(&self.account_id, batch.delta_link.as_deref())?;
-        Ok(())
-    }
-
-    /// Fetch pages into SQLite before touching the filesystem. This retains the
-    /// last occurrence of each item and survives a daemon restart between
-    /// pages, while still delaying deletes and child resolution until the feed
-    /// is complete.
-    async fn collect_delta_batch(
-        &self,
-        expected_mode: &str,
-        initial_link: Option<&str>,
-    ) -> Result<crate::db::DeltaBatch> {
-        loop {
-            let batch = self
-                .store
-                .delta_batch(&self.account_id)?
-                .ok_or_else(|| Error::other("delta batch disappeared"))?;
-            if batch.mode != expected_mode {
-                return Err(Error::other(format!(
-                    "cannot resume {} delta batch as {expected_mode}",
-                    batch.mode
-                )));
-            }
-            if batch.complete {
-                return Ok(batch);
-            }
-
-            let account = self.account()?;
-            let link = account.enum_link.as_deref().or(if batch.page_count == 0 {
-                initial_link
-            } else {
-                None
-            });
-            if batch.page_count > 0 && link.is_none() {
-                return Err(Error::other(
-                    "incomplete delta batch has no continuation link",
-                ));
-            }
-            let page = self.graph.delta(link).await?;
-            let payloads = page
-                .value
-                .iter()
-                .map(|item| Ok((item.id.clone(), serde_json::to_string(item)?)))
-                .collect::<Result<Vec<_>>>()?;
-            self.store.stage_delta_page(
-                &self.account_id,
-                &payloads,
-                page.next_link.as_deref(),
-                page.delta_link.as_deref(),
-            )?;
-            let current = self
-                .store
-                .delta_batch(&self.account_id)?
-                .ok_or_else(|| Error::other("delta batch disappeared after staging"))?;
-            self.emit(SyncEvent::Enumerating {
-                items: current.item_count,
-                pages: current.page_count,
-            });
-        }
-    }
-
-    /// Apply the final occurrence of every staged item in dependency order.
-    /// Returns the ids present in a full enumeration for its generation sweep.
-    fn apply_staged_delta(
-        &self,
-        account: &Account,
-        summary: &mut SyncSummary,
-    ) -> Result<Vec<String>> {
-        let items = self
-            .store
-            .staged_delta_payloads(&self.account_id)?
-            .into_iter()
-            .map(|payload| serde_json::from_str::<DriveItem>(&payload).map_err(Error::from))
-            .collect::<Result<Vec<_>>>()?;
-        let (upserts, deletes) = partition_delta(items);
-        let seen = upserts.iter().map(|item| item.id.clone()).collect();
-        for item in &upserts {
-            self.apply_remote(account, item, summary)?;
-        }
-        for item in &deletes {
-            self.apply_remote(account, item, summary)?;
-        }
-        Ok(seen)
-    }
-
     /// Apply one item from a delta page.
     fn apply_remote(
+        &self,
+        account: &Account,
+        remote: &DriveItem,
+        summary: &mut SyncSummary,
+    ) -> Result<()> {
+        let _projection = self
+            .remote_apply
+            .lock()
+            .map_err(|_| Error::other("remote namespace lock was poisoned"))?;
+        self.apply_remote_locked(account, remote, summary)
+    }
+
+    fn apply_remote_locked(
         &self,
         account: &Account,
         remote: &DriveItem,
@@ -252,8 +91,12 @@ impl Engine {
         // The drive root anchors every path; record it and stop. Its pin stays
         // `Inherit` — see `ItemRecord::root`.
         if remote.is_root() {
-            self.store
-                .upsert_item(&ItemRecord::root(&self.account_id, &remote.id))?;
+            let mut root = ItemRecord::root(&self.account_id, &remote.id);
+            root.child_count = remote
+                .folder
+                .as_ref()
+                .and_then(|folder| folder.child_count.map(u64::from));
+            self.store.upsert_item(&root)?;
             return Ok(());
         }
 
@@ -361,6 +204,7 @@ impl Engine {
 
         let action = decide_remote(remote, known.as_ref(), local.as_ref());
         let mut state = ItemState::Synced;
+        let mut directory_population = None;
         let local_was_modified =
             known
                 .as_ref()
@@ -375,16 +219,27 @@ impl Engine {
                 // materialises the drive, every later remote folder (including
                 // an empty or restored one) belongs in the browsable tree.
                 let on_demand = self.on_demand_enabled();
-                if on_demand || self.wants_content(known.as_ref(), parent_id)? {
+                if on_demand {
+                    // Every newly discovered directory starts partial, including
+                    // metadata-only descendants whose inode is not published yet.
+                    // Its direct children are fetched only on first enumeration.
+                    directory_population = Some(false);
+                }
+                let publish = if on_demand {
+                    self.remote_parent_is_populated(account, parent_id)?
+                } else {
+                    self.wants_content(known.as_ref(), parent_id)?
+                };
+                if publish {
                     let rooted = self.rooted(account)?;
                     rooted.ensure_dir(&path)?;
                     if on_demand {
                         let dir = rooted.open_read(&path)?;
-                        let _ = Placeholder::mark_dir_file(
+                        Placeholder::mark_dir_file(&dir, PlaceholderState::Dehydrated, &remote.id)?;
+                        Placeholder::set_directory_population_file(
                             &dir,
-                            PlaceholderState::Dehydrated,
-                            &remote.id,
-                        );
+                            DirectoryPopulation::Partial,
+                        )?;
                     }
                     self.mark_dir(&remote.id)?;
                 } else {
@@ -432,7 +287,9 @@ impl Engine {
                     // the file is not materialised, so `create` (which
                     // is exclusive) cannot overwrite a local file that appears
                     // after discovery.
-                    if self.on_demand_enabled() {
+                    if self.on_demand_enabled()
+                        && self.remote_parent_is_populated(account, parent_id)?
+                    {
                         self.create_placeholder_at(
                             account,
                             &path,
@@ -468,14 +325,33 @@ impl Engine {
                 // comes down under the original name. Neither is lost.
                 self.store
                     .enqueue(&self.account_id, OpKind::Upload, None, Some(&copy), None)?;
-                state = ItemState::DirtyRemote;
-                self.store.enqueue(
-                    &self.account_id,
-                    OpKind::Download,
-                    Some(&remote.id),
-                    Some(&path),
-                    None,
-                )?;
+                if remote.is_folder() {
+                    // A file occupied the folder's name. After preserving that
+                    // file, publish the remote directory itself; folders have no
+                    // content endpoint and must never enter the download queue.
+                    let rooted = self.rooted(account)?;
+                    rooted.ensure_dir(&path)?;
+                    if self.on_demand_enabled() {
+                        let dir = rooted.open_read(&path)?;
+                        Placeholder::mark_dir_file(&dir, PlaceholderState::Dehydrated, &remote.id)?;
+                        Placeholder::set_directory_population_file(
+                            &dir,
+                            DirectoryPopulation::Partial,
+                        )?;
+                        directory_population = Some(false);
+                    }
+                    self.mark_dir(&remote.id)?;
+                    state = ItemState::Synced;
+                } else {
+                    state = ItemState::DirtyRemote;
+                    self.store.enqueue(
+                        &self.account_id,
+                        OpKind::Download,
+                        Some(&remote.id),
+                        Some(&path),
+                        None,
+                    )?;
+                }
             }
             RemoteAction::Skip(reason) => {
                 if !matches!(reason, SkipReason::UpToDate) {
@@ -526,6 +402,10 @@ impl Engine {
             }
         }
         self.store.upsert_item(&record)?;
+        if let Some(populated) = directory_population {
+            self.store
+                .set_folder_population(&self.account_id, &record.id, populated)?;
+        }
 
         if state == ItemState::Synced {
             if let Some(local) = stat_of(&path) {
@@ -593,6 +473,51 @@ impl Engine {
             Some(explicit) => explicit,
         };
         Ok(pin.wants_content())
+    }
+
+    /// Whether children of this directory belong in the local namespace now.
+    /// The root is the first populated directory. Child folders start partial
+    /// and are promoted when a file manager asks to enumerate them.
+    fn remote_parent_is_populated(&self, account: &Account, parent_id: &str) -> Result<bool> {
+        if account.root_item_id.as_deref() == Some(parent_id) {
+            return Ok(true);
+        }
+        if let Some(populated) = self.store.folder_population(&self.account_id, parent_id)? {
+            return Ok(populated);
+        }
+        let Some(path) = self.store.local_path(account, parent_id)? else {
+            return Ok(false);
+        };
+        let rooted = self.rooted(account)?;
+        let dir = match rooted.open_read(&path) {
+            Ok(dir) if dir.metadata()?.is_dir() => dir,
+            Ok(_) => return Ok(false),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false)
+            }
+            Err(error) => return Err(error),
+        };
+        let populated = match Placeholder::directory_population_file(&dir) {
+            DirectoryPopulation::Populated => true,
+            DirectoryPopulation::Partial => false,
+            DirectoryPopulation::Unmanaged => {
+                // Trees made by releases before lazy population already contain
+                // every child. Adopt them as populated instead of hiding later
+                // delta additions until each old directory is opened once.
+                if Placeholder::item_id_file(&dir).as_deref() == Some(parent_id) {
+                    Placeholder::set_directory_population_file(
+                        &dir,
+                        DirectoryPopulation::Populated,
+                    )?;
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        self.store
+            .set_folder_population(&self.account_id, parent_id, populated)?;
+        Ok(populated)
     }
 
     /// Record that a directory — and every directory above it — was written

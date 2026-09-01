@@ -26,6 +26,10 @@ pub struct Listing {
     pub bytes: u64,
     /// Direct children for a folder, or one for a file.
     pub items: u64,
+    /// Whether `items` is authoritative. A partial folder uses Graph's
+    /// `folder.childCount`; older records that never carried that facet remain
+    /// explicitly unknown instead of being presented as an empty folder.
+    pub items_known: bool,
 }
 
 /// What a pin is about to cost.
@@ -89,16 +93,26 @@ impl Selection {
             .direct_child_summaries(&self.account_id, &parent.id)?;
         let mut out = Vec::with_capacity(children.len());
         for child in children {
-            let (bytes, items) = if child.is_folder {
-                summaries.get(&child.id).copied().unwrap_or_default()
+            let (bytes, items, items_known) = if child.is_folder {
+                if let Some((bytes, items)) = summaries.get(&child.id).copied() {
+                    (bytes, items, true)
+                } else if let Some(items) = child.child_count {
+                    // The directory is still partial, so its children are not
+                    // in SQLite yet. Graph's direct childCount is exactly the
+                    // bounded summary needed by this listing.
+                    (0, items, true)
+                } else {
+                    (0, 0, false)
+                }
             } else {
-                (child.size, 1)
+                (child.size, 1, true)
             };
             out.push(Listing {
                 pin: self.store.effective_pin(&child.id, default)?,
                 explicit: child.pin_state != PinState::Inherit,
                 bytes,
                 items,
+                items_known,
                 item: child,
             });
         }

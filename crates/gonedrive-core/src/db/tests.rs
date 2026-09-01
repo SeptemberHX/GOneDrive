@@ -46,6 +46,65 @@ fn migration_is_idempotent() {
 }
 
 #[test]
+fn version_ten_delta_staging_migrates_without_discarding_rows() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            r#"CREATE TABLE accounts (id TEXT PRIMARY KEY);
+             CREATE TABLE delta_batches (
+                 account_id TEXT PRIMARY KEY,
+                 mode TEXT NOT NULL,
+                 generation INTEGER,
+                 item_count INTEGER NOT NULL DEFAULT 0,
+                 page_count INTEGER NOT NULL DEFAULT 0,
+                 next_sequence INTEGER NOT NULL DEFAULT 0,
+                 complete INTEGER NOT NULL DEFAULT 0,
+                 delta_link TEXT
+             );
+             CREATE TABLE delta_staging (
+                 account_id TEXT NOT NULL,
+                 item_id TEXT NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 payload TEXT NOT NULL,
+                 PRIMARY KEY (account_id, item_id)
+             );
+             INSERT INTO accounts (id) VALUES ('acct');
+             INSERT INTO delta_staging (account_id, item_id, sequence, payload)
+                 VALUES ('acct', 'F1', 7, '{"id":"F1","deleted":null}');
+             INSERT INTO delta_staging (account_id, item_id, sequence, payload)
+                 VALUES ('acct', 'D1', 8, '{"id":"D1","deleted":{}}');
+             PRAGMA user_version = 10;"#,
+        )
+        .unwrap();
+
+    let store = Store::from_connection(connection).unwrap();
+    let staged: (String, i64, i64) = store
+        .with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT payload, applied, deleted FROM delta_staging WHERE item_id = 'F1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(staged, (r#"{"id":"F1","deleted":null}"#.into(), 0, 0));
+    let deleted: i64 = store
+        .with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT deleted FROM delta_staging WHERE item_id = 'D1'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(deleted, 1);
+    let version: i64 = store
+        .with_conn(|conn| Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+}
+
+#[test]
 fn activity_persists_newest_first_and_is_trimmed() {
     let store = Store::open_in_memory().unwrap();
     for i in 0..5 {
@@ -96,6 +155,64 @@ fn upsert_updates_remote_fields_but_not_local_stats() {
     assert_eq!(got.ctag.as_deref(), Some("c2"));
     assert_eq!(got.local_ino, Some(42));
     assert_eq!(got.local_size, Some(10));
+}
+
+#[test]
+fn folder_child_count_is_preserved_when_a_later_remote_record_omits_it() {
+    let (store, _) = store_with_account();
+    let mut folder = folder("D1", "ROOT", "Documents");
+    folder.child_count = Some(7);
+    store.upsert_item(&folder).unwrap();
+
+    // Metadata-only delta responses are allowed to omit the folder facet. An
+    // omission is not an authoritative zero and must not erase the summary the
+    // chooser already knows.
+    let mut later = folder.clone();
+    later.child_count = None;
+    store.upsert_item(&later).unwrap();
+    assert_eq!(store.item("D1").unwrap().unwrap().child_count, Some(7));
+
+    // An explicit zero is meaningful (the remote folder became empty), and a
+    // completed children pagination can refine the cached value as well.
+    later.child_count = Some(0);
+    store.upsert_item(&later).unwrap();
+    assert_eq!(store.item("D1").unwrap().unwrap().child_count, Some(0));
+    store.set_folder_child_count("acct", "D1", 3).unwrap();
+    assert_eq!(store.item("D1").unwrap().unwrap().child_count, Some(3));
+}
+
+#[test]
+fn population_watch_candidates_include_only_published_populated_directories() {
+    let (store, _) = store_with_account();
+    for item in [
+        folder("READY", "ROOT", "Ready"),
+        folder("PARTIAL", "ROOT", "Partial"),
+        folder("REMOTE_ONLY", "READY", "Remote only"),
+    ] {
+        store.upsert_item(&item).unwrap();
+    }
+    store
+        .set_local_stat("READY", None, Some(0), Some(101))
+        .unwrap();
+    store
+        .set_local_stat("PARTIAL", None, Some(0), Some(102))
+        .unwrap();
+    store.set_folder_population("acct", "READY", true).unwrap();
+    store
+        .set_folder_population("acct", "PARTIAL", false)
+        .unwrap();
+    store
+        .set_folder_population("acct", "REMOTE_ONLY", true)
+        .unwrap();
+
+    let candidates = store.population_watch_candidates("acct").unwrap();
+    assert_eq!(
+        candidates
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec!["READY"]
+    );
 }
 
 #[test]
@@ -587,4 +704,85 @@ fn delta_link_round_trips_verbatim() {
 
     store.set_delta_link("acct", None).unwrap();
     assert!(store.account("acct").unwrap().unwrap().delta_link.is_none());
+}
+
+#[test]
+fn replacing_a_staged_item_makes_its_final_occurrence_pending_again() {
+    let (store, _) = store_with_account();
+    store.begin_delta_batch("acct", "initial", Some(1)).unwrap();
+    store
+        .stage_delta_page(
+            "acct",
+            &[("F1".into(), "first".into(), false)],
+            Some("next"),
+            None,
+        )
+        .unwrap();
+    assert_eq!(store.unapplied_delta_upserts("acct").unwrap(), ["first"]);
+
+    store.mark_staged_applied("acct", &["F1".into()]).unwrap();
+    assert!(store.unapplied_delta_upserts("acct").unwrap().is_empty());
+
+    store
+        .stage_delta_page(
+            "acct",
+            &[("F1".into(), "last".into(), false)],
+            Some("next-2"),
+            None,
+        )
+        .unwrap();
+    assert_eq!(store.unapplied_delta_upserts("acct").unwrap(), ["last"]);
+
+    store
+        .stage_delta_page(
+            "acct",
+            &[("F1".into(), "deleted".into(), true)],
+            None,
+            Some("done"),
+        )
+        .unwrap();
+    assert!(store.unapplied_delta_upserts("acct").unwrap().is_empty());
+    assert_eq!(store.unapplied_delta_deletes("acct").unwrap(), ["deleted"]);
+    assert!(store.staged_upsert_ids("acct").unwrap().is_empty());
+}
+
+#[test]
+fn remote_package_exclusions_persist_as_a_tree_and_prune_by_generation() {
+    let (store, _) = store_with_account();
+    store
+        .upsert_remote_exclusion("acct", "PACKAGE", Some("ROOT"), "package", Some(1))
+        .unwrap();
+    store
+        .upsert_remote_exclusion(
+            "acct",
+            "CHILD",
+            Some("PACKAGE"),
+            "package-descendant",
+            Some(1),
+        )
+        .unwrap();
+    assert!(store.remote_is_excluded("acct", "PACKAGE").unwrap());
+    assert!(store.remote_is_excluded("acct", "CHILD").unwrap());
+
+    store
+        .upsert_remote_exclusion("acct", "PACKAGE", Some("ROOT"), "package", Some(2))
+        .unwrap();
+    store.prune_remote_exclusions("acct", 2).unwrap();
+    assert!(store.remote_is_excluded("acct", "PACKAGE").unwrap());
+    assert!(!store.remote_is_excluded("acct", "CHILD").unwrap());
+
+    store
+        .upsert_remote_exclusion(
+            "acct",
+            "CHILD",
+            Some("PACKAGE"),
+            "package-descendant",
+            Some(2),
+        )
+        .unwrap();
+    store
+        .delete_remote_exclusion_subtree("acct", "PACKAGE")
+        .unwrap();
+    assert!(!store.remote_is_excluded("acct", "PACKAGE").unwrap());
+    assert!(!store.remote_is_excluded("acct", "CHILD").unwrap());
 }

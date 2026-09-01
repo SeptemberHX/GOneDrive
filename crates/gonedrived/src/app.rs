@@ -2,8 +2,9 @@
 
 mod coordinator;
 mod hydration;
+mod placeholder_protector;
 
-pub(crate) use hydration::{HydrationCapabilities, StageOutcome};
+pub(crate) use hydration::{HydrationCapabilities, HydrationRequest, StageOutcome};
 
 #[cfg(test)]
 use coordinator::{
@@ -12,14 +13,14 @@ use coordinator::{
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use gonedrive_core::config::Config;
 use gonedrive_core::db::Store;
 use gonedrive_core::graph::GraphClient;
-use gonedrive_core::sync::engine::{Direction, Engine, SafetyStopKind, SyncEvent};
+use gonedrive_core::sync::engine::{Direction, Engine, SafetyStopKind, SyncEvent, SyncSummary};
 use gonedrive_core::{Authenticator, Error, TokenStore};
 use gonedrive_ipc::reader_policy::{
     is_browsing_reader, is_bulk_copier, is_file_manager_copy_reader, is_file_manager_reader,
@@ -196,6 +197,10 @@ pub enum DaemonEvent {
 
 /// A placeholder currently being filled.
 struct InFlight {
+    /// The HSM request id that created this entry.  Completion messages carry
+    /// the same id so a late range callback cannot tear down a newer request
+    /// for the same path.
+    request_id: u64,
     hydration: Hydration,
     /// Only whole-file fills represent an operation the user is waiting for.
     /// Range fills are quiet file-manager reads and must never appear in the
@@ -207,11 +212,44 @@ struct InFlight {
     /// Held from staging until the helper reports Filled, so no second reader
     /// can truncate or consume the same sibling staging file.
     _path_guard: OwnedMutexGuard<()>,
+    /// Only one helper completion may commit this request.  Fanotify can
+    /// legitimately report the final materialised range more than once.
+    finishing: bool,
 }
 
 #[derive(Default)]
 struct PathLocks {
     locks: Mutex<HashMap<std::path::PathBuf, Weak<Mutex<()>>>>,
+    /// Paths currently being turned into placeholders.  Fanotify can deliver
+    /// a permission event after the release request has started but before a
+    /// worker has handed it to the daemon; the reference count keeps that
+    /// late event from starting a new hydration.  Counts (rather than a set)
+    /// are required because overlapping subtree releases are allowed to wait
+    /// on the same paths.
+    releasing: StdMutex<HashMap<std::path::PathBuf, usize>>,
+}
+
+/// A cancellation-safe lease on the paths covered by a space release. It is
+/// synchronous so a cancelled D-Bus future still clears its protection in
+/// `Drop` rather than leaving a path blocked until the daemon restarts.
+struct ReleaseBarrier<'a> {
+    state: &'a StdMutex<HashMap<std::path::PathBuf, usize>>,
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl Drop for ReleaseBarrier<'_> {
+    fn drop(&mut self) {
+        let mut releasing = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        for path in &self.paths {
+            let remove = releasing.get_mut(path).is_some_and(|count| {
+                *count = count.saturating_sub(1);
+                *count == 0
+            });
+            if remove {
+                releasing.remove(path);
+            }
+        }
+    }
 }
 
 impl PathLocks {
@@ -229,6 +267,48 @@ impl PathLocks {
             }
         };
         path_lock.lock_owned().await
+    }
+
+    /// Acquire a stable, deadlock-free set of path locks.  Space release can
+    /// cover a whole subtree while hydration requests arrive concurrently; a
+    /// sorted/deduplicated order keeps two overlapping subtree operations from
+    /// waiting on each other forever.
+    async fn acquire_many(&self, paths: &[std::path::PathBuf]) -> Vec<OwnedMutexGuard<()>> {
+        let mut ordered = paths.to_vec();
+        ordered.sort();
+        ordered.dedup();
+        let mut guards = Vec::with_capacity(ordered.len());
+        for path in ordered {
+            guards.push(self.acquire(&path).await);
+        }
+        guards
+    }
+
+    fn begin_release(&self, paths: &[std::path::PathBuf]) -> ReleaseBarrier<'_> {
+        let paths = paths
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut releasing = self
+            .releasing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for path in &paths {
+            *releasing.entry(path.clone()).or_default() += 1;
+        }
+        ReleaseBarrier {
+            state: &self.releasing,
+            paths,
+        }
+    }
+
+    fn is_releasing(&self, path: &std::path::Path) -> bool {
+        self.releasing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(path)
     }
 }
 
@@ -249,6 +329,11 @@ pub struct App {
     /// Placeholders being filled right now, keyed by absolute path.
     hydrations: Arc<RwLock<HashMap<std::path::PathBuf, InFlight>>>,
     hydration_locks: PathLocks,
+    /// Serialises content downloads with space release.  A queued transfer can
+    /// already have popped its durable row when the user asks to release a
+    /// file; letting both write concurrently would materialise it again after
+    /// the release returns.
+    pub(crate) download_gate: Arc<Mutex<()>>,
 
     /// The privileged helper, when files-on-demand is available. Without it a
     /// placeholder is just a file full of zeroes that nothing will ever fill.
@@ -299,6 +384,7 @@ impl App {
             requested_sync_generation: AtomicU64::new(0),
             hydrations: Arc::new(RwLock::new(HashMap::new())),
             hydration_locks: PathLocks::default(),
+            download_gate: Arc::new(Mutex::new(())),
             hsm: RwLock::new(None),
             pending_placeholder_reports: Mutex::new(PendingPlaceholderReports::default()),
             open_intents,
@@ -308,8 +394,48 @@ impl App {
         Ok(app)
     }
 
-    pub(crate) fn start_open_intent_monitor(&self) {
+    pub(crate) fn start_open_intent_monitor(self: &Arc<Self>) {
+        let mut explicit = self.open_intents.subscribe();
+        let app = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let path = match explicit.recv().await {
+                    Ok(path) => path,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::debug!(skipped, "desktop open intents were coalesced");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                };
+                let Some(app) = app.upgrade() else {
+                    return;
+                };
+                app.populate_desktop_directory(&path).await;
+            }
+        });
         tokio::spawn(self.open_intents.clone().supervise());
+    }
+
+    pub(crate) async fn desktop_open_decision(
+        &self,
+        path: &std::path::Path,
+    ) -> crate::open_intent::OpenDecision {
+        self.open_intents.decide(path).await
+    }
+
+    async fn populate_desktop_directory(&self, path: &std::path::Path) {
+        if gonedrive_core::hydrate::Placeholder::directory_population(path)
+            != gonedrive_core::hydrate::DirectoryPopulation::Partial
+        {
+            return;
+        }
+        let Ok(relative) = path.strip_prefix(&self.config.sync_root) else {
+            return;
+        };
+        tracing::debug!(path = %path.display(), "desktop navigated to a partial directory");
+        if let Err(error) = self.populate_folder(relative).await {
+            tracing::warn!(path = %path.display(), %error, "could not populate the desktop's open directory");
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
@@ -325,7 +451,7 @@ impl App {
     /// Item ids and placeholder xattrs are not namespaced by account yet, so
     /// allowing two engines to scan the same root could copy content between
     /// accounts. Refuse that legacy state before either engine touches disk.
-    pub async fn load_accounts(&self) -> Result<usize> {
+    pub async fn load_accounts(self: &Arc<Self>) -> Result<usize> {
         let accounts = self.store.accounts()?;
         if accounts.len() > 1 {
             let ids = accounts
@@ -354,7 +480,7 @@ impl App {
     /// Retry accounts that exist in the database but could not be attached at
     /// startup, most commonly because the login keyring was locked. Called by
     /// an explicit SyncNow after the user has unlocked it.
-    pub(super) async fn attach_missing_accounts(&self) -> Result<usize> {
+    pub(super) async fn attach_missing_accounts(self: &Arc<Self>) -> Result<usize> {
         let active: std::collections::HashSet<_> =
             self.engines.read().await.keys().cloned().collect();
         let mut attached = 0;
@@ -369,7 +495,7 @@ impl App {
     }
 
     /// Build and register the engine for one account.
-    pub async fn attach_account(&self, account_id: &str) -> Result<()> {
+    pub async fn attach_account(self: &Arc<Self>, account_id: &str) -> Result<()> {
         if let Some(other) = self
             .store
             .accounts()?
@@ -406,6 +532,7 @@ impl App {
             self.config.clone(),
             account_id.to_string(),
         ));
+        self.install_placeholder_protector(&engine);
 
         // A crash mid-hydration leaves records claiming work that died with
         // the process; correct them before anything trusts the database.
@@ -588,7 +715,22 @@ impl App {
                                 continue;
                             }
                             SyncEvent::HydrationFinished { path, ok } => {
-                                hydrations.write().await.remove(&path);
+                                // `finish_hydration`, `fail_hydration`, and
+                                // `restore_mtime` own the terminal handshake
+                                // and keep the path guard until their work is
+                                // complete. Do not let this asynchronous event
+                                // task drop a newer request's guard midway
+                                // through that work. The fallback removal is
+                                // only for an unexpected engine event with no
+                                // owner in the daemon map.
+                                let mut hydration_guard = hydrations.write().await;
+                                let owned = hydration_guard
+                                    .get(&path)
+                                    .is_some_and(|entry| entry.finishing);
+                                if !owned {
+                                    hydration_guard.remove(&path);
+                                }
+                                drop(hydration_guard);
                                 // On-demand fetches belong in the activity list
                                 // just like scheduled downloads: to the user
                                 // both are "this file arrived".
@@ -621,10 +763,11 @@ impl App {
                             SyncEvent::Finished(summary) => {
                                 cycle_failed |= summary.failed > 0;
                                 active_phases = active_phases.saturating_sub(1);
-                                // One line per pass with every counter: the
-                                // log alone should answer "what did that sync
-                                // just do", without anyone reproducing it.
-                                if summary != Default::default() {
+                                // Delta enumeration by itself is routine and
+                                // happens every poll. Keep info logs for real
+                                // outcomes; an idle trace remains available
+                                // when RUST_LOG explicitly enables debug.
+                                if summary_has_reportable_activity(&summary) {
                                     tracing::info!(
                                         downloaded = summary.downloaded,
                                         uploaded = summary.uploaded,
@@ -632,8 +775,17 @@ impl App {
                                         deleted_remote = summary.deleted_remote,
                                         conflicts = summary.conflicts,
                                         skipped = summary.skipped,
+                                        failed = summary.failed,
+                                        refused_deletions = summary.refused_deletions,
                                         queued = summary.still_queued,
                                         "sync pass finished"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        enumerated = summary.enumerated,
+                                        not_downloaded = summary.not_downloaded,
+                                        queued = summary.still_queued,
+                                        "sync pass finished without changes"
                                     );
                                 }
                                 current.state = phase_completion_state(
@@ -789,6 +941,7 @@ impl App {
 
     /// Work through queued transfers only, skipping enumeration.
     pub async fn transfer_all(&self) -> Result<()> {
+        let _download_gate = self.download_gate.lock().await;
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         for engine in engines {
             if let Err(e) = engine.transfer_only().await {
@@ -801,6 +954,12 @@ impl App {
 
     /// One pass over every account. Returns whether anything actually moved.
     pub async fn sync_all(&self) -> bool {
+        // The one-shot command can run beside a helper callback when a user
+        // invokes it from a file manager.  Keep its queued content transfer
+        // from racing a simultaneous release; remote enumeration itself is
+        // still cheap and remains outside this gate in the long-running
+        // coordinator.
+        let _download_gate = self.download_gate.lock().await;
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         let mut did_work = false;
 
@@ -847,40 +1006,76 @@ impl App {
                     continue;
                 }
             };
-            let mut protected = Vec::new();
-            let mut protection_failed = false;
-            for path in &candidates {
-                match hsm.watch(path).await {
-                    Ok(()) => protected.push(path.clone()),
-                    Err(error) => {
-                        tracing::error!(path = %path.display(), %error, "auto-free mark failed");
-                        protection_failed = true;
-                        break;
+            let _release_barrier = self.hydration_locks.begin_release(&candidates);
+            {
+                let _path_guards = self.hydration_locks.acquire_many(&candidates).await;
+                let mut protected = Vec::new();
+                let mut protection_failed = false;
+                for path in &candidates {
+                    match hsm.watch(path).await {
+                        Ok(()) => protected.push(path.clone()),
+                        Err(error) => {
+                            tracing::error!(path = %path.display(), %error, "auto-free mark failed");
+                            if let Err(lock_error) = self.lock_unwatched_placeholder(path).await {
+                                tracing::error!(
+                                    path = %path.display(),
+                                    error = %lock_error,
+                                    "could not safety-lock an unprotected auto-free target"
+                                );
+                            }
+                            protection_failed = true;
+                            break;
+                        }
                     }
                 }
-            }
-            if protection_failed {
-                for path in protected {
-                    let _ = hsm.unwatch(&path).await;
-                }
-                continue;
-            }
-            match engine.auto_free(threshold) {
-                Ok(outcome) if outcome.files > 0 => {
-                    tracing::info!(
-                        files = outcome.files,
-                        freed = outcome.freed,
-                        "auto-released space"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "auto-free failed"),
-            }
-            for path in candidates {
-                if gonedrive_core::hydrate::Placeholder::state(&path)
-                    != gonedrive_core::hydrate::PlaceholderState::Dehydrated
-                {
-                    let _ = hsm.unwatch(&path).await;
+                if protection_failed {
+                    for path in protected {
+                        let _ = hsm.unwatch(&path).await;
+                    }
+                } else {
+                    let free_result = {
+                        let _download_gate = self.download_gate.lock().await;
+                        engine.auto_free(threshold)
+                    };
+
+                    // A queued fast-path event may have retired a mark while
+                    // the file was still materialised. Re-register the final
+                    // dehydrated set before allowing new events through.
+                    let dehydrated: Vec<_> = candidates
+                        .iter()
+                        .filter(|path| {
+                            gonedrive_core::hydrate::Placeholder::state(path)
+                                == gonedrive_core::hydrate::PlaceholderState::Dehydrated
+                        })
+                        .cloned()
+                        .collect();
+                    let protection_error = if dehydrated.is_empty() {
+                        None
+                    } else {
+                        self.protect_placeholders(&hsm, &dehydrated).await.err()
+                    };
+
+                    match free_result {
+                        Ok(outcome) if outcome.files > 0 => {
+                            tracing::info!(
+                                files = outcome.files,
+                                freed = outcome.freed,
+                                "auto-released space"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "auto-free failed"),
+                    }
+                    if let Some(error) = protection_error {
+                        tracing::error!(%error, "could not re-protect placeholders after auto-free");
+                    }
+                    for path in &candidates {
+                        if gonedrive_core::hydrate::Placeholder::state(path)
+                            != gonedrive_core::hydrate::PlaceholderState::Dehydrated
+                        {
+                            let _ = hsm.unwatch(path).await;
+                        }
+                    }
                 }
             }
         }
@@ -895,6 +1090,17 @@ fn phase_state(paused: bool, active_phases: u64) -> &'static str {
     } else {
         "syncing"
     }
+}
+
+fn summary_has_reportable_activity(summary: &SyncSummary) -> bool {
+    summary.downloaded > 0
+        || summary.uploaded > 0
+        || summary.deleted_local > 0
+        || summary.deleted_remote > 0
+        || summary.conflicts > 0
+        || summary.skipped > 0
+        || summary.failed > 0
+        || summary.refused_deletions > 0
 }
 
 fn phase_completion_state(paused: bool, active_phases: u64, cycle_failed: bool) -> &'static str {

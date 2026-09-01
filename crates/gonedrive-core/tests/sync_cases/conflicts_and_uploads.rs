@@ -105,6 +105,10 @@ async fn a_cloud_edit_to_a_hydrated_on_demand_file_re_downloads_in_place() {
     )
     .await;
     h.sync().await;
+    h.engine
+        .populate_folder(Path::new("Docs"))
+        .await
+        .unwrap();
     let path = h.path("Docs/note.txt");
     assert_eq!(
         Placeholder::state(&path),

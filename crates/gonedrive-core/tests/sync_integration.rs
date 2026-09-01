@@ -6,13 +6,15 @@
 //! a unit test of the conflict matrix cannot catch a download that lands in the
 //! wrong directory or a delete that outruns its guard.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use gonedrive_core::config::{Config, DownloadPolicy};
 use gonedrive_core::db::{Account, ItemRecord, ItemState, OpKind, PinState, Store};
 use gonedrive_core::graph::GraphClient;
-use gonedrive_core::sync::engine::{Engine, QueueScope, SyncSummary};
+use gonedrive_core::sync::engine::{Engine, PlaceholderProtector, QueueScope, SyncSummary};
 use gonedrive_core::TokenSource;
 use serde_json::{json, Value};
 use wiremock::matchers::{
@@ -30,6 +32,46 @@ struct Harness {
     config: Arc<Config>,
     root: PathBuf,
     _tmp: tempfile::TempDir,
+}
+
+#[derive(Default)]
+struct TestPlaceholderProtector {
+    calls: AtomicUsize,
+}
+
+impl PlaceholderProtector for TestPlaceholderProtector {
+    fn protect<'a>(
+        &'a self,
+        paths: &'a [PathBuf],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = gonedrive_core::Result<()>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert!(!paths.is_empty());
+            for path in paths {
+                let mut permissions = std::fs::metadata(path)?.permissions();
+                assert_eq!(permissions.mode() & 0o7777, 0);
+                // The real HSM runs as root and reads the saved xattr through
+                // its authorised O_PATH descriptor. This unprivileged test
+                // helper temporarily grants only its owner enough access to
+                // inspect the same marker.
+                permissions.set_mode(0o600);
+                std::fs::set_permissions(path, permissions)?;
+                let saved = xattr::get(path, "user.gonedrive.safety_mode")?
+                    .expect("a progressive placeholder must be safety-locked");
+                let saved: [u8; 4] = saved
+                    .try_into()
+                    .expect("the saved placeholder mode is a u32");
+                let mut permissions = std::fs::metadata(path)?.permissions();
+                permissions.set_mode(u32::from_le_bytes(saved));
+                std::fs::set_permissions(path, permissions)?;
+                xattr::remove(path, "user.gonedrive.safety_mode")?;
+            }
+            self.calls.fetch_add(1, Ordering::Release);
+            Ok(())
+        })
+    }
 }
 
 impl Harness {
@@ -142,6 +184,41 @@ impl Harness {
 
     /// Serve one delta page, ending the enumeration with `delta_token`.
     async fn mock_delta(&self, query: Option<(&str, &str)>, items: Vec<Value>, delta_token: &str) {
+        if query.is_none()
+            && self.config.on_demand
+            && self.config.download_new == DownloadPolicy::Never
+        {
+            let baseline = format!("bootstrap-{delta_token}");
+            Mock::given(method("GET"))
+                .and(path("/me/drive/root/delta"))
+                .and(query_param("token", "latest"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "value": [],
+                    "@odata.deltaLink": format!(
+                        "{}/me/drive/root/delta?token={baseline}",
+                        self.server.uri()
+                    )
+                })))
+                .mount(&self.server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/me/drive/root/delta"))
+                .and(query_param("token", baseline.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "value": [],
+                    "@odata.deltaLink": format!(
+                        "{}/me/drive/root/delta?token={delta_token}",
+                        self.server.uri()
+                    )
+                })))
+                .mount(&self.server)
+                .await;
+
+            self.mock_children(&items, true).await;
+            return;
+        }
+
+        self.mock_children(&items, false).await;
         let body = json!({
             "value": items,
             "@odata.deltaLink": format!("{}/me/drive/root/delta?token={delta_token}", self.server.uri()),
@@ -153,6 +230,42 @@ impl Harness {
         mock.respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(&self.server)
             .await;
+    }
+
+    async fn mock_children(&self, items: &[Value], include_empty_root: bool) {
+        use std::collections::HashMap;
+
+        let mut children: HashMap<String, Vec<Value>> = HashMap::new();
+        for item in items {
+            if item.get("root").is_some() || item.get("deleted").is_some() {
+                continue;
+            }
+            if item.get("folder").is_some() {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    children.entry(id.to_string()).or_default();
+                }
+            }
+            let Some(parent) = item.pointer("/parentReference/id").and_then(Value::as_str) else {
+                continue;
+            };
+            children
+                .entry(parent.to_string())
+                .or_default()
+                .push(item.clone());
+        }
+        if include_empty_root {
+            children.entry(ROOT.to_string()).or_default();
+        }
+        for (parent, value) in children {
+            Mock::given(method("GET"))
+                .and(path(format!("/me/drive/items/{parent}/children")))
+                .and(query_param("$top", "1000"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "value": value
+                })))
+                .mount(&self.server)
+                .await;
+        }
     }
 
     async fn mock_download(&self, item_id: &str, content: &'static [u8]) {
@@ -231,6 +344,7 @@ fn mtime_rfc3339(path: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 include!("sync_cases/remote_and_safety.rs");
+include!("sync_cases/initial_delta.rs");
 
 include!("sync_cases/selection_and_transfer.rs");
 

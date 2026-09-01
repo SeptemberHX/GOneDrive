@@ -38,6 +38,10 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
 /// Items per delta page. Fewer round trips on large drives; the service caps
 /// what it will actually return.
 const DELTA_PAGE_SIZE: u32 = 1000;
+/// Direct children per request. Graph may return fewer and provide a nextLink;
+/// callers must always follow the server's continuation rather than assuming
+/// this requested size was honoured.
+const CHILDREN_PAGE_SIZE: u32 = 1000;
 
 pub struct GraphClient {
     http: reqwest::Client,
@@ -110,6 +114,35 @@ impl GraphClient {
         let url = match link {
             Some(link) => self.trusted_graph_link(link)?,
             None => format!("{base}/me/drive/root/delta?$top={DELTA_PAGE_SIZE}"),
+        };
+        let response = self.send(|http| http.get(&url)).await?;
+        Ok(response.json().await?)
+    }
+
+    /// Establish a change cursor at the service's current point without walking
+    /// every historical item first. Files-on-demand combines this cursor with
+    /// direct-children listings: the cursor is persisted before a directory is
+    /// listed, so changes racing that non-snapshot pagination are observed by the
+    /// following delta poll.
+    pub async fn latest_delta(&self) -> Result<DeltaPage> {
+        let url = format!("{}/me/drive/root/delta?token=latest", self.base);
+        let response = self.send(|http| http.get(&url)).await?;
+        Ok(response.json().await?)
+    }
+
+    /// Fetch one page of a folder's direct children.
+    ///
+    /// This is the partial-population path used when a directory is enumerated.
+    /// A children listing is not an authoritative drive snapshot; the already
+    /// established delta cursor reconciles writes that race its pagination.
+    pub async fn children(&self, parent_id: &str, link: Option<&str>) -> Result<DeltaPage> {
+        let base = &self.base;
+        let url = match link {
+            Some(link) => self.trusted_graph_link(link)?,
+            None => {
+                let parent_id = urlencode_segment(parent_id);
+                format!("{base}/me/drive/items/{parent_id}/children?$top={CHILDREN_PAGE_SIZE}")
+            }
         };
         let response = self.send(|http| http.get(&url)).await?;
         Ok(response.json().await?)

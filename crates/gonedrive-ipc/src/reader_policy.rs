@@ -28,6 +28,19 @@ pub const BACKGROUND_READERS: &[&str] = &[
     "mlocate",
     "clamd", // on-access antivirus
     "freshclam",
+    // Recursive/search tools and shell completion inspect directory entries as
+    // an implementation detail. Treating their opens as foreground navigation
+    // would populate an entire lazy tree one directory at a time.
+    "find",
+    "fd",
+    "rg",
+    "grep",
+    "du",
+    "tree",
+    "locate",
+    "bash",
+    "zsh",
+    "fish",
 ];
 
 /// Tools that copy whole files. Being sparse-aware, they would otherwise SEEK
@@ -158,5 +171,16 @@ mod tests {
         }
         assert!(!is_progressive_reader("libreoffice"));
         assert!(!is_progressive_reader("cp"));
+    }
+
+    #[test]
+    fn recursive_scanners_and_shells_are_background_readers() {
+        for reader in [
+            "find", "fd", "rg", "grep", "du", "tree", "bash", "zsh", "fish",
+        ] {
+            assert!(is_background_reader(reader).is_some(), "{reader}");
+        }
+        // An explicit directory listing remains a foreground action.
+        assert!(is_background_reader("ls").is_none());
     }
 }

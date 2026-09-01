@@ -16,7 +16,7 @@ use gonedrive_ipc::reader_policy::{
 use crate::fanotify::PreContentEvent;
 use crate::marks::remove_mark_by_event_fd;
 use crate::server::send_to_session;
-use crate::{ClientSession, FileIdentity, Pending, Reply, Shared, HYDRATE_TIMEOUT};
+use crate::{ClientSession, FileIdentity, MarkKind, Pending, Reply, Shared, HYDRATE_TIMEOUT};
 
 /// Poll for events and hand each one to a worker.
 ///
@@ -51,14 +51,15 @@ pub(super) fn event_loop(
                     match workers.try_send(event) {
                         Ok(()) => {}
                         Err(mpsc::TrySendError::Full(event)) => {
-                            tracing::warn!(
-                                pid = event.pid,
-                                "hydration queue is full; denying read"
-                            );
-                            let _ = shared.fan.respond(event.fd.as_raw_fd(), false);
+                            tracing::warn!(pid = event.pid, "fanotify worker queue is full");
+                            if event.requires_response {
+                                let _ = shared.fan.respond(event.fd.as_raw_fd(), false);
+                            }
                         }
                         Err(mpsc::TrySendError::Disconnected(event)) => {
-                            let _ = shared.fan.respond(event.fd.as_raw_fd(), false);
+                            if event.requires_response {
+                                let _ = shared.fan.respond(event.fd.as_raw_fd(), false);
+                            }
                             return Ok(());
                         }
                     }
@@ -85,7 +86,9 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
         Ok(stat) => stat,
         Err(error) => {
             tracing::warn!(%error, "cannot identify fanotify event target");
-            let _ = shared.fan.respond(fd, false);
+            if event.requires_response {
+                let _ = shared.fan.respond(fd, false);
+            }
             return;
         }
     };
@@ -93,35 +96,114 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
         dev: stat.st_dev as u64,
         ino: stat.st_ino as u64,
     };
-    let uid = {
+
+    // Registration itself must be able to inspect an inode after the kernel
+    // mark exists but before the userspace registry entry is committed. This
+    // window is small, but a cold helper restart crosses it once per existing
+    // placeholder. Requiring a registry hit first makes the helper deny its
+    // own/daemon reopen and prevents the sweep from ever completing.
+    let daemon_is_reader = shared
+        .sessions
+        .lock()
+        .unwrap()
+        .get(&(stat.st_uid as u32))
+        .is_some_and(|client| event.pid == client.pid);
+    if event.requires_response && (event.pid == std::process::id() as i32 || daemon_is_reader) {
+        if let Err(error) = shared.fan.respond(fd, true) {
+            tracing::error!(%error, "could not allow the registration process");
+        }
+        return;
+    }
+
+    let (uid, kind, registered_path, child_notification) = {
         let marks = shared.marks.lock().unwrap();
         match marks.get(&identity) {
-            Some(entry) if entry.uid == stat.st_uid => entry.uid,
+            Some(entry) if entry.uid == stat.st_uid => {
+                (entry.uid, entry.kind, entry.path.clone(), false)
+            }
+            None if event.requires_response && event.is_open => {
+                let Some(path) = event.path.as_deref() else {
+                    let _ = shared.fan.respond(fd, false);
+                    return;
+                };
+                let Some(parent) = marks.population_parent(stat.st_uid, path) else {
+                    tracing::debug!(path = %path.display(), "denying an unregistered open target");
+                    let _ = shared.fan.respond(fd, false);
+                    return;
+                };
+                match stat.st_mode & libc::S_IFMT {
+                    libc::S_IFDIR => (stat.st_uid, MarkKind::PopulationDirectory, parent, true),
+                    libc::S_IFREG => {
+                        // FAN_ONDIR adds directory events; it does not exclude
+                        // ordinary files. A populated-parent mark therefore
+                        // sees every direct child file too. Hydrated and local
+                        // files need no callback, while a dehydrated file whose
+                        // exact mark is not installed must remain fail-closed.
+                        let allow = match unregistered_population_file_is_safe(fd) {
+                            Ok(allow) => allow,
+                            Err(error) => {
+                                tracing::debug!(path = %path.display(), %error, "could not classify an unregistered population child");
+                                false
+                            }
+                        };
+                        let _ = shared.fan.respond(fd, allow);
+                        return;
+                    }
+                    _ => {
+                        tracing::debug!(path = %path.display(), "denying a non-file population child");
+                        let _ = shared.fan.respond(fd, false);
+                        return;
+                    }
+                }
+            }
             _ => {
-                tracing::warn!(
+                tracing::debug!(
                     dev = identity.dev,
                     ino = identity.ino,
                     "denying an unregistered event target"
                 );
-                let _ = shared.fan.respond(fd, false);
+                if event.requires_response {
+                    let _ = shared.fan.respond(fd, false);
+                }
                 return;
             }
         }
     };
     let client = shared.sessions.lock().unwrap().get(&uid).cloned();
-    let Some(client) = client else {
-        let _ = shared.fan.respond(fd, false);
-        return;
-    };
-
-    // The daemon's own access is always deliberate; blocking it on a question
-    // only it can answer is a deadlock. Straight through.
-    if event.pid == client.pid || event.pid == std::process::id() as i32 {
-        if let Err(e) = shared.fan.respond(fd, true) {
-            tracing::error!(error = %e, "could not answer our own client");
+    if kind == MarkKind::PopulationDirectory && !child_notification {
+        // FAN_EVENT_ON_CHILD marks can also report the marked directory
+        // itself. It is already populated, so it never needs a callback and
+        // must remain usable while the daemon is restarting.
+        if event.requires_response {
+            let _ = shared.fan.respond(fd, true);
         }
         return;
     }
+    let Some(client) = client else {
+        if event.requires_response {
+            let _ = shared.fan.respond(fd, false);
+        }
+        return;
+    };
+
+    if kind == MarkKind::PopulationDirectory {
+        handle_directory_open(&shared, &client, uid, &event, &registered_path);
+        return;
+    }
+
+    // Placeholder marks consist exclusively of permission events. If the
+    // kernel ever reports something else for one, dropping the notification
+    // is safer than writing an invalid response into the fanotify group.
+    if !event.requires_response {
+        tracing::warn!(path = ?event.path, mask = "notification", "unexpected non-permission placeholder event");
+        return;
+    }
+
+    // Allocate one id for the entire permission event, including the
+    // already-materialised fast path below.  A path-only (id=0) completion can
+    // otherwise be mistaken for a newer request when a release and a read
+    // overlap on the same inode.
+    let request_id = shared.next_id.fetch_add(1, Ordering::Relaxed);
 
     // Background sweeps are refused before any work is done, so they neither
     // download anything nor put a progress window on the user's screen for a
@@ -159,19 +241,22 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
                     if let Err(error) = mark_hydrated(fd) {
                         tracing::warn!(path = ?event.path, %error, "could not repair fully materialized placeholder state");
                     }
-                    if let Err(error) = remove_mark_by_event_fd(&shared, identity, fd) {
-                        tracing::debug!(path = ?event.path, %error, "could not drop repaired hydrated mark");
-                    }
                 }
                 if let Err(error) = shared.fan.respond(fd, true) {
                     tracing::error!(%error, "could not allow a materialized range");
                 }
                 if fully_materialized {
+                    // Keep the mark until the daemon acknowledges this
+                    // completion.  A release can be punching holes at the
+                    // same time; retiring the mark here would race that
+                    // operation and leave the new placeholder unprotected.
+                    // The daemon unwatches a hydrated path, while a
+                    // dehydrated path deliberately keeps the mark.
                     if let Some(path) = &event.path {
                         let _ = send_to_session(
                             &client,
                             &Event::Filled {
-                                id: 0,
+                                id: request_id,
                                 ok: true,
                                 path: path.to_string_lossy().into_owned(),
                                 full: true,
@@ -210,7 +295,10 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
         tracing::info!(reader = %comm, path = ?event.path, "copier open; hydrating whole file");
     }
 
-    let (allow, full) = match hydrate(&shared, &event, uid, &client) {
+    // Keep the request id on the fanotify worker's stack until the final
+    // `Filled` event is sent.  The daemon uses it to reject a late completion
+    // from an older range read that overlaps a newer whole-file request.
+    let (allow, full) = match hydrate(&shared, &event, uid, &client, request_id) {
         Ok(result) => result,
         Err(e) => {
             tracing::warn!(error = %e, pid = event.pid, "hydration failed");
@@ -232,7 +320,7 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
         let _ = send_to_session(
             &client,
             &Event::Filled {
-                id: 0,
+                id: request_id,
                 ok: allow,
                 path: path.to_string_lossy().into_owned(),
                 full,
@@ -241,22 +329,102 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
     }
 }
 
+fn handle_directory_open(
+    shared: &Arc<Shared>,
+    client: &ClientSession,
+    uid: u32,
+    event: &PreContentEvent,
+    registered_path: &Path,
+) {
+    // A foreground open waits until the daemon has published every direct
+    // child, matching CFAPI's FULL population contract.
+    if !event.requires_response || !event.is_open {
+        tracing::warn!(path = ?event.path, "unexpected directory fanotify event kind");
+        if event.requires_response {
+            let _ = shared.fan.respond(event.fd.as_raw_fd(), false);
+        }
+        return;
+    }
+    if event.pid == client.pid || event.pid == std::process::id() as i32 {
+        let _ = shared.fan.respond(event.fd.as_raw_fd(), true);
+        return;
+    }
+    if let Some(reader) = background_reader(event.pid) {
+        tracing::debug!(
+            pid = event.pid,
+            reader,
+            path = ?event.path,
+            "allowing background open without populating a partial directory"
+        );
+        let _ = shared.fan.respond(event.fd.as_raw_fd(), true);
+        return;
+    }
+
+    let reader = process_name(event.pid);
+    let path = event.path.as_deref().unwrap_or(registered_path);
+    let ok = match request_directory_population(shared, client, uid, path, reader, event.pid) {
+        Ok(ok) => ok,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "directory population failed");
+            false
+        }
+    };
+    if let Err(error) = shared.fan.respond(event.fd.as_raw_fd(), ok) {
+        tracing::error!(path = %path.display(), %error, "could not answer directory open");
+    }
+}
+
+fn request_directory_population(
+    shared: &Arc<Shared>,
+    client: &ClientSession,
+    uid: u32,
+    path: &Path,
+    reader: String,
+    pid: i32,
+) -> Result<bool> {
+    const POPULATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = mpsc::channel();
+    let request = Event::DirectoryOpened {
+        id,
+        path: path.to_string_lossy().into_owned(),
+        reader,
+        pid,
+    };
+    shared.begin_request(uid, client, id, Pending { uid, reply: tx }, &request)?;
+    let reply = match rx.recv_timeout(POPULATE_TIMEOUT) {
+        Ok(reply) => reply,
+        Err(_) => {
+            shared.pending.lock().unwrap().remove(&id);
+            bail!("the daemon did not populate within {POPULATE_TIMEOUT:?}")
+        }
+    };
+    Ok(matches!(reply, Reply::DirectoryPopulated(true)))
+}
+
+fn process_name(pid: i32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|name| name.trim().to_string())
+        .unwrap_or_default()
+}
+
 fn hydrate(
     shared: &Arc<Shared>,
     event: &PreContentEvent,
     uid: u32,
     session: &ClientSession,
+    request_id: u64,
 ) -> Result<(bool, bool)> {
     let Some(path) = &event.path else {
         bail!("the event carried no resolvable path");
     };
 
-    let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
 
     let reader = hydration_reader(event.pid, path);
     let request = Event::Hydrate {
-        id,
+        id: request_id,
         path: path.to_string_lossy().into_owned(),
         offset: event.offset,
         // A zero-length range means the kernel did not say; ask for the whole
@@ -265,12 +433,18 @@ fn hydrate(
         reader: reader.clone(),
         is_open: event.is_open,
     };
-    shared.begin_hydration(uid, session, id, Pending { uid, reply: tx }, &request)?;
+    shared.begin_request(
+        uid,
+        session,
+        request_id,
+        Pending { uid, reply: tx },
+        &request,
+    )?;
 
     let reply = match rx.recv_timeout(HYDRATE_TIMEOUT) {
         Ok(reply) => reply,
         Err(_) => {
-            shared.pending.lock().unwrap().remove(&id);
+            shared.pending.lock().unwrap().remove(&request_id);
             bail!("the daemon did not answer within {HYDRATE_TIMEOUT:?}")
         }
     };
@@ -282,6 +456,7 @@ fn hydrate(
         // from a failed fill. The daemon has no hydration state to unwind for
         // this path and must not publish a spurious failure completion.
         Reply::Deny => return Ok((false, false)),
+        Reply::DirectoryPopulated(_) => bail!("received a directory reply for a file hydration"),
     };
 
     let staged_len = staged.metadata()?.len();
@@ -330,7 +505,7 @@ fn hydrate(
     } else {
         // Only the requested window was filled; the watch stays, so a reader
         // that keeps going comes back for the rest.
-        tracing::info!(
+        tracing::debug!(
             path = %path.display(),
             bytes = written,
             offset,
@@ -401,6 +576,34 @@ pub(super) fn requested_range_is_materialized(
 
 fn descriptor_len(fd: std::os::unix::io::RawFd) -> Result<u64> {
     Ok(descriptor_stat(fd)?.st_size.max(0) as u64)
+}
+
+/// Whether a regular file reported only through its populated-parent mark can
+/// be opened without an exact placeholder mark. Missing state means it is a
+/// normal local file; hydrated state means all bytes are already present.
+/// Dehydrated or malformed state stays fail-closed until registration finishes.
+pub(super) fn unregistered_population_file_is_safe(fd: RawFd) -> std::io::Result<bool> {
+    const STATE_XATTR: &[u8] = b"user.gonedrive.state\0";
+    let mut value = [0u8; 32];
+    // SAFETY: `fd` belongs to the live fanotify event, the name is NUL
+    // terminated, and `value` is a writable buffer of the supplied length.
+    let len = unsafe {
+        libc::fgetxattr(
+            fd,
+            STATE_XATTR.as_ptr().cast(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if len < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENODATA) {
+            Ok(true)
+        } else {
+            Err(error)
+        };
+    }
+    Ok(matches!(&value[..len as usize], b"hydrated" | b"unmanaged"))
 }
 
 pub(super) fn expected_fill_len(

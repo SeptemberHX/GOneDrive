@@ -20,9 +20,9 @@ pub(crate) async fn sync_once() -> Result<()> {
         anyhow::bail!("no accounts are signed in; run `gonedrived login` first");
     }
 
-    // A first pass over a large drive spends minutes reading the file list
-    // before it transfers anything. Printing nothing for that whole time is
-    // indistinguishable from having hung.
+    // Remote requests and queued transfers can still take time on a slow
+    // connection. Surface progress even though files-on-demand no longer
+    // performs a historical whole-drive enumeration on first login.
     let progress = spawn_progress(&app);
 
     app.sync_all().await;

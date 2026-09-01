@@ -16,6 +16,9 @@ Type=simple
 ExecStart=/usr/local/bin/gonedrive-hsm
 Restart=on-failure
 RestartSec=5
+# A malformed-event or filesystem-error loop must not fill the system journal.
+LogRateLimitIntervalSec=1min
+LogRateLimitBurst=30
 # Exportable filesystems use persistent inode handles and one anchor descriptor
 # per mount. Keep a high ceiling for the safety-preserving descriptor fallback
 # on filesystems that cannot reopen handles; the ceiling itself allocates no fd.

@@ -20,6 +20,10 @@ Type=simple
 ExecStart=/usr/local/bin/gonedrived run
 Restart=on-failure
 RestartSec=10
+# A repeated filesystem or network failure must not fill the journal. Normal
+# release builds log only warnings and errors; this remains the final backstop.
+LogRateLimitIntervalSec=1min
+LogRateLimitBurst=30
 
 # Hardening — seccomp/capability class only, deliberately NOT mount-namespace
 # class. The daemon connects to the privileged helper's root-owned socket at

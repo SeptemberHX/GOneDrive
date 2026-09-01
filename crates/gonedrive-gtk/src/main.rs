@@ -11,6 +11,8 @@ mod tray;
 mod trayicon;
 mod window;
 
+use std::io::IsTerminal;
+
 use adw::prelude::*;
 use gtk::gio;
 use gtk::glib;
@@ -19,15 +21,20 @@ use crate::backend::Command;
 use crate::window::Ui;
 
 const APP_ID: &str = "org.gonedrive.Gonedrive";
+#[cfg(debug_assertions)]
+const DEFAULT_LOG_FILTER: &str = "gonedrive_gtk=info";
+#[cfg(not(debug_assertions))]
+const DEFAULT_LOG_FILTER: &str = "warn";
 /// The progress window runs as its own application so it never activates — or
 /// is activated by — the main window.
 const MONITOR_APP_ID: &str = "org.gonedrive.Gonedrive.Monitor";
 
 fn main() -> glib::ExitCode {
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "gonedrive_gtk=info".into()),
+                .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
         )
         .init();
 

@@ -23,6 +23,12 @@ pub const FAN_PRE_ACCESS: u64 = 0x0010_0000;
 /// skips the placeholder's holes without ever reading. The only hook that can
 /// force such a tool to see real content is on the open itself.
 pub const FAN_OPEN_PERM: u64 = 0x0001_0000;
+/// Include directory objects themselves in events for a mark.
+pub const FAN_ONDIR: u64 = 0x4000_0000;
+/// Include direct children of a marked directory. This is intentionally not
+/// recursive; a child becomes a new population boundary only after its own
+/// direct listing has been published.
+pub const FAN_EVENT_ON_CHILD: u64 = 0x0800_0000;
 
 pub const FAN_MARK_ADD: u32 = 0x0000_0001;
 pub const FAN_MARK_REMOVE: u32 = 0x0000_0002;
@@ -86,6 +92,9 @@ pub struct PreContentEvent {
     pub length: u64,
     /// True for an open-permission event, false for a pre-content read.
     pub is_open: bool,
+    /// Permission events block a reader and require an allow/deny response.
+    /// Directory-open notifications are advisory and must not be answered.
+    pub requires_response: bool,
 }
 
 pub struct Fanotify {
@@ -120,11 +129,30 @@ impl Fanotify {
     /// performance disaster and a much larger blast radius for a bug in a
     /// root-owned daemon.
     pub fn watch_fd(&self, fd: RawFd) -> io::Result<()> {
-        self.mark_fd(FAN_MARK_ADD, fd)
+        self.mark_fd(FAN_MARK_ADD, fd, FAN_PRE_ACCESS | FAN_OPEN_PERM)
     }
 
     pub fn unwatch_fd(&self, fd: RawFd) -> io::Result<()> {
-        self.mark_fd(FAN_MARK_REMOVE, fd)
+        self.mark_fd(FAN_MARK_REMOVE, fd, FAN_PRE_ACCESS | FAN_OPEN_PERM)
+    }
+
+    /// Hold a direct child-directory open until the daemon has published its
+    /// complete direct child set. This mirrors CF_POPULATION_POLICY_FULL and
+    /// avoids exposing a transiently empty directory to the file manager.
+    pub fn watch_directory_fd(&self, fd: RawFd) -> io::Result<()> {
+        self.mark_fd(
+            FAN_MARK_ADD,
+            fd,
+            FAN_OPEN_PERM | FAN_ONDIR | FAN_EVENT_ON_CHILD,
+        )
+    }
+
+    pub fn unwatch_directory_fd(&self, fd: RawFd) -> io::Result<()> {
+        self.mark_fd(
+            FAN_MARK_REMOVE,
+            fd,
+            FAN_OPEN_PERM | FAN_ONDIR | FAN_EVENT_ON_CHILD,
+        )
     }
 
     /// Mark the exact object already opened by the caller.
@@ -138,7 +166,7 @@ impl Fanotify {
     /// In particular, do not pass an `O_PATH` descriptor with a NULL pathname.
     /// Although newer upstream kernels accept that form, deployed HSM-enabled
     /// kernels can reject it with `EBADF`.
-    fn mark_fd(&self, flags: u32, fd: RawFd) -> io::Result<()> {
+    fn mark_fd(&self, flags: u32, fd: RawFd, mask: u64) -> io::Result<()> {
         let target = descriptor_path(fd);
         // SAFETY: the fanotify descriptor and C string remain valid throughout
         // the call. `target` names the exact descriptor borrowed by the caller.
@@ -146,7 +174,7 @@ impl Fanotify {
             libc::fanotify_mark(
                 self.fd.as_raw_fd(),
                 flags,
-                FAN_PRE_ACCESS | FAN_OPEN_PERM,
+                mask,
                 libc::AT_FDCWD,
                 target.as_ptr(),
             )
@@ -226,6 +254,7 @@ impl Fanotify {
                 offset,
                 length,
                 is_open: meta.mask & FAN_OPEN_PERM != 0,
+                requires_response: meta.mask & (FAN_OPEN_PERM | FAN_PRE_ACCESS) != 0,
             });
             cursor += event_len;
         }
@@ -358,5 +387,14 @@ mod tests {
     #[test]
     fn descriptor_open_failures_are_scoped_to_one_event() {
         assert_ne!(FAN_INIT_FLAGS & FAN_REPORT_FD_ERROR, 0);
+    }
+
+    #[test]
+    fn directory_population_marks_are_direct_child_permissions() {
+        let mask = FAN_OPEN_PERM | FAN_ONDIR | FAN_EVENT_ON_CHILD;
+        assert_ne!(mask & FAN_EVENT_ON_CHILD, 0);
+        assert_ne!(mask & FAN_ONDIR, 0);
+        assert_ne!(mask & FAN_OPEN_PERM, 0);
+        assert_eq!(mask & FAN_PRE_ACCESS, 0);
     }
 }

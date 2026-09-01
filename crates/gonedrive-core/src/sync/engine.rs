@@ -6,6 +6,7 @@
 //! restart is still queued when the daemon comes back.
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use time::OffsetDateTime;
@@ -19,6 +20,7 @@ use crate::hydrate::Placeholder;
 use crate::sync::plan::LocalStat;
 use crate::sync::rooted_fs::RootedFs;
 use crate::sync::selection::{Listing, PinOutcome, Selection};
+use crate::sync::transfer;
 
 /// Bounds on how often a hydration reports progress: at least this much has to
 /// have moved, so a small file still gets a few updates and a large one does
@@ -43,6 +45,19 @@ pub enum QueueScope {
     OutboundNonDelete,
     /// All durable operations, including uploads and remote mutations.
     All,
+}
+
+/// Installs kernel interception for newly-created online-only files.
+///
+/// The core safety-locks each file before handing the page to this callback.
+/// A daemon implementation must return only after every path is protected (or
+/// has remained locked). Keeping this interface in the engine avoids exposing
+/// a sparse, readable file while a long initial delta is still running.
+pub trait PlaceholderProtector: Send + Sync {
+    fn protect<'a>(
+        &'a self,
+        paths: &'a [PathBuf],
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +201,24 @@ pub struct Engine {
     /// Exact paths created as new placeholders since the last coordinator
     /// pass. This avoids re-enumerating every dehydrated record after delta.
     pub(super) placeholder_marks: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    /// Namespace projection is short and synchronous, but folder population
+    /// can run beside a background delta. Serialising the per-item read/decide/
+    /// write section prevents both paths from observing an item as new and
+    /// racing two no-replace placeholder publications.
+    pub(super) remote_apply: std::sync::Mutex<()>,
+    /// Orders directory snapshots before delta changes. Graph children pages are
+    /// not snapshots of the whole drive; allowing a slow, older listing to land
+    /// after a newer delta would roll metadata back with no later event to fix
+    /// it. Network collection may overlap, but namespace commits cannot.
+    pub(super) remote_commit: tokio::sync::Mutex<()>,
+    /// Directory opens can be repeated while a file manager redraws. One
+    /// bounded population at a time avoids duplicate Graph pagination and
+    /// keeps namespace publication ordered without blocking delta network I/O.
+    pub(super) folder_population: tokio::sync::Mutex<()>,
+    /// Optional daemon bridge that acknowledges HSM registration at delta-page
+    /// boundaries. Tests and one-shot core users retain the legacy end-of-pass
+    /// collection through `take_placeholder_marks` when no bridge is installed.
+    placeholder_protector: std::sync::RwLock<Option<Arc<dyn PlaceholderProtector>>>,
     /// Runtime copy of the persistent files-on-demand mode. Materialising the
     /// tree can enable it while the daemon is already running; later deltas must
     /// see that change without waiting for a restart.
@@ -254,6 +287,10 @@ impl Engine {
             reported_skips: std::sync::Mutex::new(std::collections::HashSet::new()),
             dir_stamps: std::sync::Mutex::new(std::collections::HashSet::new()),
             placeholder_marks: std::sync::Mutex::new(std::collections::HashSet::new()),
+            remote_apply: std::sync::Mutex::new(()),
+            remote_commit: tokio::sync::Mutex::new(()),
+            folder_population: tokio::sync::Mutex::new(()),
+            placeholder_protector: std::sync::RwLock::new(None),
             on_demand: std::sync::atomic::AtomicBool::new(on_demand),
             mass_delete_approval: std::sync::atomic::AtomicBool::new(false),
         }
@@ -267,6 +304,19 @@ impl Engine {
 
     pub fn on_demand_enabled(&self) -> bool {
         self.on_demand.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_placeholder_protector(&self, protector: Arc<dyn PlaceholderProtector>) {
+        if let Ok(mut slot) = self.placeholder_protector.write() {
+            *slot = Some(protector);
+        }
+    }
+
+    fn placeholder_protector(&self) -> Option<Arc<dyn PlaceholderProtector>> {
+        self.placeholder_protector
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SyncEvent> {
@@ -306,8 +356,49 @@ impl Engine {
         // New placeholders never replace a path that appeared after discovery.
         // Existing placeholders are refreshed through their already-validated
         // descriptor at the call site.
-        let file = self.rooted(account)?.create_new_file(path)?;
-        Placeholder::create_file(&file, size, item_id, ctag, mtime)
+        let rooted = self.rooted(account)?;
+        if self.placeholder_protector().is_none() {
+            let file = rooted.create_new_file(path)?;
+            return Placeholder::create_file(&file, size, item_id, ctag, mtime);
+        }
+
+        // Build away from the target name: user xattrs cannot be populated
+        // after chmod(0), while publishing first would briefly expose readable
+        // sparse zeroes. Rename the fully-marked, safety-locked inode into place
+        // atomically and refuse a destination that appeared concurrently.
+        let staging = transfer::placeholder_staging_sibling(path);
+        let file = rooted.create_new_file(&staging)?;
+        let prepared = Placeholder::create_file(&file, size, item_id, ctag, mtime)
+            .and_then(|()| Placeholder::lock_unprotected_file(&file));
+        drop(file);
+        if let Err(error) = prepared {
+            let _ = rooted.remove_file(&staging);
+            return Err(error);
+        }
+        if let Err(error) = rooted.rename_noreplace(&staging, path) {
+            let _ = rooted.remove_file(&staging);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Protect the exact placeholders produced since the previous page before
+    /// more remote records can replace or expose them.
+    pub(super) async fn protect_pending_placeholders(&self) -> Result<()> {
+        let Some(protector) = self.placeholder_protector() else {
+            return Ok(());
+        };
+        let paths = self.take_placeholder_marks();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) = protector.protect(&paths).await {
+            for path in &paths {
+                self.note_placeholder(path);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Resolve a placeholder beneath this account's root and bind its xattr id
@@ -382,6 +473,49 @@ impl Engine {
     /// Browse what has been enumerated, with each entry's effective pin.
     pub fn list(&self, relative: &Path) -> Result<Vec<Listing>> {
         self.selection().list(relative)
+    }
+
+    /// Whether browsing `relative` should fetch and publish its direct
+    /// children first.
+    ///
+    /// A partial directory has its Graph `childCount`, but deliberately no
+    /// local child rows yet.  The desktop chooser is itself a directory
+    /// reader, so it needs the same one-level population that a file manager
+    /// open triggers.  Keeping this check separate from [`Engine::list`]
+    /// preserves the latter's offline, read-only semantics.
+    pub fn folder_needs_population(&self, relative: &Path) -> Result<bool> {
+        if !self.on_demand_enabled() {
+            return Ok(false);
+        }
+        let account = self.account()?;
+        let root_id = account.root_item_id.clone().ok_or_else(|| {
+            Error::other("the drive has not been enumerated yet; run a sync first")
+        })?;
+        let Some(target) = self
+            .store
+            .item_at_path(&self.account_id, &root_id, relative)?
+        else {
+            return Err(Error::other(format!(
+                "no such folder: {}",
+                relative.display()
+            )));
+        };
+        if !target.is_folder {
+            return Ok(false);
+        }
+        match self.store.folder_population(&self.account_id, &target.id)? {
+            Some(populated) => Ok(!populated),
+            None => {
+                // Profiles created before the population table have no row.
+                // A non-empty child index is enough to identify those folders
+                // as already enumerated; an empty/unknown one gets one bounded
+                // retry so a legacy partial tree cannot masquerade as empty.
+                Ok(self
+                    .store
+                    .children(&self.account_id, &target.id)?
+                    .is_empty())
+            }
+        }
     }
 
     /// Choose whether a path's content is kept on this device.

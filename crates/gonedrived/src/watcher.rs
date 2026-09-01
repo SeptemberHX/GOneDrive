@@ -472,4 +472,27 @@ mod tests {
         assert!(batch.paths.contains(&path));
         assert!(batch.completed_writes.contains(&path));
     }
+
+    #[tokio::test]
+    async fn opening_a_partial_directory_is_not_a_local_change() {
+        let root = tempfile::tempdir().unwrap();
+        let partial = root.path().join("Cloud folder");
+        std::fs::create_dir(&partial).unwrap();
+        xattr::set(
+            &partial,
+            gonedrive_core::hydrate::XATTR_POPULATION,
+            b"partial",
+        )
+        .unwrap();
+        let (_watcher, mut batches) =
+            LocalWatcher::start(root.path(), Duration::from_millis(40)).unwrap();
+
+        let _entries = std::fs::read_dir(&partial).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), batches.recv())
+                .await
+                .is_err(),
+            "directory reads must not enter local reconciliation"
+        );
+    }
 }

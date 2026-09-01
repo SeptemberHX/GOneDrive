@@ -4,6 +4,7 @@ mod app;
 mod commands;
 mod failure_summary;
 mod hsm_client;
+mod indexer;
 mod login;
 mod open_intent;
 mod placeholder_reports;
@@ -13,7 +14,7 @@ mod watcher;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::{io::IsTerminal, path::PathBuf};
 
 use gonedrive_core::db::PinState;
 
@@ -22,6 +23,11 @@ use crate::commands::{
     storage, sync_once, transfer,
 };
 use crate::runtime::run;
+
+#[cfg(debug_assertions)]
+const DEFAULT_LOG_FILTER: &str = "gonedrived=info,gonedrive_core=info";
+#[cfg(not(debug_assertions))]
+const DEFAULT_LOG_FILTER: &str = "warn";
 
 #[derive(Parser)]
 #[command(name = "gonedrived", version, about = "GOnedrive sync daemon")]
@@ -95,9 +101,10 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "gonedrived=info,gonedrive_core=info".into()),
+                .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
         )
         .init();
 

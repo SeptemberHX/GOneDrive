@@ -286,6 +286,38 @@ async fn folder_listing_counts_only_the_next_level() {
 }
 
 #[tokio::test]
+async fn a_lazy_folder_listing_uses_graph_child_count_before_opening_it() {
+    let h = Harness::with_config(Config {
+        on_demand: true,
+        download_new: DownloadPolicy::Never,
+        ..Config::default()
+    })
+    .await;
+    let remote_folder = json!({
+        "id": "D1",
+        "name": "Remote folder",
+        "folder": {"childCount": 37},
+        "parentReference": {"driveId": "drive1", "id": ROOT}
+    });
+    h.mock_delta(None, vec![root_item(), remote_folder], "v1")
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.failed, 0);
+
+    // The folder is still partial and none of its children have been
+    // published. Its direct count nevertheless comes from Graph's bounded
+    // folder facet, rather than the empty local directory.
+    let listing = h.engine.list(Path::new("")).unwrap();
+    let folder = listing
+        .iter()
+        .find(|entry| entry.item.name == "Remote folder")
+        .expect("remote folder in root listing");
+    assert_eq!(folder.items, 37);
+    assert!(folder.items_known);
+}
+
+#[tokio::test]
 async fn a_preview_does_not_charge_for_an_already_local_file() {
     let h = harness_with_a_downloaded_file(b"already here").await;
     let selection = gonedrive_core::sync::selection::Selection::new(

@@ -35,6 +35,10 @@ pub const XATTR_CTAG: &str = "user.gonedrive.ctag";
 /// The user's retention choice, so a file manager can distinguish "downloaded"
 /// from "always keep here" without asking the daemon.
 pub const XATTR_PIN: &str = "user.gonedrive.pin";
+/// Whether a placeholder directory's direct children have been published.
+/// This mirrors CFAPI's partial-directory population state: metadata may be in
+/// SQLite while child inodes are created only when the directory is browsed.
+pub const XATTR_POPULATION: &str = "user.gonedrive.population";
 
 /// quickXorHash of the content we last wrote to this file (download, hydration,
 /// or the local content at the moment we uploaded it). It is the reference the
@@ -58,6 +62,31 @@ pub enum PlaceholderState {
     Hydrated,
     /// Not a GOnedrive placeholder at all.
     Unmanaged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryPopulation {
+    Partial,
+    Populated,
+    Unmanaged,
+}
+
+impl DirectoryPopulation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Partial => "partial",
+            Self::Populated => "populated",
+            Self::Unmanaged => "unmanaged",
+        }
+    }
+
+    fn parse(raw: &[u8]) -> Self {
+        match raw {
+            b"partial" => Self::Partial,
+            b"populated" => Self::Populated,
+            _ => Self::Unmanaged,
+        }
+    }
 }
 
 impl PlaceholderState {
@@ -353,6 +382,27 @@ impl Placeholder {
         Ok(())
     }
 
+    pub fn directory_population(path: &Path) -> DirectoryPopulation {
+        match xattr::get(path, XATTR_POPULATION) {
+            Ok(Some(raw)) => DirectoryPopulation::parse(&raw),
+            _ => DirectoryPopulation::Unmanaged,
+        }
+    }
+
+    pub(crate) fn directory_population_file(file: &std::fs::File) -> DirectoryPopulation {
+        match get_xattr_file(file, XATTR_POPULATION) {
+            Ok(Some(raw)) => DirectoryPopulation::parse(&raw),
+            _ => DirectoryPopulation::Unmanaged,
+        }
+    }
+
+    pub(crate) fn set_directory_population_file(
+        file: &std::fs::File,
+        population: DirectoryPopulation,
+    ) -> Result<()> {
+        set_xattr_file(file, XATTR_POPULATION, population.as_str().as_bytes())
+    }
+
     /// Record the retention choice on the file itself.
     ///
     /// Duplicating this from the database is deliberate: a file manager
@@ -474,12 +524,13 @@ impl Placeholder {
     }
 }
 
-fn managed_xattrs() -> [&'static str; 7] {
+fn managed_xattrs() -> [&'static str; 8] {
     [
         XATTR_STATE,
         XATTR_ITEM_ID,
         XATTR_CTAG,
         XATTR_PIN,
+        XATTR_POPULATION,
         XATTR_QUICKXOR,
         XATTR_SYNCING,
         XATTR_SAFETY_MODE,

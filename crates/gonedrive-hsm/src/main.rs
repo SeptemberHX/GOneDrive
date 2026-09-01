@@ -24,6 +24,7 @@ mod server;
 mod worker;
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -45,7 +46,7 @@ use crate::server::{parallel_map_ordered, read_frame, truncate_mark_error, MARK_
 #[cfg(test)]
 use crate::worker::{
     background_reader, expected_fill_len, fill_from, hydration_reader, mark_hydrated,
-    requested_range_is_materialized,
+    requested_range_is_materialized, unregistered_population_file_is_safe,
 };
 use crate::worker::{event_loop, handle_event};
 #[cfg(test)]
@@ -59,6 +60,11 @@ const HYDRATE_TIMEOUT: Duration = Duration::from_secs(300);
 /// turn each one into an unbounded root-owned thread.
 const WORKERS: usize = 64;
 const WORK_QUEUE: usize = 256;
+
+#[cfg(debug_assertions)]
+const DEFAULT_LOG_FILTER: &str = "gonedrive_hsm=info";
+#[cfg(not(debug_assertions))]
+const DEFAULT_LOG_FILTER: &str = "warn";
 
 #[derive(Parser)]
 #[command(
@@ -85,6 +91,8 @@ enum Reply {
     AllowEmpty,
     /// The content could not be provided; fail the read.
     Deny,
+    /// Completion of a directory population callback.
+    DirectoryPopulated(bool),
 }
 
 struct Pending {
@@ -102,7 +110,14 @@ struct MarkEntry {
     uid: u32,
     path: Arc<Path>,
     file: ReopenableFile,
+    kind: MarkKind,
     sweep: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkKind {
+    Placeholder,
+    PopulationDirectory,
 }
 
 #[derive(Clone)]
@@ -136,7 +151,7 @@ impl Shared {
         send_to_session(&session, event)
     }
 
-    fn begin_hydration(
+    fn begin_request(
         &self,
         uid: u32,
         session: &ClientSession,
@@ -169,9 +184,10 @@ impl Shared {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "gonedrive_hsm=info".into()),
+                .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
         )
         .init();
 

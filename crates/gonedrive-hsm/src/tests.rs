@@ -30,6 +30,33 @@ fn helper_unit_keeps_home_writable_for_hydration() {
 }
 
 #[test]
+fn helper_unit_bounds_journal_writes() {
+    assert!(SYSTEM_UNIT.contains("LogRateLimitIntervalSec=1min"));
+    assert!(SYSTEM_UNIT.contains("LogRateLimitBurst=30"));
+}
+
+#[test]
+fn a_parent_mark_allows_only_files_whose_bytes_are_already_local() {
+    use std::os::fd::AsRawFd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("item.bin");
+    std::fs::write(&path, b"local bytes").unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+
+    assert!(unregistered_population_file_is_safe(file.as_raw_fd()).unwrap());
+
+    xattr::set(&path, "user.gonedrive.state", b"hydrated").unwrap();
+    assert!(unregistered_population_file_is_safe(file.as_raw_fd()).unwrap());
+
+    xattr::set(&path, "user.gonedrive.state", b"dehydrated").unwrap();
+    assert!(!unregistered_population_file_is_safe(file.as_raw_fd()).unwrap());
+
+    xattr::set(&path, "user.gonedrive.state", b"corrupt").unwrap();
+    assert!(!unregistered_population_file_is_safe(file.as_raw_fd()).unwrap());
+}
+
+#[test]
 fn a_nautilus_copy_is_bound_to_its_writable_destination() {
     let dir = tempfile::tempdir().unwrap();
     let source_dir = dir.path().join("source");

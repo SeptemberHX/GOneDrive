@@ -345,6 +345,10 @@ pub fn record_from_remote(
         },
         name: remote.name.clone().unwrap_or_else(|| "root".into()),
         is_folder: remote.is_folder(),
+        child_count: remote
+            .folder
+            .as_ref()
+            .and_then(|folder| folder.child_count.map(u64::from)),
         size: remote.size.unwrap_or(0),
         etag: remote.etag.clone(),
         ctag: remote.ctag.clone(),
