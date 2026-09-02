@@ -40,6 +40,19 @@ pub(crate) async fn run() -> Result<()> {
         tracing::warn!(%error, "could not apply desktop-indexer policy");
     }
 
+    // Claim the single-instance bus name FIRST, before touching credentials.
+    // The front end detects the daemon by this name, so registering it up
+    // front means a daemon that is up but not yet signed in — a locked keyring,
+    // no network — shows as "running, needs attention" instead of "not
+    // running", and a stuck credential read can never keep us off the bus. It
+    // also settles the single-instance race before either candidate touches the
+    // watcher, database or HSM session.
+    let connection = service::serve(app.clone()).await?;
+    tracing::info!(
+        bus = gonedrive_ipc::SERVICE_NAME,
+        "listening on the session bus"
+    );
+
     let has_configured_account = !app.store.accounts()?.is_empty();
     let accounts = app.load_accounts().await?;
     if !has_configured_account {
@@ -47,15 +60,6 @@ pub(crate) async fn run() -> Result<()> {
     } else if accounts == 0 {
         tracing::warn!("the configured account is waiting for credentials to become available");
     }
-
-    // Acquire the single-instance name before starting any background work.
-    // A manually launched candidate must not compete with the installed
-    // service for the watcher, database or HSM session.
-    let connection = service::serve(app.clone()).await?;
-    tracing::info!(
-        bus = gonedrive_ipc::SERVICE_NAME,
-        "listening on the session bus"
-    );
 
     app.start_open_intent_monitor();
 

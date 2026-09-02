@@ -34,6 +34,11 @@ use crate::placeholder_reports::PendingPlaceholderReports;
 /// signature of content sniffing, and even when it is not, filling just the
 /// window is always correct — the watch stays armed for the rest.
 const PARTIAL_HYDRATION_CEILING: u64 = 256 * 1024;
+
+/// Upper bound on one account's credential read at startup. Long enough for a
+/// slow network token refresh, short enough that a locked keyring waiting on an
+/// unanswered unlock prompt cannot hang the daemon.
+const CREDENTIAL_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const KEYRING_LOCKED_MESSAGE: &str =
     "系统钥匙环已锁定。请先解锁登录钥匙环，然后点击“立即同步”重试；已保存的登录凭据仍然保留。";
 
@@ -533,13 +538,31 @@ impl App {
             anyhow::bail!("account {other} is already active");
         }
 
-        let auth = Authenticator::restore(
-            self.http.clone(),
-            self.config.client_id.clone(),
-            account_id.to_string(),
-            self.tokens.clone(),
+        // Reading the refresh token can block on the Secret Service: a locked
+        // keyring makes it wait on an unlock prompt that may never be answered.
+        // Bound it so a stuck credential read can never hang daemon startup —
+        // we are already on the bus (see runtime::run), and on timeout we
+        // report a (transient) keyring lock and carry on. An explicit unlock
+        // followed by SyncNow re-attaches the account via attach_missing_accounts.
+        let auth = match tokio::time::timeout(
+            CREDENTIAL_LOAD_TIMEOUT,
+            Authenticator::restore(
+                self.http.clone(),
+                self.config.client_id.clone(),
+                account_id.to_string(),
+                self.tokens.clone(),
+            ),
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(Error::KeyringLocked(
+                    "timed out reading credentials (the login keyring may be locked)".into(),
+                )
+                .into())
+            }
+        };
 
         let graph = Arc::new(GraphClient::new(self.http.clone(), Arc::new(auth)));
         let engine = Arc::new(Engine::new(
