@@ -408,7 +408,7 @@ impl Engine {
     ) -> Result<Vec<crate::db::ItemRecord>> {
         let mut directories = Vec::new();
         for child in self.store.children(&self.account_id, &parent.id)? {
-            let Some(path) = self.store.local_path(&account, &child.id)? else {
+            let Some(path) = self.store.local_path(account, &child.id)? else {
                 continue;
             };
             let result = if child.is_folder {

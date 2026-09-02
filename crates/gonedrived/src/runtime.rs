@@ -241,8 +241,10 @@ mod tests {
 
     #[test]
     fn an_explicit_selective_sync_setting_is_preserved() {
-        let mut config = Config::default();
-        config.on_demand = false;
+        let mut config = Config {
+            on_demand: false,
+            ..Config::default()
+        };
 
         apply_first_run_defaults(&mut config, true);
 
