@@ -476,7 +476,8 @@ impl Engine {
     }
 
     /// Whether browsing `relative` should fetch and publish its direct
-    /// children first.
+    /// children first, including a bounded lookahead when its direct child
+    /// directories are still partial.
     ///
     /// A partial directory has its Graph `childCount`, but deliberately no
     /// local child rows yet.  The desktop chooser is itself a directory
@@ -504,7 +505,8 @@ impl Engine {
             return Ok(false);
         }
         match self.store.folder_population(&self.account_id, &target.id)? {
-            Some(populated) => Ok(!populated),
+            Some(false) => Ok(true),
+            Some(true) => self.has_partial_child_directory(&target.id),
             None => {
                 // Profiles created before the population table have no row.
                 // A non-empty child index is enough to identify those folders
@@ -516,6 +518,17 @@ impl Engine {
                     .is_empty())
             }
         }
+    }
+
+    fn has_partial_child_directory(&self, parent_id: &str) -> Result<bool> {
+        for child in self.store.children(&self.account_id, parent_id)? {
+            if child.is_folder
+                && self.store.folder_population(&self.account_id, &child.id)? == Some(false)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Choose whether a path's content is kept on this device.

@@ -84,7 +84,10 @@ impl Harness {
         Self::with_policy(DownloadPolicy::Always).await
     }
 
-    /// A harness with the shipped default: enumerate, download nothing.
+    /// A legacy metadata-only harness: enumerate, download nothing, and keep
+    /// the filesystem untouched. Explicit on-demand scenarios use
+    /// `with_config(... on_demand: true)` so this helper can remain focused on
+    /// transfer and reconciliation tests.
     async fn metadata_only() -> Self {
         Self::with_policy(DownloadPolicy::Never).await
     }
@@ -168,6 +171,7 @@ impl Harness {
             client_id: "test".into(),
             sync_root: root.clone(),
             download_new,
+            on_demand: false,
             ..Config::default()
         });
         let engine = Engine::new(store.clone(), graph, config.clone(), ACCOUNT.into());

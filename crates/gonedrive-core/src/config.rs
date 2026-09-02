@@ -171,7 +171,10 @@ impl Default for Config {
             auto_free_below_bytes: 0,
             download_limit_bytes_per_sec: 0,
             upload_limit_bytes_per_sec: 0,
-            on_demand: false,
+            // Files-on-demand is the product's default: initial sync anchors a
+            // delta cursor and publishes only bounded directory lookahead.
+            // Set this to false explicitly for legacy full metadata sync.
+            on_demand: true,
             exclude_desktop_indexer: true,
             download_new: DownloadPolicy::Never,
             mass_delete_fraction: 0.5,
@@ -388,6 +391,11 @@ mod tests {
         };
         assert_eq!(cfg.upload_chunk_size % UPLOAD_CHUNK_GRANULARITY, 0);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn defaults_enable_files_on_demand() {
+        assert!(Config::default().on_demand);
     }
 
     #[test]

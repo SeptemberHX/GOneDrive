@@ -294,21 +294,27 @@ async fn a_lazy_folder_listing_uses_graph_child_count_before_opening_it() {
     })
     .await;
     let remote_folder = json!({
-        "id": "D1",
+        "id": "D2",
         "name": "Remote folder",
         "folder": {"childCount": 37},
+        "parentReference": {"driveId": "drive1", "id": "D1"}
+    });
+    let parent = json!({
+        "id": "D1",
+        "name": "Parent",
+        "folder": {},
         "parentReference": {"driveId": "drive1", "id": ROOT}
     });
-    h.mock_delta(None, vec![root_item(), remote_folder], "v1")
+    h.mock_delta(None, vec![root_item(), parent, remote_folder], "v1")
         .await;
 
     let summary = h.sync().await;
     assert_eq!(summary.failed, 0);
 
-    // The folder is still partial and none of its children have been
+    // The remote folder is still partial and none of its children have been
     // published. Its direct count nevertheless comes from Graph's bounded
     // folder facet, rather than the empty local directory.
-    let listing = h.engine.list(Path::new("")).unwrap();
+    let listing = h.engine.list(Path::new("Parent")).unwrap();
     let folder = listing
         .iter()
         .find(|entry| entry.item.name == "Remote folder")

@@ -730,9 +730,9 @@ impl App {
         // The chooser is a real user navigation boundary.  A partial folder
         // has only its Graph childCount in the database, so listing it without
         // this step would render an apparently empty directory.  Reuse the
-        // same bounded population path as Nautilus: one direct page (A+1),
-        // with each child folder left partial.  If the network or helper is
-        // unavailable, keep the cached listing path alive; the caller can
+        // same bounded population path as Nautilus: fetch the requested
+        // directory and one lookahead level (A+1). If the network or helper
+        // is unavailable, keep the cached listing path alive; the caller can
         // still show any rows already known and retry on the next navigation.
         if engine.folder_needs_population(relative)? {
             if let Err(error) = self.populate_folder(relative).await {
@@ -790,7 +790,8 @@ impl App {
     }
 
     /// Populate one directory, Cloud Files style: metadata is already local,
-    /// only its direct child inodes are published and protected here.
+    /// its direct child inodes and one lookahead directory level are published
+    /// and protected here.
     pub async fn populate_folder(
         &self,
         relative: &std::path::Path,

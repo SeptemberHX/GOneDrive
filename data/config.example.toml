@@ -38,10 +38,11 @@ upload_session_threshold = 4194304
 upload_chunk_size = 10485760
 
 # Files on demand.
-# 按需下载与目录部分填充：首次只列根直属项，第一次打开一个文件夹时才缓存
-# 它的直属项；文件内容仍在真正读取时下载。已浏览目录可离线查看。没有配置
-# 文件的图形界面首次运行默认启用；明确设为 false 则改用传统全量元数据同步。
-on_demand = false
+# 按需下载与目录部分填充：首次列根直属项并为其子目录预取一层占位项，打开一个
+# 文件夹时也只向下预取一层；文件内容仍在真正读取时下载。已浏览目录可离线查看。
+# 没有配置
+# 默认启用按需下载；明确设为 false 才改用传统全量元数据同步。
+on_demand = true
 
 # Linux desktop indexers do not understand cloud placeholders. Keep them out
 # by default so a background crawl cannot populate every partial directory.

@@ -425,14 +425,30 @@ impl App {
 
     async fn populate_desktop_directory(&self, path: &std::path::Path) {
         if gonedrive_core::hydrate::Placeholder::directory_population(path)
-            != gonedrive_core::hydrate::DirectoryPopulation::Partial
+            == gonedrive_core::hydrate::DirectoryPopulation::Unmanaged
         {
             return;
         }
         let Ok(relative) = path.strip_prefix(&self.config.sync_root) else {
             return;
         };
-        tracing::debug!(path = %path.display(), "desktop navigated to a partial directory");
+        let needs_population = {
+            let engines = self.engines.read().await;
+            match engines.values().next() {
+                Some(engine) => match engine.folder_needs_population(relative) {
+                    Ok(needs) => needs,
+                    Err(error) => {
+                        tracing::debug!(path = %path.display(), %error, "could not check directory population state");
+                        false
+                    }
+                },
+                None => false,
+            }
+        };
+        if !needs_population {
+            return;
+        }
+        tracing::debug!(path = %path.display(), "desktop navigated to a directory with pending lookahead");
         if let Err(error) = self.populate_folder(relative).await {
             tracing::warn!(path = %path.display(), %error, "could not populate the desktop's open directory");
         }

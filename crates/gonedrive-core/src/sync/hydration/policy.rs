@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::hydrate::{DirectoryPopulation, Placeholder, PlaceholderState};
 use crate::sync::plan::LocalStat;
 
-use super::super::engine::{Engine, FreeSpaceOutcome, SyncEvent};
+use super::super::engine::{Engine, FreeSpaceOutcome, SyncEvent, SyncSummary};
 use super::super::rooted_fs::RootedFs;
 use super::super::transfer;
 
@@ -286,9 +286,10 @@ impl Engine {
     }
 
     /// Publish one directory's direct children and mark that directory fully
-    /// populated. Remote metadata for deeper descendants stays in SQLite until
-    /// their own parent is browsed, matching Cloud Files' FETCH_PLACEHOLDERS
-    /// contract without making first login create the whole drive's inodes.
+    /// populated. For files-on-demand, also materialise one bounded lookahead:
+    /// each direct child directory gets its own direct children, but those
+    /// grandchildren remain partial. This gives file managers a useful item
+    /// count without making first login create the whole drive's inodes.
     pub async fn populate_folder(&self, relative: &Path) -> Result<FreeSpaceOutcome> {
         let _population = self.folder_population.lock().await;
         let account = self.account()?;
@@ -322,11 +323,10 @@ impl Engine {
         // Repeated InfoProvider callbacks are common while Nautilus redraws.
         // Once populated, delta itself maintains direct additions and removals.
         let disk_population = Placeholder::directory_population_file(&target_dir);
-        if disk_population == DirectoryPopulation::Populated {
+        let mut target_was_populated = disk_population == DirectoryPopulation::Populated;
+        if target_was_populated {
             self.store
                 .set_folder_population(&self.account_id, &target.id, true)?;
-            self.record_directory_local_stat(&target.id, &target_dir)?;
-            return Ok(FreeSpaceOutcome::default());
         }
 
         // A partial directory intentionally has no complete child set in SQLite.
@@ -335,7 +335,8 @@ impl Engine {
         if disk_population == DirectoryPopulation::Partial
             || self.store.folder_population(&self.account_id, &target.id)? == Some(false)
         {
-            let mut summary = super::super::engine::SyncSummary::default();
+            target_was_populated = false;
+            let mut summary = SyncSummary::default();
             self.fetch_folder_children(&account, &target.id, &mut summary)
                 .await?;
             target = self
@@ -345,32 +346,32 @@ impl Engine {
         }
 
         let mut outcome = FreeSpaceOutcome::default();
-        for child in self.store.children(&self.account_id, &target.id)? {
-            let Some(path) = self.store.local_path(&account, &child.id)? else {
-                continue;
-            };
-            let result = if child.is_folder {
-                self.publish_child_directory(&rooted, &child, &path)
-                    .map(|()| None)
-            } else {
-                self.publish_child_placeholder(&account, &rooted, &child, &path)
-                    .map(Some)
-            };
-            match result {
-                Ok(Some(path)) => {
-                    outcome.files = outcome.files.saturating_add(1);
-                    outcome.paths.push(path);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let detail = error.to_string();
-                    let _ = self.store.set_item_state(&child.id, ItemState::Error);
-                    self.emit(SyncEvent::Failed {
-                        name: child.name,
-                        path: Some(path.clone()),
-                        error: detail.clone(),
-                    });
-                    outcome.skipped.push((path, detail));
+        let child_directories = if target_was_populated {
+            self.store
+                .children(&self.account_id, &target.id)?
+                .into_iter()
+                .filter(|child| child.is_folder)
+                .collect()
+        } else {
+            self.publish_direct_children(&account, &rooted, &target, &mut outcome)?
+        };
+
+        // Nautilus computes a directory's "N items" from local children. Fetch
+        // one extra level so a visible child directory is not reported as zero
+        // merely because its own placeholders have not been published yet.
+        // Never recurse from these children: their directory children remain
+        // partial until the user opens that directory.
+        if self.on_demand_enabled() {
+            for child in child_directories {
+                if let Err(error) = self
+                    .populate_lookahead_directory(&account, &rooted, &child, &mut outcome)
+                    .await
+                {
+                    tracing::debug!(
+                        path = %child.name,
+                        %error,
+                        "bounded directory lookahead was not available"
+                    );
                 }
             }
         }
@@ -393,6 +394,97 @@ impl Engine {
         self.stamp_directories(&account)?;
         self.record_directory_local_stat(&target.id, &target_dir)?;
         Ok(outcome)
+    }
+
+    /// Publish the indexed direct children of `parent` without changing its
+    /// population marker. The caller decides whether this is the user-opened
+    /// directory or the bounded lookahead directory.
+    fn publish_direct_children(
+        &self,
+        account: &Account,
+        rooted: &RootedFs,
+        parent: &crate::db::ItemRecord,
+        outcome: &mut FreeSpaceOutcome,
+    ) -> Result<Vec<crate::db::ItemRecord>> {
+        let mut directories = Vec::new();
+        for child in self.store.children(&self.account_id, &parent.id)? {
+            let Some(path) = self.store.local_path(&account, &child.id)? else {
+                continue;
+            };
+            let result = if child.is_folder {
+                directories.push(child.clone());
+                self.publish_child_directory(rooted, &child, &path)
+                    .map(|()| None)
+            } else {
+                self.publish_child_placeholder(account, rooted, &child, &path)
+                    .map(Some)
+            };
+            match result {
+                Ok(Some(path)) => {
+                    outcome.files = outcome.files.saturating_add(1);
+                    outcome.paths.push(path);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let detail = error.to_string();
+                    let _ = self.store.set_item_state(&child.id, ItemState::Error);
+                    self.emit(SyncEvent::Failed {
+                        name: child.name,
+                        path: Some(path.clone()),
+                        error: detail.clone(),
+                    });
+                    outcome.skipped.push((path, detail));
+                }
+            }
+        }
+        Ok(directories)
+    }
+
+    /// Fetch and publish one direct child directory, then stop. The directory
+    /// itself becomes populated, while any child directories it contains are
+    /// left partial so a later open is still the next network boundary.
+    async fn populate_lookahead_directory(
+        &self,
+        account: &Account,
+        rooted: &RootedFs,
+        child: &crate::db::ItemRecord,
+        outcome: &mut FreeSpaceOutcome,
+    ) -> Result<()> {
+        if self.store.folder_population(&self.account_id, &child.id)? != Some(false) {
+            return Ok(());
+        }
+        let Some(path) = self.store.local_path(account, &child.id)? else {
+            return Ok(());
+        };
+
+        let mut summary = SyncSummary::default();
+        self.fetch_folder_children(account, &child.id, &mut summary)
+            .await?;
+        let child = self.store.item(&child.id)?.ok_or_else(|| {
+            Error::other("lookahead directory disappeared while it was populated")
+        })?;
+        let child_dir = rooted.open_read(&path)?;
+        if !child_dir.metadata()?.is_dir() {
+            return Err(Error::other(format!(
+                "{} is occupied by a file",
+                path.display()
+            )));
+        }
+
+        self.publish_direct_children(account, rooted, &child, outcome)?;
+        // Keep the child partial until every newly published file placeholder
+        // has been acknowledged by the helper. A failed registration must
+        // leave the directory eligible for a later retry.
+        self.protect_pending_placeholders().await?;
+        if Placeholder::state_file(&child_dir) == PlaceholderState::Unmanaged {
+            Placeholder::mark_dir_file(&child_dir, PlaceholderState::Dehydrated, &child.id)?;
+        }
+        Placeholder::set_directory_population_file(&child_dir, DirectoryPopulation::Populated)?;
+        self.store
+            .set_folder_population(&self.account_id, &child.id, true)?;
+        self.mark_dir(&child.id)?;
+        self.record_directory_local_stat(&child.id, &child_dir)?;
+        Ok(())
     }
 
     fn publish_child_directory(
@@ -493,9 +585,10 @@ impl Engine {
     ///
     /// This is the difference between selective sync and true files-on-demand:
     /// every folder becomes a real (near-free) directory and every file a
-    /// sparse placeholder. In the normal partial-population mode, deeper
-    /// folders are indexed only after their parent is opened; callers that
-    /// explicitly want a complete tree must populate those folders first.
+    /// sparse placeholder. In the normal partial-population mode, folders one
+    /// level below an opened directory are indexed as a bounded lookahead;
+    /// deeper folders are indexed after their own parent is opened. Callers
+    /// that explicitly want a complete tree must populate those folders first.
     /// Content still arrives only when a file is opened.
     ///
     /// Idempotent and resumable: anything already on disk is left as it is, so

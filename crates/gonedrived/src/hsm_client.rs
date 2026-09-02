@@ -482,6 +482,12 @@ async fn populate_opened_directory(
     if background_reader(reader).is_some() {
         return true;
     }
+    // The sync root has no parent population boundary. It is the local
+    // namespace anchor and must remain browsable even while HSM marks are
+    // being rebuilt after a daemon/helper restart.
+    if path == app.config.sync_root {
+        return true;
+    }
     let watched_parent = match path.parent() {
         Some(parent) => watched_directories.lock().await.contains_key(parent),
         None => false,

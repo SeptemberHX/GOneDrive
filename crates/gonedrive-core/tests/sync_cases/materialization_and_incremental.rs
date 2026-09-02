@@ -51,7 +51,7 @@ async fn materialize_all_builds_a_browsable_placeholder_tree() {
 }
 
 #[tokio::test]
-async fn on_demand_population_stops_at_each_opened_directory_boundary() {
+async fn on_demand_population_prefetches_one_directory_level() {
     use gonedrive_core::hydrate::{DirectoryPopulation, Placeholder, PlaceholderState};
 
     let h = Harness::with_config(Config {
@@ -80,15 +80,22 @@ async fn on_demand_population_stops_at_each_opened_directory_boundary() {
     assert!(h.path("A").is_dir(), "the root's direct folder is published");
     assert_eq!(
         Placeholder::directory_population(&h.path("A")),
+        DirectoryPopulation::Populated
+    );
+    assert!(
+        h.engine.folder_needs_population(Path::new("A")).unwrap(),
+        "an already-populated parent still needs the bounded lookahead"
+    );
+    assert!(h.path("A/a.txt").exists());
+    assert_eq!(
+        Placeholder::directory_population(&h.path("A/B")),
         DirectoryPopulation::Partial
     );
-    assert!(h.engine.folder_needs_population(Path::new("A")).unwrap());
-    assert!(!h.path("A/a.txt").exists());
-    assert!(!h.path("A/B").exists());
+    assert!(!h.path("A/B/b.txt").exists());
 
     let first = h.engine.populate_folder(Path::new("A")).await.unwrap();
     assert!(!h.engine.folder_needs_population(Path::new("A")).unwrap());
-    assert_eq!(first.files, 1);
+    assert_eq!(first.files, 1, "the one-level B/b.txt preview");
     assert_eq!(
         Placeholder::directory_population(&h.path("A")),
         DirectoryPopulation::Populated
@@ -99,11 +106,19 @@ async fn on_demand_population_stops_at_each_opened_directory_boundary() {
     );
     assert_eq!(
         Placeholder::directory_population(&h.path("A/B")),
+        DirectoryPopulation::Populated
+    );
+    assert!(
+        h.path("A/B/b.txt").exists() && h.path("A/B/C").is_dir(),
+        "opening A should publish B's direct children"
+    );
+    assert_eq!(
+        Placeholder::directory_population(&h.path("A/B/C")),
         DirectoryPopulation::Partial
     );
     assert!(
-        !h.path("A/B/b.txt").exists() && !h.path("A/B/C").exists(),
-        "opening A must not recursively publish B's children"
+        !h.path("A/B/C/c.txt").exists(),
+        "the lookahead must stop before C's children"
     );
 
     let second = h.engine.populate_folder(Path::new("A/B")).await.unwrap();
@@ -111,8 +126,8 @@ async fn on_demand_population_stops_at_each_opened_directory_boundary() {
     assert!(h.path("A/B/b.txt").exists());
     assert!(h.path("A/B/C").is_dir());
     assert!(
-        !h.path("A/B/C/c.txt").exists(),
-        "the next unopened directory remains metadata-only"
+        h.path("A/B/C/c.txt").exists(),
+        "opening B should advance the boundary by one level"
     );
 }
 

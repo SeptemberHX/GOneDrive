@@ -65,7 +65,10 @@ async fn first_login_can_browse_a_folder_while_the_first_incremental_delta_is_st
     let sync = h.engine.sync_remote();
     tokio::pin!(sync);
     let root_preview = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-        while !h.path("A").is_dir() {
+        while !h.path("A").is_dir()
+            || Placeholder::directory_population(&h.root)
+                != DirectoryPopulation::Populated
+        {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     });
@@ -84,12 +87,12 @@ async fn first_login_can_browse_a_folder_while_the_first_incremental_delta_is_st
     assert_eq!(
         gonedrive_core::sync::population_watch_directories_for_account(&h.store, &account)
             .unwrap(),
-        vec![h.root.clone()],
-        "the root is one population boundary regardless of its child count"
+        vec![h.root.clone(), h.path("A")],
+        "the root lookahead adds exactly one published child boundary"
     );
 
     let populated = h.engine.populate_folder(Path::new("A")).await.unwrap();
-    assert_eq!(populated.files, 1);
+    assert_eq!(populated.files, 0, "A was already populated by the root lookahead");
     assert_eq!(
         Placeholder::state(&h.path("A/ready.txt")),
         PlaceholderState::Dehydrated

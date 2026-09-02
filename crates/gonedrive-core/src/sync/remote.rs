@@ -222,7 +222,8 @@ impl Engine {
                 if on_demand {
                     // Every newly discovered directory starts partial, including
                     // metadata-only descendants whose inode is not published yet.
-                    // Its direct children are fetched only on first enumeration.
+                    // Its direct children are fetched on first enumeration or by
+                    // the bounded one-level lookahead of an opened parent.
                     directory_population = Some(false);
                 }
                 let publish = if on_demand {
@@ -477,7 +478,8 @@ impl Engine {
 
     /// Whether children of this directory belong in the local namespace now.
     /// The root is the first populated directory. Child folders start partial
-    /// and are promoted when a file manager asks to enumerate them.
+    /// and are promoted when a file manager asks to enumerate them, either
+    /// directly or through the parent's bounded lookahead.
     fn remote_parent_is_populated(&self, account: &Account, parent_id: &str) -> Result<bool> {
         if account.root_item_id.as_deref() == Some(parent_id) {
             return Ok(true);
