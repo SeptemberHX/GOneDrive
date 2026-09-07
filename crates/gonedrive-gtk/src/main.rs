@@ -273,7 +273,16 @@ fn find_stack(widget: &gtk::Widget) -> Option<gtk::Widget> {
 fn open_sync_folder(parent: &adw::ApplicationWindow) {
     let home = glib::home_dir().join("OneDrive");
     let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&home)));
-    launcher.launch(Some(parent), None::<&gio::Cancellable>, |_| {});
+    // The launch goes through the OpenURI portal, which exports a Wayland
+    // handle for the parent. A window that was closed to the tray has no
+    // xdg_toplevel any more, and exporting it is a compositor protocol error
+    // that kills the whole process. Only a mapped window can be a parent.
+    let parent = parent.is_mapped().then_some(parent);
+    launcher.launch(parent, None::<&gio::Cancellable>, |result| {
+        if let Err(error) = result {
+            tracing::warn!(%error, "could not open the sync folder");
+        }
+    });
 }
 
 /// Restart only the per-user sync daemon. The GTK/tray process stays alive and
