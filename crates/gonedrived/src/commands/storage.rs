@@ -78,6 +78,40 @@ pub(crate) async fn materialize() -> Result<()> {
     anyhow::bail!("the daemon is not running; start it with `gonedrived run`")
 }
 
+/// Show or switch the sync mode. Switching goes through the daemon: the
+/// conversion touches the placeholder tree the helper is watching, and the
+/// choice has to reach the running engines.
+pub(crate) async fn sync_mode(mode: Option<String>) -> Result<()> {
+    let daemon = running_daemon().await;
+    let Some(mode) = mode else {
+        let current = match &daemon {
+            Some(proxy) => proxy.sync_mode().await?,
+            None => crate::app::SyncMode::of(&super::load_config()?)
+                .as_str()
+                .to_string(),
+        };
+        println!("{current}");
+        match current.as_str() {
+            "on-demand" => {
+                println!("Files download when opened; only browsed folders are indexed.")
+            }
+            "full" => println!("The whole drive is kept downloaded."),
+            _ => println!("Every item is indexed; nothing downloads unless pinned."),
+        }
+        println!("Change it with: gonedrived mode on-demand | full");
+        return Ok(());
+    };
+    if crate::app::SyncMode::parse(&mode).is_none() {
+        anyhow::bail!("unknown mode {mode:?}; use on-demand or full");
+    }
+    let Some(proxy) = daemon else {
+        anyhow::bail!("the daemon is not running; start it with `gonedrived run`")
+    };
+    let summary = proxy.set_sync_mode(&mode).await?;
+    println!("{summary}");
+    Ok(())
+}
+
 /// Report what each file under a path actually costs on disk.
 pub(crate) fn storage(path: PathBuf) -> Result<()> {
     use gonedrive_core::hydrate::PlaceholderState;

@@ -2,7 +2,10 @@
 
 mod coordinator;
 mod hydration;
+mod mode;
 mod placeholder_protector;
+
+pub(crate) use mode::{ModeSwitch, SyncMode};
 
 pub(crate) use hydration::{HydrationCapabilities, HydrationRequest, StageOutcome};
 

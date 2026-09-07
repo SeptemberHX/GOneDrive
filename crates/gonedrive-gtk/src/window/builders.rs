@@ -237,6 +237,7 @@ impl Ui {
     pub(super) fn build_settings() -> (
         adw::PreferencesDialog,
         gtk::Switch,
+        gtk::Switch,
         adw::ActionRow,
         gtk::Button,
     ) {
@@ -262,6 +263,22 @@ impl Ui {
         sync_group.add(&folder_row);
         page.add(&sync_group);
 
+        // Files on demand is the default; turning it off means "download the
+        // whole drive", which the window confirms before sending.
+        let files_group = adw::PreferencesGroup::builder().title("文件").build();
+        let on_demand_switch = gtk::Switch::builder()
+            .valign(gtk::Align::Center)
+            .sensitive(false)
+            .build();
+        let on_demand_row = adw::ActionRow::builder()
+            .title("按需下载")
+            .subtitle("文件在打开时才下载，只索引浏览过的文件夹；关闭后会下载整个 OneDrive")
+            .build();
+        on_demand_row.add_suffix(&on_demand_switch);
+        on_demand_row.set_activatable_widget(Some(&on_demand_switch));
+        files_group.add(&on_demand_row);
+        page.add(&files_group);
+
         let danger = adw::PreferencesGroup::builder().title("账户").build();
         let signout_button = gtk::Button::builder()
             .label("退出登录")
@@ -277,7 +294,13 @@ impl Ui {
         page.add(&danger);
 
         dialog.add(&page);
-        (dialog, pause_switch, folder_row, signout_button)
+        (
+            dialog,
+            pause_switch,
+            on_demand_switch,
+            folder_row,
+            signout_button,
+        )
     }
 }
 

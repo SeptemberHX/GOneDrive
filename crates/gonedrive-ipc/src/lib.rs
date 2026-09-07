@@ -177,6 +177,16 @@ pub trait Daemon {
     /// files-on-demand). Returns how many placeholders are now watched.
     fn materialize_tree(&self) -> zbus::Result<u64>;
 
+    /// How the drive is kept on this device: `on-demand` (the default),
+    /// `full`, or the legacy `metadata`.
+    fn sync_mode(&self) -> zbus::Result<String>;
+
+    /// Switch modes and persist the choice. `on-demand` converts the tree in
+    /// place, keeping downloaded files, pins and local edits; `full` schedules
+    /// a whole-drive enumeration and download. Returns a one-line summary.
+    /// A policy change restarts the daemon after the reply.
+    fn set_sync_mode(&self, mode: &str) -> zbus::Result<String>;
+
     /// What was synced recently, newest first.
     ///
     /// Kept by the daemon rather than the front end so the list survives the

@@ -7,7 +7,7 @@ mod syncing;
 
 pub(crate) use account::{login, logout, status};
 pub(crate) use selection::{list, set_pin};
-pub(crate) use storage::{fetch, free_space, indexer, materialize, on_demand, storage};
+pub(crate) use storage::{fetch, free_space, indexer, materialize, on_demand, storage, sync_mode};
 pub(crate) use syncing::{sync_once, transfer};
 
 use anyhow::{Context, Result};

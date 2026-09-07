@@ -296,6 +296,11 @@ impl Engine {
         }
     }
 
+    /// The account this engine syncs.
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
     /// Keep a materialised placeholder tree current for subsequent deltas.
     pub fn enable_on_demand(&self) {
         self.on_demand

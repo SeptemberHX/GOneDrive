@@ -54,6 +54,7 @@ pub struct Ui {
 
     // -- settings (in the header menu) --
     pause_switch: gtk::Switch,
+    on_demand_switch: gtk::Switch,
     folder_row: adw::ActionRow,
 
     login_button: gtk::Button,
@@ -238,7 +239,8 @@ impl Ui {
         }
 
         // == settings dialog (opened from the header menu) ==
-        let (settings_dialog, pause_switch, folder_row, signout_button) = Self::build_settings();
+        let (settings_dialog, pause_switch, on_demand_switch, folder_row, signout_button) =
+            Self::build_settings();
 
         // Header: title + a primary menu. Settings/about/open-folder live here,
         // so the three views are all the tab bar carries.
@@ -325,6 +327,7 @@ impl Ui {
             root_path: Rc::new(RefCell::new(String::new())),
             folders_loaded: Cell::new(false),
             pause_switch,
+            on_demand_switch,
             folder_row,
             login_button,
             login_hint,
@@ -380,6 +383,49 @@ impl Ui {
             }
             glib::Propagation::Proceed
         });
+
+        let commands = self.commands.clone();
+        let suppress = self.suppress.clone();
+        self.on_demand_switch
+            .connect_state_set(move |switch, on_demand| {
+                if suppress.get() {
+                    return glib::Propagation::Proceed;
+                }
+                if on_demand {
+                    // Converting in place keeps everything already local;
+                    // nothing to warn about.
+                    switch.set_sensitive(false);
+                    let _ = commands.send_blocking(Command::SetSyncMode("on-demand".into()));
+                    return glib::Propagation::Proceed;
+                }
+                // Off means the whole drive comes down: worth a confirmation.
+                let dialog = adw::AlertDialog::new(
+                    Some("下载整个 OneDrive？"),
+                    Some(
+                        "关闭按需下载后，GOnedrive 会重新读取整个网盘并把所有文件下载到本机。\
+                         这可能占用大量磁盘空间和时间。后台服务会重启以应用此设置。",
+                    ),
+                );
+                dialog.add_responses(&[("cancel", "取消"), ("full", "全部下载")]);
+                dialog.set_response_appearance("full", adw::ResponseAppearance::Destructive);
+                dialog.set_default_response(Some("cancel"));
+                dialog.set_close_response("cancel");
+                let commands = commands.clone();
+                let suppress = suppress.clone();
+                let switch_handle = switch.clone();
+                dialog.connect_response(None, move |_, response| {
+                    if response == "full" {
+                        switch_handle.set_sensitive(false);
+                        let _ = commands.send_blocking(Command::SetSyncMode("full".into()));
+                    } else {
+                        suppress.set(true);
+                        switch_handle.set_active(true);
+                        suppress.set(false);
+                    }
+                });
+                dialog.present(Some(switch));
+                glib::Propagation::Proceed
+            });
     }
 }
 

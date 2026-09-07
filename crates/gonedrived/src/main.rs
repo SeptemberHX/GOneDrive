@@ -20,7 +20,7 @@ use gonedrive_core::db::PinState;
 
 use crate::commands::{
     fetch, free_space, indexer, list, login, logout, materialize, on_demand, set_pin, status,
-    storage, sync_once, transfer,
+    storage, sync_mode, sync_once, transfer,
 };
 use crate::runtime::run;
 
@@ -86,6 +86,17 @@ enum Command {
     /// Present the whole drive as a browsable placeholder tree, so the file
     /// manager shows every folder and file (true files-on-demand).
     Materialize,
+    /// Show or change how the drive is kept on this device.
+    ///
+    /// `on-demand` (the default) keeps placeholders that download when opened
+    /// and indexes only the folders you browse; switching to it converts the
+    /// current tree in place, keeping downloaded files, pins and local edits.
+    /// `full` downloads the entire drive. A change of download policy
+    /// restarts the daemon.
+    Mode {
+        /// `on-demand` or `full`. Omit to print the current mode.
+        mode: Option<String>,
+    },
     /// Show what is on disk, what is a placeholder, and what is neither.
     Storage {
         #[arg(default_value = ".")]
@@ -121,6 +132,7 @@ async fn main() -> Result<()> {
         Command::FreeSpace { path } => free_space(path).await,
         Command::OnDemand { path } => on_demand(path).await,
         Command::Materialize => materialize().await,
+        Command::Mode { mode } => sync_mode(mode).await,
         Command::Indexer { include } => indexer(include),
         Command::Fetch { path } => fetch(path).await,
         Command::Storage { path } => storage(path),

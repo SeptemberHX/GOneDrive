@@ -204,7 +204,13 @@ gonedrived free-space 文档        # 释放空间，文件留在原地变成占
 gonedrived on-demand 图片         # 为从未下载过的文件建占位
 gonedrived storage 文档           # 看每个文件实际占多少
 gonedrived fetch 文档/报告.docx    # 手动回填
+gonedrived mode                   # 查看当前模式：on-demand（默认）或 full
+gonedrived mode on-demand         # 从全量模式切到按需：本机已有的文件、固定项、本地改动原地保留，
+                                  # 从未打开过的文件夹变成首次打开时才加载，不重新登录、不重新枚举
+gonedrived mode full              # 切回全量：重新枚举整个网盘并下载所有文件（守护进程会自动重启）
 ```
+
+设置窗口的「按需下载」开关做的是同一件事；关闭前会确认，因为那意味着下载整个网盘。
 
 需要 `gonedrive-hsm` 以 root 运行（systemd 系统服务，或 `sudo gonedrive-hsm`）。
 

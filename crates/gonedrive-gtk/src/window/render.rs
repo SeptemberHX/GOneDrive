@@ -44,7 +44,23 @@ impl Ui {
             }
             UiEvent::Disconnected(reason) => {
                 self.stack.set_visible_child_name("offline");
+                self.on_demand_switch.set_sensitive(false);
                 tracing::debug!(%reason, "daemon unreachable");
+            }
+            UiEvent::SyncMode { mode, summary } => {
+                self.set_on_demand_switch(mode == "on-demand");
+                self.on_demand_switch.set_sensitive(true);
+                if summary.is_some() {
+                    self.show_banner(if mode == "on-demand" {
+                        "已切换为按需下载：本机已有的文件保留，未打开过的文件夹会在首次打开时加载。"
+                    } else {
+                        "已切换为全量同步：后台服务正在重启，随后开始下载整个 OneDrive。"
+                    });
+                }
+            }
+            UiEvent::SyncModeFailed(error) => {
+                self.on_demand_switch.set_sensitive(true);
+                self.show_banner(&format!("切换同步模式失败：{error}"));
             }
             UiEvent::Status(status) => {
                 self.apply_status(&status);
@@ -194,6 +210,14 @@ impl Ui {
         if self.pause_switch.is_active() != paused {
             self.suppress.set(true);
             self.pause_switch.set_active(paused);
+            self.suppress.set(false);
+        }
+    }
+
+    fn set_on_demand_switch(&self, on_demand: bool) {
+        if self.on_demand_switch.is_active() != on_demand {
+            self.suppress.set(true);
+            self.on_demand_switch.set_active(on_demand);
             self.suppress.set(false);
         }
     }

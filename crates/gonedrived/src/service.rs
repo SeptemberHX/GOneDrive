@@ -51,6 +51,27 @@ fn confine_to_root(
     Ok(relative.to_path_buf())
 }
 
+/// One line the CLI prints and the settings dialog shows.
+pub(crate) fn describe_mode_switch(switch: &crate::app::ModeSwitch) -> String {
+    let mut line = match switch.mode {
+        "on-demand" => "Files on demand is on.".to_string(),
+        "full" => "Full sync is on: the whole drive will be downloaded.".to_string(),
+        other => format!("Sync mode is now {other}."),
+    };
+    if let Some(conversion) = &switch.conversion {
+        line.push_str(&format!(
+            " Kept {} folder(s) with local content; {} never-opened folder(s) now load on first open ({} placeholder(s) removed).",
+            conversion.folders_kept, conversion.folders_pruned, conversion.placeholders_removed
+        ));
+    }
+    if switch.restarting {
+        line.push_str(" The daemon is restarting to apply it.");
+    } else if switch.policy_changed {
+        line.push_str(" Restart gonedrived to apply it.");
+    }
+    line
+}
+
 impl DaemonService {
     /// Turn an absolute path from a file manager into one relative to the sync
     /// root, refusing anything outside it.
@@ -285,6 +306,25 @@ impl DaemonService {
             .materialize_tree()
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))
+    }
+
+    async fn sync_mode(&self) -> zbus::fdo::Result<String> {
+        Ok(self.app.sync_mode().as_str().to_string())
+    }
+
+    async fn set_sync_mode(&self, mode: &str) -> zbus::fdo::Result<String> {
+        tracing::info!(%mode, "SetSyncMode requested");
+        let mode = crate::app::SyncMode::parse(mode).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(format!(
+                "unknown sync mode {mode:?}; use on-demand or full"
+            ))
+        })?;
+        let switch = self
+            .app
+            .set_sync_mode(mode)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        Ok(describe_mode_switch(&switch))
     }
 
     async fn fetch_now(&self, path: &str) -> zbus::fdo::Result<u64> {

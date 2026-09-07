@@ -356,3 +356,4 @@ include!("sync_cases/conflicts_and_uploads.rs");
 include!("sync_cases/on_demand.rs");
 include!("sync_cases/moves.rs");
 include!("sync_cases/materialization_and_incremental.rs");
+include!("sync_cases/lazy_conversion.rs");

@@ -23,6 +23,14 @@ pub enum UiEvent {
     },
     /// The daemon is not running or went away.
     Disconnected(String),
+    /// How the drive is kept on this device; `summary` is set after a switch
+    /// the user asked for.
+    SyncMode {
+        mode: String,
+        summary: Option<String>,
+    },
+    /// A requested switch was refused.
+    SyncModeFailed(String),
     Status(SyncStatus),
     /// A sign-in has begun; show the URL in case the browser did not open.
     LoginStarted(String),
@@ -58,6 +66,8 @@ pub enum Command {
     StartLogin,
     SyncNow,
     SetPaused(bool),
+    /// `on-demand` or `full`.
+    SetSyncMode(String),
     RemoveAccount(String),
     Refresh,
     CancelHydration(String),
@@ -280,6 +290,14 @@ async fn connect(
     // account.
     tray_set_all(tray, cell, accounts.first().cloned(), status.clone()).await;
     let _ = ui.send(UiEvent::Connected { accounts, status }).await;
+    if let Ok(mode) = proxy.sync_mode().await {
+        let _ = ui
+            .send(UiEvent::SyncMode {
+                mode,
+                summary: None,
+            })
+            .await;
+    }
 
     // Anything already in flight, so a window that opened late shows the
     // transfer it was opened *for* rather than an empty list.
@@ -451,6 +469,34 @@ async fn handle(
             Err(_) => false,
         },
         Command::SetPaused(paused) => proxy.set_paused(paused).await.is_ok(),
+        Command::SetSyncMode(mode) => match proxy.set_sync_mode(&mode).await {
+            Ok(summary) => {
+                let _ = ui
+                    .send(UiEvent::SyncMode {
+                        mode,
+                        summary: Some(summary),
+                    })
+                    .await;
+                true
+            }
+            Err(e) => {
+                let _ = ui.send(UiEvent::SyncModeFailed(e.to_string())).await;
+                // A refusal keeps the connection; report the mode that still
+                // applies so the switch settles back where it was.
+                match proxy.sync_mode().await {
+                    Ok(mode) => {
+                        let _ = ui
+                            .send(UiEvent::SyncMode {
+                                mode,
+                                summary: None,
+                            })
+                            .await;
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+        },
         Command::RemoveAccount(id) => {
             let ok = proxy.remove_account(&id).await.is_ok();
             if ok {
