@@ -94,6 +94,43 @@ if [ "$1" = configure ]; then
     # The privileged helper (system service); restart so an upgrade takes.
     systemctl enable gonedrive-hsm.service || true
     systemctl restart gonedrive-hsm.service || true
+
+    # A development build used to install a user-unit drop-in that pointed at
+    # gonedrived-codex. Drop-ins override the packaged unit, so migrate only
+    # that known legacy file and retain a disabled copy for recovery. The
+    # daemon is restarted below when the user's bus is available.
+    getent passwd | while IFS=: read -r _ _ uid _ _ home _; do
+        case "$uid:$home" in
+            [0-9]*:/home/*|[0-9]*:/root) ;;
+            *) continue ;;
+        esac
+        override="$home/.config/systemd/user/gonedrived.service.d/codex-release.conf"
+        [ -f "$override" ] || continue
+        grep -Eq '^[[:space:]]*ExecStart=[^[:space:]]*/gonedrived-codex[[:space:]]+run[[:space:]]*$' \
+            "$override" || continue
+
+        disabled="${override}.disabled"
+        if [ -e "$disabled" ]; then
+            disabled="${override}.disabled.$(date +%s).$$"
+        fi
+        mv "$override" "$disabled"
+        echo "  disabled legacy daemon override for $home -> $disabled"
+
+        # A package upgrade can happen while the user is logged in. Refresh
+        # that user's manager now; failures are harmless and the next login
+        # will load the canonical unit as well.
+        if [ -S "/run/user/$uid/bus" ] && command -v runuser >/dev/null 2>&1; then
+            runuser -u "#$uid" -- env \
+                XDG_RUNTIME_DIR="/run/user/$uid" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                systemctl --user daemon-reload || true
+            runuser -u "#$uid" -- env \
+                XDG_RUNTIME_DIR="/run/user/$uid" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                systemctl --user restart gonedrived.service || true
+        fi
+    done
+
     # The sync daemon runs per user; enable it for every user's session.
     systemctl --global enable gonedrived.service || true
     # Reload and restart every active user instance. A global enable alone does
