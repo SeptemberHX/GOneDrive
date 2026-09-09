@@ -289,14 +289,10 @@ async fn connect(
     // reads this the moment it does, so it never shows "未登录" over a signed-in
     // account.
     tray_set_all(tray, cell, accounts.first().cloned(), status.clone()).await;
+    let has_account = !accounts.is_empty();
     let _ = ui.send(UiEvent::Connected { accounts, status }).await;
-    if let Ok(mode) = proxy.sync_mode().await {
-        let _ = ui
-            .send(UiEvent::SyncMode {
-                mode,
-                summary: None,
-            })
-            .await;
+    if has_account {
+        refresh_sync_mode(&proxy, ui).await;
     }
 
     // Anything already in flight, so a window that opened late shows the
@@ -354,8 +350,12 @@ async fn serve(
                 if let (Ok(accounts), Ok(status)) =
                     (proxy.list_accounts().await, proxy.status().await)
                 {
+                    let has_account = !accounts.is_empty();
                     tray_set_all(tray, cell, accounts.first().cloned(), status.clone()).await;
                     let _ = ui.send(UiEvent::Connected { accounts, status }).await;
+                    if has_account {
+                        refresh_sync_mode(proxy, ui).await;
+                    }
                 }
             }
             Some(signal) = login_failed.next() => {
@@ -503,20 +503,48 @@ async fn handle(
                 if let (Ok(accounts), Ok(status)) =
                     (proxy.list_accounts().await, proxy.status().await)
                 {
+                    let has_account = !accounts.is_empty();
                     tray_set_all(tray, cell, accounts.first().cloned(), status.clone()).await;
                     let _ = ui.send(UiEvent::Connected { accounts, status }).await;
+                    if has_account {
+                        refresh_sync_mode(proxy, ui).await;
+                    }
                 }
             }
             ok
         }
         Command::Refresh => match (proxy.list_accounts().await, proxy.status().await) {
             (Ok(accounts), Ok(status)) => {
+                let has_account = !accounts.is_empty();
                 tray_set_all(tray, cell, accounts.first().cloned(), status.clone()).await;
                 let _ = ui.send(UiEvent::Connected { accounts, status }).await;
+                if has_account {
+                    refresh_sync_mode(proxy, ui).await;
+                }
                 true
             }
             _ => false,
         },
+    }
+}
+
+/// Refresh the mode after every connection/state refresh. The tray process can
+/// outlive a daemon upgrade, so reading it only during the initial handshake
+/// leaves the settings switch disabled forever when the old daemon lacked the
+/// SyncMode method.
+async fn refresh_sync_mode(proxy: &DaemonProxy<'static>, ui: &async_channel::Sender<UiEvent>) {
+    match proxy.sync_mode().await {
+        Ok(mode) => {
+            let _ = ui
+                .send(UiEvent::SyncMode {
+                    mode,
+                    summary: None,
+                })
+                .await;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not read the daemon sync mode");
+        }
     }
 }
 

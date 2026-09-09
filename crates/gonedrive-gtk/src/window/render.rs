@@ -23,6 +23,9 @@ impl Ui {
     pub fn apply(&self, event: UiEvent) {
         match event {
             UiEvent::Connected { accounts, status } => {
+                // The mode is fetched separately. Keep this disabled until it
+                // arrives, and never expose it while signed out.
+                self.on_demand_switch.set_sensitive(false);
                 if !self.on_folders_page.get() {
                     self.ready.set(true);
                 }
@@ -49,7 +52,8 @@ impl Ui {
             }
             UiEvent::SyncMode { mode, summary } => {
                 self.set_on_demand_switch(mode == "on-demand");
-                self.on_demand_switch.set_sensitive(true);
+                self.on_demand_switch
+                    .set_sensitive(self.account_id.borrow().is_some());
                 if summary.is_some() {
                     self.show_banner(if mode == "on-demand" {
                         "已切换为按需下载：本机已有的文件保留，未打开过的文件夹会在首次打开时加载。"
@@ -59,7 +63,8 @@ impl Ui {
                 }
             }
             UiEvent::SyncModeFailed(error) => {
-                self.on_demand_switch.set_sensitive(true);
+                self.on_demand_switch
+                    .set_sensitive(self.account_id.borrow().is_some());
                 self.show_banner(&format!("切换同步模式失败：{error}"));
             }
             UiEvent::Status(status) => {
