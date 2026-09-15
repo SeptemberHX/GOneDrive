@@ -11,9 +11,29 @@ APPS="$HOME/.local/share/icons/hicolor/scalable/apps"
 EXTENSIONS="$HOME/.local/share/nautilus-python/extensions"
 AUTOSTART="$HOME/.config/autostart"
 
+# A development build used to install a user-unit drop-in that pointed at a
+# binary named gonedrived-codex. Drop-ins override the unit we install below,
+# so leave that known legacy override out of the active configuration. Keep a
+# disabled copy for recovery instead of deleting a user's file.
+migrate_legacy_daemon_override() {
+    local override="$HOME/.config/systemd/user/gonedrived.service.d/codex-release.conf"
+    [ -f "$override" ] || return 0
+    grep -Eq '^[[:space:]]*ExecStart=[^[:space:]]*/gonedrived-codex[[:space:]]+run[[:space:]]*$' \
+        "$override" || return 0
+
+    local disabled="${override}.disabled"
+    if [ -e "$disabled" ]; then
+        disabled="${override}.disabled.$(date +%s).$$"
+    fi
+    mv "$override" "$disabled"
+    echo "  disabled legacy daemon override -> $disabled"
+}
+
 install -d "$ICONS" "$APPS" "$EXTENSIONS" "$AUTOSTART"
 install -m644 data/icons/hicolor/scalable/emblems/*.svg "$ICONS/"
 install -m644 data/nautilus/gonedrive.py "$EXTENSIONS/"
+
+migrate_legacy_daemon_override
 
 # The application icon (OneDrive cloud + GNOME foot) and the plain cloud used
 # for the sync folder in the file manager.
