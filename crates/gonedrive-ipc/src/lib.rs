@@ -294,6 +294,12 @@ pub mod hsm {
         CommitWatchSet { id: u64 },
         /// Abandon an incomplete declaration without changing existing marks.
         AbortWatchSet { id: u64 },
+        /// Declare the directories the daemon syncs. A helper that understands
+        /// this resolves every later path beneath one of them and refuses
+        /// anything outside, so the daemon sends it before the first watch on
+        /// a new connection. The set replaces any earlier declaration for the
+        /// same uid. Acknowledged with [`Event::WatchResult`].
+        RegisterRoots { id: u64, paths: Vec<String> },
         /// Stop intercepting: the file is hydrated, gone, or no longer ours.
         Unwatch { id: u64, path: String },
         /// Answer to a [`Event::Hydrate`].
@@ -400,6 +406,11 @@ pub mod hsm {
             /// installed by an older package.
             #[serde(default)]
             directory_open_notifications: bool,
+            /// Whether [`Request::RegisterRoots`] is understood and enforced:
+            /// marks and staged files must lie beneath a declared root, which
+            /// itself must be a peer-owned directory on a local filesystem.
+            #[serde(default)]
+            sync_roots: bool,
         },
         /// Completion of a watch/unwatch request. A request id makes concurrent
         /// registrations unambiguous and lets the daemon refuse to create a
@@ -525,6 +536,7 @@ pub mod hsm {
                     mark_sweeps: false,
                     file_manager_copy_detection: false,
                     directory_open_notifications: false,
+                    sync_roots: false,
                 }
             ));
         }

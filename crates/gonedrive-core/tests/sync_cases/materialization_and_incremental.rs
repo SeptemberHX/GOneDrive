@@ -647,38 +647,8 @@ async fn incremental_scan_does_not_walk_an_unrelated_known_sibling() {
 
 #[tokio::test]
 async fn scoped_delete_batches_trip_the_cumulative_mass_delete_guard() {
-    use std::os::unix::fs::MetadataExt;
-
     let h = Harness::new().await;
-    for (folder_id, folder_name, file_prefix) in [("DA", "A", "A"), ("DB", "B", "B")] {
-        let directory = h.path(folder_name);
-        std::fs::create_dir_all(&directory).unwrap();
-        for index in 0..10 {
-            let name = format!("{index}.txt");
-            let path = directory.join(&name);
-            std::fs::write(&path, b"x").unwrap();
-            let metadata = std::fs::metadata(&path).unwrap();
-            let mut item = ItemRecord::new(ACCOUNT, format!("{file_prefix}{index}"), name);
-            item.parent_id = Some(folder_id.into());
-            item.size = metadata.len();
-            item.etag = Some(format!("e-{file_prefix}{index}"));
-            item.ctag = Some(format!("c-{file_prefix}{index}"));
-            item.local_mtime = Some(time::OffsetDateTime::from(metadata.modified().unwrap()));
-            item.local_size = Some(metadata.len());
-            item.local_ino = Some(metadata.ino());
-            item.state = ItemState::Synced;
-            h.store.upsert_item(&item).unwrap();
-        }
-        let metadata = std::fs::metadata(&directory).unwrap();
-        let mut folder = ItemRecord::new(ACCOUNT, folder_id, folder_name);
-        folder.parent_id = Some(ROOT.into());
-        folder.is_folder = true;
-        folder.local_mtime = Some(time::OffsetDateTime::from(metadata.modified().unwrap()));
-        folder.local_size = Some(metadata.len());
-        folder.local_ino = Some(metadata.ino());
-        folder.state = ItemState::Synced;
-        h.store.upsert_item(&folder).unwrap();
-    }
+    seed_two_synced_folders(&h);
     assert_eq!(h.store.item_count(ACCOUNT).unwrap(), 23);
 
     for index in 0..6 {
@@ -715,6 +685,84 @@ async fn scoped_delete_batches_trip_the_cumulative_mass_delete_guard() {
         .unwrap();
     assert_eq!(confirmed.refused_deletions, 0);
     assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 12);
+}
+
+#[tokio::test]
+async fn a_mass_delete_approval_survives_an_unrelated_scan() {
+    // The user confirms the held deletions, but before the coordinator
+    // re-scans them the watcher reports an unrelated write elsewhere. That
+    // scan carries no deletions and must not spend the one-shot approval.
+    let h = Harness::new().await;
+    seed_two_synced_folders(&h);
+    for folder in ["A", "B"] {
+        for index in 0..6 {
+            std::fs::remove_file(h.path(&format!("{folder}/{index}.txt"))).unwrap();
+        }
+    }
+    let refused = h
+        .engine
+        .sync_local_paths(&[h.path("A"), h.path("B")])
+        .unwrap();
+    assert_eq!(refused.refused_deletions, 12);
+
+    h.engine.approve_next_mass_delete();
+    std::fs::create_dir_all(h.path("C")).unwrap();
+    std::fs::write(h.path("C/new.txt"), b"unrelated").unwrap();
+    let unrelated = h.engine.sync_local_paths(&[h.path("C")]).unwrap();
+    assert_eq!(unrelated.refused_deletions, 0);
+
+    let confirmed = h
+        .engine
+        .sync_local_paths(&[h.path("A"), h.path("B")])
+        .unwrap();
+    assert_eq!(
+        confirmed.refused_deletions, 0,
+        "the approval must still apply to the deletions it answered"
+    );
+    let deletes = h
+        .store
+        .pending_ops(ACCOUNT, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|op| op.kind == gonedrive_core::db::OpKind::DeleteRemote)
+        .count();
+    assert_eq!(deletes, 12);
+}
+
+/// Two synced folders of ten files each, plus the root: 23 records that all
+/// exist on disk with matching inode and size metadata.
+fn seed_two_synced_folders(h: &Harness) {
+    use std::os::unix::fs::MetadataExt;
+
+    for (folder_id, folder_name, file_prefix) in [("DA", "A", "A"), ("DB", "B", "B")] {
+        let directory = h.path(folder_name);
+        std::fs::create_dir_all(&directory).unwrap();
+        for index in 0..10 {
+            let name = format!("{index}.txt");
+            let path = directory.join(&name);
+            std::fs::write(&path, b"x").unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+            let mut item = ItemRecord::new(ACCOUNT, format!("{file_prefix}{index}"), name);
+            item.parent_id = Some(folder_id.into());
+            item.size = metadata.len();
+            item.etag = Some(format!("e-{file_prefix}{index}"));
+            item.ctag = Some(format!("c-{file_prefix}{index}"));
+            item.local_mtime = Some(time::OffsetDateTime::from(metadata.modified().unwrap()));
+            item.local_size = Some(metadata.len());
+            item.local_ino = Some(metadata.ino());
+            item.state = ItemState::Synced;
+            h.store.upsert_item(&item).unwrap();
+        }
+        let metadata = std::fs::metadata(&directory).unwrap();
+        let mut folder = ItemRecord::new(ACCOUNT, folder_id, folder_name);
+        folder.parent_id = Some(ROOT.into());
+        folder.is_folder = true;
+        folder.local_mtime = Some(time::OffsetDateTime::from(metadata.modified().unwrap()));
+        folder.local_size = Some(metadata.len());
+        folder.local_ino = Some(metadata.ino());
+        folder.state = ItemState::Synced;
+        h.store.upsert_item(&folder).unwrap();
+    }
 }
 
 #[tokio::test]

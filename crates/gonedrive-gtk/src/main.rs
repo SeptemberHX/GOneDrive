@@ -94,8 +94,9 @@ fn build_ui(app: &adw::Application) {
     let window = ui.window.clone();
     let account = ui.current_account();
     let ready = ui.is_ready();
+    let sync_root = ui.sync_root();
 
-    register_actions(app, &window, &commands, account);
+    register_actions(app, &window, &commands, account, sync_root.clone());
 
     // The receiving end runs on the GLib main context, which is what makes it
     // safe to touch widgets here: every `apply` call is on the main thread.
@@ -136,7 +137,7 @@ fn build_ui(app: &adw::Application) {
                     tray_window.present();
                     let _ = tray_commands.send_blocking(Command::Refresh);
                 }
-                tray::TrayAction::OpenFolder => open_sync_folder(&tray_window),
+                tray::TrayAction::OpenFolder => open_sync_folder(&tray_window, &sync_root),
                 tray::TrayAction::RestartDaemon => restart_daemon_service(),
                 tray::TrayAction::RestartFilesOnDemand => restart_files_on_demand_service(),
                 tray::TrayAction::Quit => {
@@ -270,9 +271,21 @@ fn find_stack(widget: &gtk::Widget) -> Option<gtk::Widget> {
 }
 
 /// Open the sync folder in the user's file manager.
-fn open_sync_folder(parent: &adw::ApplicationWindow) {
-    let home = glib::home_dir().join("OneDrive");
-    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&home)));
+///
+/// The daemon reports the configured root with the account; the default
+/// location is only a fallback for before that arrives or while signed out.
+fn open_sync_folder(
+    parent: &adw::ApplicationWindow,
+    root: &std::rc::Rc<std::cell::RefCell<String>>,
+) {
+    let configured = root.borrow();
+    let folder = if configured.is_empty() {
+        glib::home_dir().join("OneDrive")
+    } else {
+        std::path::PathBuf::from(configured.as_str())
+    };
+    drop(configured);
+    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&folder)));
     // The launch goes through the OpenURI portal, which exports a Wayland
     // handle for the parent. A window that was closed to the tray has no
     // xdg_toplevel any more, and exporting it is a compositor protocol error
@@ -339,6 +352,7 @@ fn register_actions(
     window: &adw::ApplicationWindow,
     commands: &async_channel::Sender<Command>,
     account: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    sync_root: std::rc::Rc<std::cell::RefCell<String>>,
 ) {
     let about = gio::SimpleAction::new("about", None);
     let parent = window.clone();
@@ -357,7 +371,7 @@ fn register_actions(
 
     let open_folder = gio::SimpleAction::new("open-folder", None);
     let parent = window.clone();
-    open_folder.connect_activate(move |_, _| open_sync_folder(&parent));
+    open_folder.connect_activate(move |_, _| open_sync_folder(&parent, &sync_root));
     app.add_action(&open_folder);
 
     let sign_out = gio::SimpleAction::new("sign-out", None);

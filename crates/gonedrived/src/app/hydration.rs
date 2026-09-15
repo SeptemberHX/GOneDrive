@@ -590,12 +590,13 @@ impl App {
         // Materialising is a mode choice, not a one-shot repair. Persist it and
         // publish it to the live engine so later deltas create new/restored
         // entries without repeating this whole-tree pass at every start.
-        if !self.config.on_demand {
-            let mut config = (*self.config).clone();
+        if !self.config().on_demand {
+            let mut config = (*self.config()).clone();
             config.on_demand = true;
             config
                 .save()
                 .context("could not persist files-on-demand mode")?;
+            self.replace_config(config);
         }
         engine.enable_on_demand();
         tracing::info!(placeholders = count, "placeholder tree ready");
@@ -809,7 +810,7 @@ impl App {
         {
             anyhow::bail!("folder population path must stay below the sync root");
         }
-        let target = self.config.sync_root.join(relative);
+        let target = self.config().sync_root.join(relative);
         let outcome = engine.populate_folder(relative).await?;
         self.protect_placeholders(&hsm, &outcome.paths).await?;
         hsm.watch_directory_paths(&[target]).await?;
@@ -843,7 +844,7 @@ impl App {
         Vec<(gonedrive_core::db::Account, String)>,
     )> {
         let store = self.store.clone();
-        let on_demand = self.config.on_demand;
+        let on_demand = self.config().on_demand;
         tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
             let mut missing = Vec::new();
@@ -871,7 +872,7 @@ impl App {
     /// open notifications. This remains local-only and works while Graph or
     /// the token service is offline.
     pub(crate) async fn population_watch_inventory(&self) -> Result<Vec<std::path::PathBuf>> {
-        if !self.config.on_demand {
+        if !self.config().on_demand {
             return Ok(Vec::new());
         }
         let store = self.store.clone();

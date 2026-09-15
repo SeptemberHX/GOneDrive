@@ -92,6 +92,7 @@ impl HsmClient {
         };
         client.send(&Request::Ping).await?;
         client.send(&Request::Features).await?;
+        let sync_root = app.config().sync_root.clone();
 
         let handler = HandlerState {
             app,
@@ -143,6 +144,23 @@ impl HsmClient {
         {
             let _ = client.writer.lock().await.shutdown().await;
             return Err(error);
+        }
+
+        // A helper that confines itself to declared roots refuses every mark
+        // and staged file until it knows the tree. Declare it before the
+        // client is published, so no watch can race the declaration.
+        match client.register_sync_roots(&sync_root).await {
+            Ok(true) => {
+                tracing::info!(root = %sync_root.display(), "sync root declared to the helper")
+            }
+            Ok(false) => tracing::debug!("the helper predates sync-root confinement"),
+            Err(error) => {
+                let _ = client.writer.lock().await.shutdown().await;
+                return Err(error.context(format!(
+                    "the files-on-demand helper refused the sync root {}",
+                    sync_root.display()
+                )));
+            }
         }
 
         Ok(client)
@@ -409,6 +427,7 @@ async fn handle(state: HandlerState, frame: Vec<u8>) {
             mark_sweeps,
             file_manager_copy_detection: copy_detection,
             directory_open_notifications,
+            sync_roots,
         } => {
             partial_hydration.store(partial, std::sync::atomic::Ordering::Relaxed);
             file_manager_copy_detection.store(copy_detection, std::sync::atomic::Ordering::Relaxed);
@@ -417,6 +436,7 @@ async fn handle(state: HandlerState, frame: Vec<u8>) {
                 batch_marks,
                 mark_sweeps,
                 directory_open_notifications,
+                sync_roots,
             });
             tracing::info!(
                 partial_hydration = partial,
@@ -424,6 +444,7 @@ async fn handle(state: HandlerState, frame: Vec<u8>) {
                 mark_sweeps,
                 file_manager_copy_detection = copy_detection,
                 directory_open_notifications,
+                sync_roots,
                 "helper features"
             );
         }
@@ -485,7 +506,7 @@ async fn populate_opened_directory(
     // The sync root has no parent population boundary. It is the local
     // namespace anchor and must remain browsable even while HSM marks are
     // being rebuilt after a daemon/helper restart.
-    if path == app.config.sync_root {
+    if path == app.config().sync_root {
         return true;
     }
     let watched_parent = match path.parent() {
@@ -513,7 +534,7 @@ async fn populate_opened_directory(
             }
         }
     }
-    let Ok(relative) = path.strip_prefix(&app.config.sync_root) else {
+    let Ok(relative) = path.strip_prefix(&app.config().sync_root) else {
         tracing::warn!(path = %path.display(), "helper reported a directory outside the sync root");
         return false;
     };

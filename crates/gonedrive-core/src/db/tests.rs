@@ -786,3 +786,27 @@ fn remote_package_exclusions_persist_as_a_tree_and_prune_by_generation() {
     assert!(!store.remote_is_excluded("acct", "PACKAGE").unwrap());
     assert!(!store.remote_is_excluded("acct", "CHILD").unwrap());
 }
+
+#[test]
+fn a_resync_sweep_visits_children_before_their_parents() {
+    // A parent folder handled before its child folder is found non-empty,
+    // detaches the subtree, and strands the child directory on disk with no
+    // record — the next scan then re-creates the remotely deleted folder.
+    let (store, _account) = store_with_account();
+    store.upsert_item(&folder("A", "ROOT", "A")).unwrap();
+    store.upsert_item(&folder("B", "A", "B")).unwrap();
+    store.upsert_item(&folder("C", "B", "C")).unwrap();
+    store.upsert_item(&file("f", "C", "deep.txt")).unwrap();
+    store.upsert_item(&file("g", "ROOT", "top.txt")).unwrap();
+    store.upsert_item(&folder("D", "ROOT", "D")).unwrap();
+    // Only D survived the re-enumeration.
+    store.mark_seen(&["D".to_string()], 1).unwrap();
+
+    let missed: Vec<String> = store
+        .items_missed_by_resync("acct", 1)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    assert_eq!(missed, ["f", "C", "B", "g", "A"]);
+}

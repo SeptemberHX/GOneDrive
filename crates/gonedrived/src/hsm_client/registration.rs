@@ -29,6 +29,7 @@ pub(super) struct HelperFeatures {
     pub(super) batch_marks: bool,
     pub(super) mark_sweeps: bool,
     pub(super) directory_open_notifications: bool,
+    pub(super) sync_roots: bool,
 }
 
 /// Leave room for JSON escaping and for the helper's result frame.
@@ -170,6 +171,24 @@ impl HsmClient {
 
     async fn batch_marks_available(&self) -> bool {
         self.negotiated_features().await.batch_marks
+    }
+
+    /// Tell the helper which tree it may touch on our behalf.
+    ///
+    /// A helper that enforces roots refuses every mark and every staged file
+    /// outside them, so this precedes the first watch on a new connection.
+    /// Returns whether the helper understood the declaration; an older helper
+    /// is served unconfined, as before.
+    pub(super) async fn register_sync_roots(&self, root: &Path) -> Result<bool> {
+        if !self.negotiated_features().await.sync_roots {
+            return Ok(false);
+        }
+        self.request_control(|id| Request::RegisterRoots {
+            id,
+            paths: vec![root.to_string_lossy().into_owned()],
+        })
+        .await?;
+        Ok(true)
     }
 
     /// Register every placeholder currently on disk.

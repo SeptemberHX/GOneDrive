@@ -746,9 +746,14 @@ impl GraphClient {
                     self.auth.invalidate().await;
                     continue;
                 }
-                429 | 503 | 504 if attempt < MAX_ATTEMPTS => {
+                429 | 503 | 504 => {
                     let delay = retry_after(response.headers()).unwrap_or_else(|| backoff(attempt));
-                    if delay > MAX_RETRY_AFTER {
+                    // Running out of in-call attempts is not a verdict on the
+                    // request: the service is asking for patience. Hand the
+                    // wait back to the queue, which retries with its own
+                    // backoff, instead of letting it read as a permanent
+                    // 429 and give the transfer up.
+                    if attempt >= MAX_ATTEMPTS || delay > MAX_RETRY_AFTER {
                         return Err(Error::Throttled(delay));
                     }
                     tracing::info!(?delay, status, "throttled; backing off");

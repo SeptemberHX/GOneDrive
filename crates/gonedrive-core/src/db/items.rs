@@ -868,6 +868,12 @@ impl Store {
     /// Items a full re-enumeration did not mention: they no longer exist
     /// remotely. Returned deepest-first so a folder is handled after its
     /// contents.
+    ///
+    /// The depth order is load-bearing, not cosmetic. Removing a parent
+    /// folder before its child folder finds the parent non-empty, detaches
+    /// the whole subtree from the store, and leaves the child directory on
+    /// disk with no record — which the next local scan re-creates remotely.
+    /// Files of equal depth still go before folders.
     pub fn items_missed_by_resync(
         &self,
         account_id: &str,
@@ -875,8 +881,16 @@ impl Store {
     ) -> Result<Vec<ItemRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(&format!(
-                "{ITEM_COLUMNS} WHERE account_id = ?1 AND seen_gen < ?2 AND parent_id IS NOT NULL
-                 ORDER BY is_folder ASC"
+                "WITH RECURSIVE depth(item_id, level) AS (
+                     SELECT id, 0 FROM items WHERE account_id = ?1 AND parent_id IS NULL
+                     UNION ALL
+                     SELECT items.id, depth.level + 1
+                       FROM items JOIN depth ON items.parent_id = depth.item_id
+                      WHERE items.account_id = ?1
+                 )
+                 {ITEM_COLUMNS} LEFT JOIN depth ON depth.item_id = items.id
+                 WHERE account_id = ?1 AND seen_gen < ?2 AND parent_id IS NOT NULL
+                 ORDER BY COALESCE(depth.level, -1) DESC, is_folder ASC, id"
             ))?;
             let rows = stmt.query_map(params![account_id, generation], row_to_item)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

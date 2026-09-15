@@ -36,3 +36,19 @@
 - **现象**：`download_to_file_limited` 恒以 `download(id, None)` 从头下载；每次断线都丢弃已下字节从 0 重来，一个比"平均掉线间隔"还大的文件可能永远下不完。
 - **修复**：断点续传。瞬时失败时**保留** `partial` 临时文件；下次以 `Range: bytes=<已下长度>-` 续传，并带 `If-Range: <etag>` 校验——服务端仅在内容未变时回 `206 Partial Content` 流式续传，内容已变则回 `200` 整份重来，杜绝把旧前缀拼到新内容上。完成前仍有 `written == total` 完整性校验 + 原子 `rename` 兜底。永久失败才删 partial。
 - **回归测试**：`crates/gonedrive-core/src/sync/transfer.rs::an_interrupted_download_resumes_from_its_partial`（预置半截 partial，只 mock 带 `Range`+`If-Range` 的 206；全量 GET 会 404，故只有真正走续传才能通过）。
+
+## NR-005 · 429 重试预算耗尽被当作永久失败 → 限流时放弃传输
+
+- **首次发现**：2026-09-15（代码审计）
+- **现象**：服务端持续限流时，某个上传/下载在五次 in-call 重试后被彻底放弃并计入失败，与队列层"限流绝不是放弃的理由"的承诺相矛盾。
+- **根因**：`crates/gonedrive-core/src/graph.rs::send` 的 `429 | 503 | 504 if attempt < MAX_ATTEMPTS` 分支耗尽后落入 `_` → `Error::Graph{429}`，而 `error.rs::is_transient` 只认 `status >= 500`。
+- **修复**：耗尽预算时返回 `Error::Throttled(delay)` 交给队列退避；`is_transient` 同时把 `Graph{429}`/`Graph{408}` 视为暂时性（覆盖分片上传的同类路径）。
+- **回归测试**：`crates/gonedrive-core/src/error.rs::exhausted_throttling_is_still_transient`。
+
+## NR-006 · 令牌端点临时故障被报成"需重新登录"
+
+- **首次发现**：2026-09-15（代码审计）
+- **现象**：login.microsoftonline.com 返回 5xx/429 或网关的 HTML 错误页时，界面跳到"已登出"，用户以为凭据失效。
+- **根因**：`crates/gonedrive-core/src/auth.rs::post_token` 把任何非 2xx 都映射为 `Error::AuthRequired`；`app.rs::core_error_status` 据此置 `signed_out`。
+- **修复**：新增 `Error::TokenEndpoint { status, message }`。只有结构化的 4xx（`invalid_grant` 等）才判定需登录；5xx/429/408 与无法解析的响应体为暂时性错误，UI 显示"离线"而非"已登出"。
+- **回归测试**：`crates/gonedrive-core/src/auth.rs::a_dead_grant_requires_a_new_login`、`::a_token_endpoint_outage_is_not_a_sign_out`、`error.rs::a_token_endpoint_outage_is_transient_but_a_dead_grant_is_not`。

@@ -136,9 +136,9 @@ impl App {
         open_writes: crate::watcher::OpenWrites,
         shutdown: impl std::future::Future<Output = ()>,
     ) {
-        let base = Duration::from_secs(self.config.poll_interval_secs);
-        let ceiling = Duration::from_secs(self.config.max_poll_interval_secs);
-        let full_interval = Duration::from_secs(self.config.full_scan_interval_secs);
+        let base = Duration::from_secs(self.config().poll_interval_secs);
+        let ceiling = Duration::from_secs(self.config().max_poll_interval_secs);
+        let full_interval = Duration::from_secs(self.config().full_scan_interval_secs);
         let mut retry_interval = base;
         let mut next_remote = Instant::now();
         let mut next_full = Instant::now();
@@ -300,7 +300,30 @@ impl App {
                         );
                         continue;
                     }
-                    Ok(_) => {}
+                    Ok(pending) => {
+                        // Everything still queued is sitting out a retry
+                        // delay: nothing more can happen until those timers
+                        // fire. The explicit pass is as complete as it can
+                        // be, so report what remains rather than holding the
+                        // caller until a backed-off transfer finally lands.
+                        let due = self.store.accounts().and_then(|accounts| {
+                            accounts.into_iter().try_fold(0u64, |total, account| {
+                                self.store
+                                    .due_pending_count(&account.id)
+                                    .map(|count| total.saturating_add(count))
+                            })
+                        });
+                        if matches!(due, Ok(0)) {
+                            let mut explicit = explicit_sync.take().expect("checked above");
+                            explicit.result.queued = pending;
+                            self.complete_explicit_sync(
+                                &mut completed_generation,
+                                explicit.target_generation,
+                                explicit.result,
+                            );
+                            continue;
+                        }
+                    }
                     Err(error) => {
                         let message = format!("could not inspect the operation queue: {error}");
                         self.set_state("error", Some(message.clone())).await;

@@ -9,3 +9,6 @@ __pycache__/
 
 # deb build artifact
 gonedrive_*.deb
+
+# compiled probe (source is tools/fanotify-probe.c)
+tools/fanotify-probe

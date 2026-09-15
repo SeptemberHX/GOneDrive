@@ -65,7 +65,7 @@ impl App {
     /// The mode the daemon was started with. A pending switch that needs a
     /// restart is not reported until it has taken effect.
     pub fn sync_mode(&self) -> SyncMode {
-        SyncMode::of(&self.config)
+        SyncMode::of(&self.config())
     }
 
     /// Switch modes, persisting the choice for every later start.
@@ -79,7 +79,8 @@ impl App {
     /// is applied live.
     pub async fn set_sync_mode(self: &Arc<Self>, mode: SyncMode) -> Result<ModeSwitch> {
         let current = self.sync_mode();
-        let mut config = (*self.config).clone();
+        let previous = self.config();
+        let mut config = (*previous).clone();
         let mut switch = ModeSwitch {
             mode: mode.as_str(),
             ..Default::default()
@@ -99,10 +100,13 @@ impl App {
                 config.download_new = DownloadPolicy::Never;
             }
         }
-        if config.on_demand != self.config.on_demand
-            || config.download_new != self.config.download_new
-        {
+        if config.on_demand != previous.on_demand || config.download_new != previous.download_new {
             config.save().context("could not persist the sync mode")?;
+            // Publish the new mode to everything that reads the live
+            // configuration — `sync_mode()`, the placeholder inventories, a
+            // later login's persistence — so an in-place switch is neither
+            // reported nor acted on as the mode the daemon started with.
+            self.replace_config(config.clone());
             tracing::info!(
                 from = current.as_str(),
                 to = mode.as_str(),
@@ -119,7 +123,7 @@ impl App {
         // A policy change needs the engines rebuilt. Full mode also needs the
         // whole drive enumerated again: a lazy index knows only browsed
         // folders, and the download-everything policy has to see every file.
-        if config.download_new != self.config.download_new {
+        if config.download_new != previous.download_new {
             switch.policy_changed = true;
             self.set_paused(true).await;
             if mode == SyncMode::Full {

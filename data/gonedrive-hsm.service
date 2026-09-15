@@ -14,7 +14,10 @@ Documentation=https://github.com/monotune/GOnedrive
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/gonedrive-hsm
-Restart=on-failure
+# Any exit, not only a failed one: while the helper is down every placeholder
+# on the machine reads as zeroes, and a "clean" SIGHUP or SIGTERM from outside
+# must not be allowed to leave it that way.
+Restart=always
 RestartSec=5
 # A malformed-event or filesystem-error loop must not fill the system journal.
 LogRateLimitIntervalSec=1min

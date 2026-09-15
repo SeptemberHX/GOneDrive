@@ -30,6 +30,19 @@ fn helper_unit_keeps_home_writable_for_hydration() {
 }
 
 #[test]
+fn helper_unit_restarts_after_any_exit() {
+    assert!(
+        SYSTEM_UNIT.contains("Restart=always"),
+        "a helper that stays down leaves every placeholder reading as zeroes"
+    );
+}
+
+/// A peer-owned temporary directory declared as the only sync root.
+fn roots(dir: &Path) -> Vec<SyncRoot> {
+    vec![open_root(dir, my_uid()).unwrap()]
+}
+
+#[test]
 fn helper_unit_bounds_journal_writes() {
     assert!(SYSTEM_UNIT.contains("LogRateLimitIntervalSec=1min"));
     assert!(SYSTEM_UNIT.contains("LogRateLimitBurst=30"));
@@ -267,7 +280,66 @@ fn a_users_own_file_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mine.bin");
     std::fs::write(&path, b"x").unwrap();
-    assert!(open_authorised(&path, my_uid(), libc::O_RDONLY).is_ok());
+    assert!(open_authorised(&roots(dir.path()), &path, my_uid(), libc::O_RDONLY).is_ok());
+}
+
+#[test]
+fn a_file_outside_every_registered_root_is_refused() {
+    let inside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let path = outside.path().join("mine.bin");
+    std::fs::write(&path, b"x").unwrap();
+
+    // Owned by the peer, readable, real — and still refused: the helper's
+    // reach is the declared tree, not the peer's whole uid.
+    let err = open_authorised(&roots(inside.path()), &path, my_uid(), libc::O_RDONLY)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("outside every registered sync root"), "{err}");
+    // A daemon that never declared a root can mark nothing at all.
+    let err = open_authorised(&[], &path, my_uid(), libc::O_RDONLY)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("outside every registered sync root"), "{err}");
+}
+
+#[test]
+fn a_root_prefix_is_matched_by_whole_component() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("OneDrive");
+    let sibling = base.path().join("OneDrive-evil");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    let path = sibling.join("mine.bin");
+    std::fs::write(&path, b"x").unwrap();
+
+    let err = open_authorised(&roots(&root), &path, my_uid(), libc::O_RDONLY)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("outside every registered sync root"), "{err}");
+}
+
+#[test]
+fn a_root_must_be_a_directory_the_peer_owns_reached_without_symlinks() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    let link = dir.path().join("link");
+    symlink(dir.path(), &link).unwrap();
+
+    let err = open_root(&file, my_uid()).unwrap_err().to_string();
+    assert!(err.contains("cannot open"), "{err}");
+    let err = open_root(&link, my_uid()).unwrap_err().to_string();
+    assert!(err.contains("cannot open"), "{err}");
+    let err = open_root(dir.path(), my_uid().wrapping_add(1))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("belongs to uid"), "{err}");
+    let err = open_root(Path::new("relative/root"), my_uid())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("absolute"), "{err}");
 }
 
 #[test]
@@ -282,7 +354,7 @@ fn another_users_file_is_refused() {
     std::fs::write(&path, b"secret").unwrap();
     let owner = std::fs::metadata(&path).unwrap().uid();
     let connecting_uid = owner.wrapping_add(1);
-    let err = open_authorised(&path, connecting_uid, libc::O_RDONLY)
+    let err = open_authorised(&roots(dir.path()), &path, connecting_uid, libc::O_RDONLY)
         .unwrap_err()
         .to_string();
     assert!(err.contains("belongs to uid"), "{err}");
@@ -290,7 +362,7 @@ fn another_users_file_is_refused() {
 
 #[test]
 fn relative_paths_are_refused() {
-    let err = open_authorised(Path::new("OneDrive/a.bin"), my_uid(), libc::O_RDONLY)
+    let err = open_authorised(&[], Path::new("OneDrive/a.bin"), my_uid(), libc::O_RDONLY)
         .unwrap_err()
         .to_string();
     assert!(err.contains("absolute"), "{err}");
@@ -303,7 +375,7 @@ fn parent_directory_traversal_is_refused() {
     std::fs::write(dir.path().join("escape.bin"), b"x").unwrap();
     std::fs::create_dir_all(dir.path().join("sub")).unwrap();
     // The file resolves, so only the explicit component check stops it.
-    let err = open_authorised(&path, my_uid(), libc::O_RDONLY)
+    let err = open_authorised(&roots(dir.path()), &path, my_uid(), libc::O_RDONLY)
         .unwrap_err()
         .to_string();
     assert!(err.contains("parent-directory"), "{err}");
@@ -311,9 +383,15 @@ fn parent_directory_traversal_is_refused() {
 
 #[test]
 fn a_missing_file_is_refused_rather_than_assumed_safe() {
-    let err = open_authorised(Path::new("/nonexistent/nope.bin"), my_uid(), libc::O_RDONLY)
-        .unwrap_err()
-        .to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let err = open_authorised(
+        &roots(dir.path()),
+        &dir.path().join("nope.bin"),
+        my_uid(),
+        libc::O_RDONLY,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("cannot open"), "{err}");
 }
 
@@ -326,7 +404,7 @@ fn a_final_symlink_is_never_followed() {
     std::fs::write(&target, b"content").unwrap();
     symlink(&target, &link).unwrap();
 
-    let error = open_authorised(&link, my_uid(), libc::O_RDONLY)
+    let error = open_authorised(&roots(dir.path()), &link, my_uid(), libc::O_RDONLY)
         .unwrap_err()
         .to_string();
     assert!(error.contains("cannot open"), "{error}");
@@ -341,16 +419,21 @@ fn an_intermediate_symlink_is_never_followed() {
     std::fs::write(&target, b"content").unwrap();
     symlink(outside.path(), root.path().join("link")).unwrap();
 
-    let error = open_authorised(&root.path().join("link/target"), my_uid(), libc::O_RDONLY)
-        .unwrap_err()
-        .to_string();
+    let error = open_authorised(
+        &roots(root.path()),
+        &root.path().join("link/target"),
+        my_uid(),
+        libc::O_RDONLY,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("cannot open"), "{error}");
 }
 
 #[test]
 fn non_regular_files_are_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let error = open_authorised(dir.path(), my_uid(), libc::O_PATH)
+    let error = open_authorised(&roots(dir.path()), dir.path(), my_uid(), libc::O_PATH)
         .unwrap_err()
         .to_string();
     assert!(error.contains("not a regular file"), "{error}");

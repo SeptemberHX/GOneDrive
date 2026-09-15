@@ -47,6 +47,10 @@ sed 's#/usr/local/bin#/usr/bin#' data/gonedrive-hsm.service \
 sed 's#/usr/local/bin#/usr/bin#' data/gonedrived.service \
     > "$STAGE/usr/lib/systemd/user/gonedrived.service"
 
+# --- D-Bus activation: launching the panel starts the daemon if it is not up ---
+install -Dm644 data/org.gonedrive.Daemon.service \
+    "$STAGE/usr/share/dbus-1/services/org.gonedrive.Daemon.service"
+
 # --- desktop entry, and a silent autostart of the tray ---
 install -Dm644 data/org.gonedrive.Gonedrive.desktop \
     "$STAGE/usr/share/applications/org.gonedrive.Gonedrive.desktop"
@@ -77,7 +81,7 @@ Maintainer: GOnedrive <noreply@example.com>
 Installed-Size: $INSTALLED_KB
 Section: net
 Priority: optional
-Depends: libc6, libgtk-4-1 (>= 4.18), libadwaita-1-0 (>= 1.7), python3, python3-gi, init-system-helpers
+Depends: libc6, libgtk-4-1 (>= 4.18), libadwaita-1-0 (>= 1.7), python3 (>= 3.11), python3-gi, init-system-helpers
 Recommends: python3-nautilus, gnome-shell-extension-appindicator
 Description: OneDrive client for Linux with files-on-demand
  GOnedrive syncs Microsoft OneDrive two ways and supports files-on-demand:

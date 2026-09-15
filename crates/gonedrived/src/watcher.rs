@@ -69,6 +69,17 @@ pub struct OpenWrites {
 }
 
 impl OpenWrites {
+    /// Forget every tracked writer. After an inotify overflow the closes that
+    /// would have released these entries may never arrive, and one stale
+    /// entry blocks reconciliation below it until the daemon restarts.
+    fn clear(&self) {
+        let mut open = self.paths.lock().unwrap_or_else(|e| e.into_inner());
+        if !open.is_empty() {
+            open.clear();
+            self.changed.notify_waiters();
+        }
+    }
+
     fn observe(&self, kind: &EventKind, paths: &[PathBuf]) {
         let mut open = self.paths.lock().unwrap_or_else(|e| e.into_inner());
         let mut changed = false;
@@ -157,6 +168,21 @@ impl LocalWatcher {
         let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
             match result {
                 Ok(event) => {
+                    if event.need_rescan() {
+                        // The kernel queue overflowed (IN_Q_OVERFLOW): events
+                        // were dropped, and the close-write bookkeeping can
+                        // no longer be trusted either. notify reports this as
+                        // a path-less event, which used to be discarded here
+                        // as if nothing had happened.
+                        tracing::warn!("inotify queue overflowed; scheduling a full local scan");
+                        callback_writes.clear();
+                        callback_overflow.store(true, Ordering::Release);
+                        let _ = tx.try_send(LocalChange {
+                            kind: LocalChangeKind::Other,
+                            paths: Vec::new(),
+                        });
+                        return;
+                    }
                     let paths: Vec<_> = event
                         .paths
                         .into_iter()

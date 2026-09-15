@@ -658,10 +658,14 @@ impl Engine {
                 )
             })
             .collect();
-        let approved = self
-            .mass_delete_approval
-            .swap(false, std::sync::atomic::Ordering::AcqRel);
         if !deletes.is_empty() {
+            // The approval is a one-shot answer to the refusal it followed.
+            // Only a scan that actually carries deletions may spend it: a
+            // watcher batch for some unrelated write must not silently eat the
+            // user's confirmation and leave the held deletions refused again.
+            let approved = self
+                .mass_delete_approval
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
             let settle = if full_scan {
                 Duration::ZERO
             } else {

@@ -11,7 +11,7 @@ use gonedrive_ipc::hsm::{Event, Request, WatchOutcome, MAX_FRAME_SIZE, MAX_WATCH
 
 use crate::marks::{
     begin_mark_sweep, cancel_mark_sweep, commit_mark_sweep, install_directory_mark, install_mark,
-    open_authorised, remove_marks_for_path,
+    open_authorised, register_roots, remove_marks_for_path,
 };
 use crate::worker::fail_pending_for_uid;
 use crate::{ClientSession, FileIdentity, Reply, Shared};
@@ -232,6 +232,7 @@ fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
                     mark_sweeps: true,
                     file_manager_copy_detection: true,
                     directory_open_notifications: true,
+                    sync_roots: true,
                 },
             );
         }
@@ -337,6 +338,12 @@ fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
             cancel_mark_sweep(shared, uid);
             send_control_result(shared, uid, id, Ok(()));
         }
+        Request::RegisterRoots { id, paths } => {
+            let result = register_roots(shared, &paths, uid).map(|count| {
+                tracing::info!(uid, count, "registered sync roots");
+            });
+            send_control_result(shared, uid, id, result);
+        }
         Request::Unwatch { id, path } => {
             let path = PathBuf::from(path);
             let result = remove_marks_for_path(shared, &path, uid);
@@ -371,7 +378,8 @@ fn handle_request(shared: &Arc<Shared>, request: Request, uid: u32) {
             let reply = match (ok, source) {
                 (true, Some(source)) => {
                     let source = PathBuf::from(source);
-                    match open_authorised(&source, uid, libc::O_RDONLY) {
+                    let roots = shared.roots_for(uid);
+                    match open_authorised(&roots, &source, uid, libc::O_RDONLY) {
                         Ok(source) => Reply::Fill(source.file, offset, full),
                         Err(error) => {
                             tracing::warn!(%error, "refusing staged content");

@@ -12,6 +12,9 @@ cd "$(dirname "$0")"
 if [ "${1:-}" = "--user" ]; then
     [ "$(id -u)" = 0 ] && { echo "run the --user half as yourself, not root"; exit 1; }
     install -Dm644 data/gonedrived.service "$HOME/.config/systemd/user/gonedrived.service"
+    # D-Bus activation: opening the panel starts the daemon when it is not up.
+    install -Dm644 data/org.gonedrive.Daemon.service \
+        "$HOME/.local/share/dbus-1/services/org.gonedrive.Daemon.service"
     ./install-desktop-integration.sh
     systemctl --user daemon-reload
     systemctl --user enable gonedrived.service

@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::fanotify::descriptor_path;
 use crate::file_handle::{object_is_gone, ReopenableFile};
-use crate::{FileIdentity, MarkEntry, MarkKind, Shared};
+use crate::{FileIdentity, MarkEntry, MarkKind, Shared, SyncRoot};
 
 /// Both lookup directions live under one lock so registration, replacement,
 /// event validation, and explicit unwatch always observe one coherent set.
@@ -141,51 +141,170 @@ fn validate_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Open and authorise the exact inode in one operation. No symlink component is
-/// followed, and every later operation uses the returned descriptor.
-pub(super) fn open_authorised(path: &Path, uid: u32, access: i32) -> Result<AuthorisedFile> {
-    open_authorised_kind(path, uid, access, MarkKind::Placeholder)
-}
+/// Resolution rules for everything opened beneath a root: no symlink anywhere
+/// in the path, no magic link, no escape above the root, and no crossing into
+/// another mount — a FUSE tree bind-mounted inside the root would otherwise be
+/// reachable despite the root itself being local.
+const BENEATH_ROOT: u64 = libc::RESOLVE_BENEATH
+    | libc::RESOLVE_NO_SYMLINKS
+    | libc::RESOLVE_NO_MAGICLINKS
+    | libc::RESOLVE_NO_XDEV;
 
-fn open_authorised_kind(
-    path: &Path,
-    uid: u32,
-    access: i32,
-    kind: MarkKind,
-) -> Result<AuthorisedFile> {
-    validate_path(path)?;
-    let path_bytes = path.as_os_str().as_encoded_bytes();
-    let c_path = std::ffi::CString::new(path_bytes)
-        .map_err(|_| anyhow::anyhow!("{} contains a NUL byte", path.display()))?;
+/// Filesystem magic numbers on which the helper refuses to operate. A FUSE or
+/// network mount can block a root-owned worker for as long as its server
+/// likes — a lever any local user could pull against everyone else's
+/// placeholders — and a sync root belongs on a local disk anyway.
+const REFUSED_FILESYSTEMS: &[(u64, &str)] = &[
+    (0x6573_5546, "fuse"),
+    (0x6969, "nfs"),
+    (0x517B, "smb"),
+    (0xFF53_4D42, "cifs"),
+    (0xFE53_4D42, "smb2"),
+    (0x0102_1997, "9p"),
+    (0x5346_414F, "afs"),
+    (0x00C3_6400, "ceph"),
+    (0x7375_7245, "coda"),
+    (0x0116_1970, "gfs2"),
+    (0x7461_636F, "ocfs2"),
+];
+
+fn openat2(dirfd: i32, path: &Path, flags: i32, resolve: u64) -> std::io::Result<File> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains a NUL byte")
+    })?;
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
-    let mut flags = access | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // openat2 accepts only a narrow flag set with O_PATH; O_NONBLOCK is both
-    // unnecessary there and rejected with EINVAL on current kernels. Ordinary
-    // opens keep it so a FIFO or device can never stall this privileged path
-    // before fstat rejects it.
-    if access & libc::O_PATH == 0 {
-        flags |= libc::O_NONBLOCK;
-    }
     how.flags = flags as u64;
-    how.resolve = libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_SYMLINKS;
+    how.resolve = resolve;
     // SAFETY: `c_path` is NUL terminated and `how` has the ABI size supplied.
-    // O_NONBLOCK prevents special-file opens from hanging; those files are
-    // rejected immediately after fstat in any case.
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
-            libc::AT_FDCWD,
+            dirfd,
             c_path.as_ptr(),
             &how,
             std::mem::size_of::<libc::open_how>(),
         ) as i32
     };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("cannot open {}", path.display()));
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: `fd` is a fresh descriptor returned by open.
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Authorise a directory as a sync root: absolute, no symlink anywhere in the
+/// path, a real directory owned by the peer, on a local filesystem.
+pub(super) fn open_root(path: &Path, uid: u32) -> Result<SyncRoot> {
+    validate_path(path)?;
+    let dir = openat2(
+        libc::AT_FDCWD,
+        path,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS,
+    )
+    .with_context(|| format!("cannot open {}", path.display()))?;
+    let meta = dir
+        .metadata()
+        .with_context(|| format!("cannot stat {}", path.display()))?;
+    if !meta.is_dir() {
+        bail!("{} is not a directory", path.display());
+    }
+    if meta.uid() != uid {
+        bail!(
+            "{} belongs to uid {}, not to the connecting uid {uid}",
+            path.display(),
+            meta.uid()
+        );
+    }
+    if let Some(name) = refused_filesystem(&dir)? {
+        bail!(
+            "{} is on a {name} filesystem, which the helper does not serve",
+            path.display()
+        );
+    }
+    Ok(SyncRoot {
+        path: Arc::from(path),
+        dir,
+    })
+}
+
+fn refused_filesystem(dir: &File) -> Result<Option<&'static str>> {
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `stat` is a valid out-pointer for the duration of the call.
+    if unsafe { libc::fstatfs(dir.as_raw_fd(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("fstatfs failed");
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let magic = stat.f_type as u64;
+    Ok(REFUSED_FILESYSTEMS
+        .iter()
+        .find(|(known, _)| *known == magic)
+        .map(|(_, name)| *name))
+}
+
+/// Replace the peer's declared roots. Roots outlive the session the way marks
+/// do: a reconnecting daemon re-declares them before its first watch, and a
+/// hydration reply for a mark installed under the old set must still resolve.
+pub(super) fn register_roots(shared: &Arc<Shared>, paths: &[String], uid: u32) -> Result<usize> {
+    let mut roots = Vec::with_capacity(paths.len());
+    for path in paths {
+        roots.push(open_root(Path::new(path), uid)?);
+    }
+    let count = roots.len();
+    shared.roots.lock().unwrap().insert(uid, Arc::new(roots));
+    Ok(count)
+}
+
+/// Open and authorise the exact inode in one operation.
+///
+/// The path must lie beneath one of the daemon's declared roots and is
+/// resolved relative to that root's descriptor under [`BENEATH_ROOT`], so
+/// neither a symlink nor a lexical trick can point the helper outside the
+/// tree. Every later operation uses the returned descriptor.
+pub(super) fn open_authorised(
+    roots: &[SyncRoot],
+    path: &Path,
+    uid: u32,
+    access: i32,
+) -> Result<AuthorisedFile> {
+    open_authorised_kind(roots, path, uid, access, MarkKind::Placeholder)
+}
+
+fn open_authorised_kind(
+    roots: &[SyncRoot],
+    path: &Path,
+    uid: u32,
+    access: i32,
+    kind: MarkKind,
+) -> Result<AuthorisedFile> {
+    validate_path(path)?;
+    // `strip_prefix` matches whole components, so `/home/u/OneDrive-evil` is
+    // not beneath `/home/u/OneDrive`.
+    let Some((root, relative)) = roots.iter().find_map(|root| {
+        path.strip_prefix(&*root.path)
+            .ok()
+            .map(|relative| (root, relative))
+    }) else {
+        bail!("{} is outside every registered sync root", path.display());
+    };
+    let relative = if relative.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        relative
+    };
+    let mut flags = access | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // openat2 accepts only a narrow flag set with O_PATH; these are both
+    // unnecessary there and rejected with EINVAL on current kernels. Ordinary
+    // opens keep O_NONBLOCK so a FIFO or device can never stall this
+    // privileged path before fstat rejects it, and O_NOCTTY so a terminal
+    // device the peer owns cannot become this process's controlling terminal
+    // — the type check comes after the open, and a hang-up on an acquired
+    // terminal would take the helper down with it.
+    if access & libc::O_PATH == 0 {
+        flags |= libc::O_NONBLOCK | libc::O_NOCTTY;
+    }
+    let file = openat2(root.dir.as_raw_fd(), relative, flags, BENEATH_ROOT)
+        .with_context(|| format!("cannot open {}", path.display()))?;
     let meta = file
         .metadata()
         .with_context(|| format!("cannot stat {}", path.display()))?;
@@ -234,7 +353,8 @@ fn install_typed_mark(
     uid: u32,
     kind: MarkKind,
 ) -> Result<FileIdentity> {
-    let target = open_authorised_kind(path, uid, libc::O_PATH, kind)?;
+    let roots = shared.roots_for(uid);
+    let target = open_authorised_kind(&roots, path, uid, libc::O_PATH, kind)?;
     let sweep = shared.sweeps.lock().unwrap().get(&uid).copied();
     let existing_stale = {
         let mut marks = shared.marks.lock().unwrap();
@@ -628,7 +748,10 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
 
         let uid = unsafe { libc::geteuid() };
-        let path_file = open_authorised(&path, uid, libc::O_PATH).unwrap().file;
+        let roots = vec![open_root(temp.path(), uid).unwrap()];
+        let path_file = open_authorised(&roots, &path, uid, libc::O_PATH)
+            .unwrap()
+            .file;
         // `prepare` reads a mode-000 inode's xattr and intentionally requires
         // the production helper's CAP_DAC_OVERRIDE. Exercise the descriptor-
         // bound restore path here without making the test suite run as root.

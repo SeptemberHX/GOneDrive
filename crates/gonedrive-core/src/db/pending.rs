@@ -416,6 +416,18 @@ impl Store {
             )? as u64)
         })
     }
+
+    /// Queued operations whose retry delay has elapsed. Zero with a non-zero
+    /// [`Self::pending_count`] means everything left is waiting out a backoff.
+    pub fn due_pending_count(&self, account_id: &str) -> Result<u64> {
+        self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM pending_ops WHERE account_id = ?1 AND next_attempt_at <= ?2",
+                params![account_id, now()],
+                |r| r.get::<_, i64>(0),
+            )? as u64)
+        })
+    }
 }
 
 fn row_to_pending(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingOp> {

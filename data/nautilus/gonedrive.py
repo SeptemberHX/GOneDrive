@@ -98,7 +98,9 @@ def menu_item_name(namespace, action):
 def _xattr(path, name):
     try:
         return os.getxattr(path, name).decode("utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # Missing, unreadable, or not ours to interpret: no status is better
+        # than an exception thrown into Nautilus for every file it draws.
         return None
 
 

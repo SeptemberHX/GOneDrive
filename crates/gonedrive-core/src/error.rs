@@ -29,6 +29,13 @@ pub enum Error {
     #[error("throttled by the service; retry after {0:?}")]
     Throttled(Duration),
 
+    /// The identity platform's token endpoint failed without saying the grant
+    /// is dead: a 5xx, a 429, or a gateway's HTML error page. Nothing is
+    /// wrong with the saved credential, so this must never read as "sign in
+    /// again" — the UI would drop to signed-out over a transient outage.
+    #[error("token endpoint returned {status}: {message}")]
+    TokenEndpoint { status: u16, message: String },
+
     /// A name that OneDrive will not accept. Reported to the user, never auto-renamed.
     #[error("invalid name {name:?}: {reason}")]
     InvalidName { name: String, reason: NameError },
@@ -115,7 +122,13 @@ impl Error {
                     | std::io::ErrorKind::ConnectionAborted
                     | std::io::ErrorKind::BrokenPipe
             ),
-            Error::Graph { status, .. } => *status >= 500,
+            // A 429 that outlived the in-call retry budget is still just
+            // throttling: the service asked for patience, not for the transfer
+            // to be abandoned. 408 is the server giving up on a slow link.
+            Error::Graph { status, .. } => *status >= 500 || *status == 429 || *status == 408,
+            Error::TokenEndpoint { status, .. } => {
+                *status >= 500 || *status == 429 || *status == 408
+            }
             _ => false,
         }
     }
@@ -151,6 +164,37 @@ mod tests {
         assert!(!Error::Io(io::Error::from(io::ErrorKind::PermissionDenied)).is_transient());
         assert!(!Error::other("bad name").is_transient());
         assert!(Error::KeyringLocked("login collection".into()).is_transient());
+    }
+
+    #[test]
+    fn exhausted_throttling_is_still_transient() {
+        let throttled = Error::Graph {
+            status: 429,
+            code: "activityLimitReached".into(),
+            message: "slow down".into(),
+        };
+        assert!(throttled.is_transient());
+        let refused = Error::Graph {
+            status: 403,
+            code: "accessDenied".into(),
+            message: "no".into(),
+        };
+        assert!(!refused.is_transient());
+    }
+
+    #[test]
+    fn a_token_endpoint_outage_is_transient_but_a_dead_grant_is_not() {
+        let outage = Error::TokenEndpoint {
+            status: 503,
+            message: "<html>gateway</html>".into(),
+        };
+        assert!(outage.is_transient());
+        let malformed = Error::TokenEndpoint {
+            status: 400,
+            message: "<html>bad proxy</html>".into(),
+        };
+        assert!(!malformed.is_transient());
+        assert!(!Error::AuthRequired("invalid_grant: expired".into()).is_transient());
     }
 }
 

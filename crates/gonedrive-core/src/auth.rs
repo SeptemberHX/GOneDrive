@@ -354,6 +354,36 @@ pub async fn refresh(
     post_token(http, &form, Some(refresh_token)).await
 }
 
+/// Decide whether a failed token request means the user must sign in again.
+///
+/// The identity platform reports a dead grant as a structured 4xx —
+/// `invalid_grant`, `interaction_required`, a revoked consent. Only that
+/// deserves the signed-out prompt. A 5xx, a 429, or an unstructured body (a
+/// proxy's HTML error page) says nothing about the credential, and treating it
+/// as "authentication required" used to flip the UI to signed-out during an
+/// ordinary service outage.
+fn classify_token_failure(status: u16, body: &[u8]) -> Error {
+    let parsed: std::result::Result<TokenErrorResponse, _> = serde_json::from_slice(body);
+    match parsed {
+        Ok(e) if (400..500).contains(&status) && status != 429 && status != 408 => {
+            let message = if e.error_description.is_empty() {
+                e.error.clone()
+            } else {
+                e.error_description
+            };
+            Error::AuthRequired(format!("{}: {message}", e.error))
+        }
+        Ok(e) => Error::TokenEndpoint {
+            status,
+            message: format!("{}: {}", e.error, e.error_description),
+        },
+        Err(_) => Error::TokenEndpoint {
+            status,
+            message: String::from_utf8_lossy(body).into_owned(),
+        },
+    }
+}
+
 async fn post_token(
     http: &reqwest::Client,
     form: &[(&str, &str)],
@@ -369,24 +399,7 @@ async fn post_token(
     let body = response.bytes().await?;
 
     if !status.is_success() {
-        // The identity platform returns a structured error; `invalid_grant`
-        // specifically means the refresh token is dead and only a fresh
-        // interactive login can recover.
-        let parsed: std::result::Result<TokenErrorResponse, _> = serde_json::from_slice(&body);
-        return Err(match parsed {
-            Ok(e) => {
-                let message = if e.error_description.is_empty() {
-                    e.error.clone()
-                } else {
-                    e.error_description
-                };
-                Error::AuthRequired(format!("{}: {message}", e.error))
-            }
-            Err(_) => Error::AuthRequired(format!(
-                "token endpoint returned {status}: {}",
-                String::from_utf8_lossy(&body)
-            )),
-        });
+        return Err(classify_token_failure(status.as_u16(), &body));
     }
 
     let token: TokenResponse = serde_json::from_slice(&body)?;
@@ -436,6 +449,30 @@ div{{text-align:center;max-width:40rem}}p{{color:#616161}}</style>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dead_grant_requires_a_new_login() {
+        let body = br#"{"error":"invalid_grant","error_description":"AADSTS70008: expired"}"#;
+        match classify_token_failure(400, body) {
+            Error::AuthRequired(message) => assert!(message.contains("AADSTS70008")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_token_endpoint_outage_is_not_a_sign_out() {
+        // A structured 503 and a gateway's HTML page both leave the saved
+        // credential untouched; neither may drop the UI to signed-out.
+        let structured = br#"{"error":"temporarily_unavailable","error_description":"retry"}"#;
+        assert!(classify_token_failure(503, structured).is_transient());
+        assert!(classify_token_failure(503, b"<html>upstream timeout</html>").is_transient());
+        assert!(classify_token_failure(429, structured).is_transient());
+        // An unstructured 4xx is an error, but still not a reason to sign out.
+        assert!(matches!(
+            classify_token_failure(400, b"<html>bad proxy</html>"),
+            Error::TokenEndpoint { status: 400, .. }
+        ));
+    }
 
     #[test]
     fn pkce_challenge_is_sha256_of_verifier() {

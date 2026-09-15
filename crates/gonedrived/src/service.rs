@@ -141,7 +141,7 @@ impl DaemonService {
     /// the caller is not blocked on a D-Bus method for however long someone
     /// takes to type a password. Completion arrives as a signal.
     async fn start_login(&self) -> zbus::fdo::Result<String> {
-        let login = Login::start(&self.app.config)
+        let login = Login::start(&self.app.config())
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let url = login.url.clone();
@@ -151,7 +151,7 @@ impl DaemonService {
             let result = login
                 .complete(
                     app.http.clone(),
-                    &app.config,
+                    &app.config(),
                     &app.store,
                     app.tokens.clone(),
                 )

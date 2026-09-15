@@ -432,7 +432,7 @@ async fn handle(
                 !is_disconnected(&e)
             }
         },
-        Command::SyncNow => proxy.sync_now().await.is_ok(),
+        Command::SyncNow => still_connected(proxy.sync_now().await),
         Command::CancelHydration(path) => {
             // A refusal here just means it already finished.
             let _ = proxy.cancel_hydration(&path).await;
@@ -444,31 +444,30 @@ async fn handle(
                 true
             }
             Err(e) => {
-                eprintln!("DBG backend ListFolder err: {e}");
-                false
+                tracing::warn!(path, error = %e, "could not list the folder");
+                !is_disconnected(&e)
             }
         },
         Command::SetKeep { path, keep } => {
-            let ok = if keep {
-                proxy.set_pin_state(&path, "pinned").await.is_ok()
+            if keep {
+                still_connected(proxy.set_pin_state(&path, "pinned").await)
             } else {
                 // FreeUpSpace is the atomic deselect operation: the daemon
                 // cancels queued downloads and commits `unpinned + dehydrated`
                 // under its per-path/download gates. Sending a separate
                 // SetPinState first leaves a window in which the coordinator
                 // can start the very download we are about to release.
-                proxy.free_up_space(&path).await.is_ok()
-            };
-            ok
+                still_connected(proxy.free_up_space(&path).await)
+            }
         }
         Command::GetActivity => match proxy.recent_activity().await {
             Ok(items) => {
                 let _ = ui.send(UiEvent::Activity(items)).await;
                 true
             }
-            Err(_) => false,
+            Err(e) => !is_disconnected(&e),
         },
-        Command::SetPaused(paused) => proxy.set_paused(paused).await.is_ok(),
+        Command::SetPaused(paused) => still_connected(proxy.set_paused(paused).await),
         Command::SetSyncMode(mode) => match proxy.set_sync_mode(&mode).await {
             Ok(summary) => {
                 let _ = ui
@@ -526,4 +525,14 @@ async fn handle(
 /// sign-in is an ordinary answer.
 fn is_disconnected(error: &zbus::Error) -> bool {
     matches!(error, zbus::Error::InputOutput(_))
+}
+
+/// Whether the connection survives a call's outcome. A daemon that answered
+/// with a refusal is still there; treating every error as a lost connection
+/// used to flip the panel to its offline page over an ordinary "no".
+fn still_connected<T>(result: zbus::Result<T>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(e) => !is_disconnected(&e),
+    }
 }

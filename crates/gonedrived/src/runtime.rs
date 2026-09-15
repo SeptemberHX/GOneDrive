@@ -23,10 +23,10 @@ pub(crate) async fn run() -> Result<()> {
     // The UI can sign in after this process has started. Establish the watch
     // before that happens so the first session has the same real-time local
     // change handling as every later restart.
-    std::fs::create_dir_all(&app.config.sync_root).with_context(|| {
+    std::fs::create_dir_all(&app.config().sync_root).with_context(|| {
         format!(
             "could not create sync root {}",
-            app.config.sync_root.display()
+            app.config().sync_root.display()
         )
     })?;
 
@@ -34,9 +34,10 @@ pub(crate) async fn run() -> Result<()> {
     // Process-aware HSM callbacks refuse to populate for them, while the
     // standard exclusion avoids the otherwise pointless recursive namespace
     // walk and permission-event traffic in the first place.
-    if let Err(error) =
-        crate::indexer::ensure_policy(&app.config.sync_root, app.config.exclude_desktop_indexer)
-    {
+    if let Err(error) = crate::indexer::ensure_policy(
+        &app.config().sync_root,
+        app.config().exclude_desktop_indexer,
+    ) {
         tracing::warn!(%error, "could not apply desktop-indexer policy");
     }
 
@@ -71,10 +72,10 @@ pub(crate) async fn run() -> Result<()> {
 
     // Keep the watcher alive for the daemon's lifetime; dropping it stops the
     // watch and the client silently falls back to poll-only.
-    watcher::check_watch_limit(&app.config.sync_root);
+    watcher::check_watch_limit(&app.config().sync_root);
     let (_watcher, local_changes, open_writes) = match LocalWatcher::start(
-        &app.config.sync_root,
-        Duration::from_millis(app.config.local_debounce_ms),
+        &app.config().sync_root,
+        Duration::from_millis(app.config().local_debounce_ms),
     ) {
         Ok((watcher, changes)) => {
             let open_writes = watcher.open_writes();

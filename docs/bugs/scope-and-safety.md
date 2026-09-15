@@ -22,3 +22,20 @@
 - **回归测试**：`crates/gonedrived/src/service.rs::a_path_outside_the_root_is_refused`、`::the_sync_root_itself_is_refused_so_one_click_cannot_sweep_the_drive`、`::a_path_inside_the_root_is_confined_to_a_relative_one`。
 
 <!-- 关联 data-loss 的 DL-001 批量删除阀也是作用域安全的一部分，主条目见 data-loss.md。 -->
+
+## SS-003 · 批量删除确认被无关的扫描消耗 → 用户确认后删除仍被拒
+
+- **首次发现**：2026-09-15（代码审计）
+- **现象**：批量删除阀触发后用户点击确认，但删除仍然被拒绝、再次弹出安全停止。
+- **根因**：`crates/gonedrive-core/src/sync/local.rs` 在 `if !deletes.is_empty()` 之前无条件 `mass_delete_approval.swap(false)`。确认之后若先来一次没有删除的 watcher 局部扫描（任何无关的写入），一次性确认就被它悄悄吃掉。
+- **修复**：只有真正携带删除的扫描才消耗确认标志。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_mass_delete_approval_survives_an_unrelated_scan`（已验证：无修复时 RED，有修复 GREEN）。
+
+## SS-004 · root helper 不知道同步根 → 任何本地用户可让 root 进程 mark 自己拥有的任意文件
+
+- **首次发现**：2026-09-15（代码审计）
+- **现象**：helper 的套接字为 0666，授权边界仅为"目标 inode 的 owner uid == 对端 uid"，不限制在同步根之下。任意本地用户因此获得本需 CAP_SYS_ADMIN 的内核 pre-content 钩子，可挂在自己拥有的任何文件上（`~/.ssh/authorized_keys` 等），阻塞 root 进程对它们的读取最长 300 秒；FUSE 上的文件还能让 root worker 无限期阻塞。
+- **根因**：`crates/gonedrive-hsm/src/marks.rs::open_authorised_kind` 用 `AT_FDCWD` 打开绝对路径，没有任何根目录概念。
+- **修复**：新增协议 `RegisterRoots`（`Features.sync_roots`）。守护进程连接后先声明同步根；helper 校验根为对端拥有的真实目录且不在 FUSE/网络文件系统上，此后所有 mark 与暂存文件都相对根描述符以 `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV` 解析，未声明根的会话什么都不能 mark。同时补上 `O_NOCTTY`（对端拥有的 pts 曾可成为 helper 的控制终端，关闭 master 即 SIGHUP 杀死 helper）并将 unit 改为 `Restart=always`。
+- **回归测试**：`crates/gonedrive-hsm/src/tests.rs::a_file_outside_every_registered_root_is_refused`、`::a_root_prefix_is_matched_by_whole_component`、`::a_root_must_be_a_directory_the_peer_owns_reached_without_symlinks`、`::helper_unit_restarts_after_any_exit`。
+- **兼容性**：新 helper 会拒绝旧守护进程的所有 mark（它不会声明根）；两者随包一起升级，deb 的 postinst 同时重启两个服务。

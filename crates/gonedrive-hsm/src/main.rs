@@ -37,9 +37,9 @@ use gonedrive_ipc::hsm::{Event, SOCKET_PATH};
 
 use crate::fanotify::Fanotify;
 use crate::file_handle::{MountHandles, ReopenableFile};
-#[cfg(test)]
-use crate::marks::open_authorised;
 use crate::marks::MarkRegistry;
+#[cfg(test)]
+use crate::marks::{open_authorised, open_root};
 use crate::server::{bind_socket, send_to_session, send_to_stream, serve_daemon};
 #[cfg(test)]
 use crate::server::{parallel_map_ordered, read_frame, truncate_mark_error, MARK_ERROR_BYTES};
@@ -126,6 +126,15 @@ struct ClientSession {
     stream: Arc<Mutex<UnixStream>>,
 }
 
+/// A directory the daemon declared as one of its sync roots. Every path the
+/// daemon names afterwards is resolved beneath this descriptor, so the helper's
+/// root privilege never reaches a file outside the tree it was told about.
+#[derive(Debug)]
+struct SyncRoot {
+    path: Arc<Path>,
+    dir: std::fs::File,
+}
+
 struct Shared {
     fan: Fanotify,
     next_id: AtomicU64,
@@ -133,6 +142,9 @@ struct Shared {
     sessions: Mutex<HashMap<u32, ClientSession>>,
     marks: Mutex<MarkRegistry>,
     sweeps: Mutex<HashMap<u32, u64>>,
+    /// Declared sync roots per uid. Like marks, they outlive the session that
+    /// declared them: a reconnecting daemon re-declares before its first watch.
+    roots: Mutex<HashMap<u32, Arc<Vec<SyncRoot>>>>,
     mounts: MountHandles,
     descriptor_fallbacks: AtomicU64,
     next_sweep: AtomicU64,
@@ -140,6 +152,17 @@ struct Shared {
 }
 
 impl Shared {
+    /// The roots this uid's daemon declared; empty until it does, which
+    /// refuses every path.
+    fn roots_for(&self, uid: u32) -> Arc<Vec<SyncRoot>> {
+        self.roots
+            .lock()
+            .unwrap()
+            .get(&uid)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn send(&self, uid: u32, event: &Event) -> Result<()> {
         let session = {
             let sessions = self.sessions.lock().unwrap();
@@ -205,6 +228,7 @@ fn main() -> Result<()> {
         sessions: Mutex::new(HashMap::new()),
         marks: Mutex::new(MarkRegistry::default()),
         sweeps: Mutex::new(HashMap::new()),
+        roots: Mutex::new(HashMap::new()),
         mounts: MountHandles::default(),
         descriptor_fallbacks: AtomicU64::new(0),
         next_sweep: AtomicU64::new(1),

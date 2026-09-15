@@ -58,3 +58,11 @@
 - **根因**：`graph.rs` 上传不带 `If-Match`。
 - **修复**：Phase 1.5——带 `If-Match: <etag>`，服务端 412 转冲突副本。（待做，跨"数据丢失"与"正确性"，主条目将并入 data-loss.md）
 - **回归测试**：待补（Phase 1.5）。
+
+## SC-008 · resync 扫尾按错误顺序删除 → 远端已删的嵌套目录被"复活"
+
+- **首次发现**：2026-09-15（代码审计）
+- **现象**：delta 游标失效（410）触发全量重枚举后，云端在此期间删除的、含子目录的文件夹会在下一次本地扫描时被当作新目录重新创建到云端。
+- **根因**：`crates/gonedrive-core/src/db/items.rs::items_missed_by_resync` 注释声称 deepest-first，实际只 `ORDER BY is_folder ASC`。父目录 A 先于子目录 B 处理：`remove_local(A)` 得 `DirectoryNotEmpty` → `delete_subtree(A)` 连带清掉 B 的记录；轮到 B 时 `local_path` 已为 None，B 目录留在磁盘上没有任何记录。
+- **修复**：用递归 CTE 计算每项深度，`ORDER BY level DESC, is_folder ASC, id`，子项永远先于父项处理。
+- **回归测试**：`crates/gonedrive-core/src/db/tests.rs::a_resync_sweep_visits_children_before_their_parents`（已验证：无修复时 RED，有修复 GREEN）。

@@ -70,6 +70,12 @@ pub struct Ui {
 use crate::backend::{Command, UiEvent};
 
 impl Ui {
+    /// The sync root the daemon reported with the account. Empty until the
+    /// first account arrives.
+    pub fn sync_root(&self) -> Rc<RefCell<String>> {
+        self.root_path.clone()
+    }
+
     pub fn build(app: &adw::Application, commands: async_channel::Sender<Command>) -> Self {
         // OneDrive blue as the accent, plus a little card padding. Loaded once,
         // application-wide, so switches/buttons/bars all pick up the brand.

@@ -321,7 +321,9 @@ impl PathLocks {
 }
 
 pub struct App {
-    pub config: Arc<Config>,
+    /// Read through [`App::config`]. A mode switch replaces this in place, so
+    /// nothing may cache a snapshot across an await that could switch modes.
+    config: std::sync::RwLock<Arc<Config>>,
     pub store: Store,
     pub tokens: Arc<TokenStore>,
     pub http: reqwest::Client,
@@ -361,6 +363,26 @@ pub struct App {
 }
 
 impl App {
+    /// The live configuration.
+    ///
+    /// Callers get a snapshot; a sync-mode switch publishes a new one through
+    /// [`App::replace_config`]. Re-read it after any await that could switch
+    /// modes rather than holding an early snapshot.
+    pub fn config(&self) -> Arc<Config> {
+        self.config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Publish a configuration that has already been persisted.
+    pub(crate) fn replace_config(&self, config: Config) {
+        *self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(config);
+    }
+
     pub async fn new(config: Config) -> Result<Arc<Self>> {
         gonedrive_core::config::ensure_dirs()?;
         let store = Store::open(&gonedrive_core::config::state_db_path())
@@ -378,7 +400,7 @@ impl App {
         let open_intents = crate::open_intent::OpenIntents::new(config.sync_root.clone());
 
         let app = Arc::new(Self {
-            config: Arc::new(config),
+            config: std::sync::RwLock::new(Arc::new(config)),
             store,
             tokens,
             http: build_http_client()?,
@@ -437,7 +459,7 @@ impl App {
         {
             return;
         }
-        let Ok(relative) = path.strip_prefix(&self.config.sync_root) else {
+        let Ok(relative) = path.strip_prefix(&self.config().sync_root) else {
             return;
         };
         let needs_population = {
@@ -551,7 +573,7 @@ impl App {
             CREDENTIAL_LOAD_TIMEOUT,
             Authenticator::restore(
                 self.http.clone(),
-                self.config.client_id.clone(),
+                self.config().client_id.clone(),
                 account_id.to_string(),
                 self.tokens.clone(),
             ),
@@ -571,7 +593,7 @@ impl App {
         let engine = Arc::new(Engine::new(
             self.store.clone(),
             graph,
-            self.config.clone(),
+            self.config(),
             account_id.to_string(),
         ));
         self.install_placeholder_protector(&engine);
@@ -1032,7 +1054,7 @@ impl App {
     /// Skipped entirely without the helper: an automatic action must never
     /// create placeholders that nothing will fill.
     async fn auto_free_if_low(&self) {
-        let threshold = self.config.auto_free_below_bytes;
+        let threshold = self.config().auto_free_below_bytes;
         if threshold == 0 {
             return;
         }
