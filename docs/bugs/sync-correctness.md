@@ -66,3 +66,42 @@
 - **根因**：`crates/gonedrive-core/src/db/items.rs::items_missed_by_resync` 注释声称 deepest-first，实际只 `ORDER BY is_folder ASC`。父目录 A 先于子目录 B 处理：`remove_local(A)` 得 `DirectoryNotEmpty` → `delete_subtree(A)` 连带清掉 B 的记录；轮到 B 时 `local_path` 已为 None，B 目录留在磁盘上没有任何记录。
 - **修复**：用递归 CTE 计算每项深度，`ORDER BY level DESC, is_folder ASC, id`，子项永远先于父项处理。
 - **回归测试**：`crates/gonedrive-core/src/db/tests.rs::a_resync_sweep_visits_children_before_their_parents`（已验证：无修复时 RED，有修复 GREEN）。
+
+## SC-009 · 一个消失或非 UTF-8 命名的条目让整次本地扫描中止 → 删除永远传不出去
+
+- **首次发现**：2026-09-15（代码审计）
+- **现象**：目录里存在文件名不是合法 UTF-8 的文件，或全量扫描期间出现又消失的临时文件（编辑器探测文件），之后该账户的本地删除再也不会同步到云端，且全量扫描不断重跑失败。
+- **根因**：`crates/gonedrive-core/src/sync/local.rs::read_dir` 用 `to_string_lossy` 得到一个磁盘上不存在的名字；`prepare_copied_placeholder` 对 ENOENT 直接返回 Err，而它运行在整棵树遍历之后、`enqueue_guarded_deletes` 之前，一个条目的失败丢掉了整次扫描的结果。
+- **修复**：非 UTF-8 名字在枚举时跳过并记录警告；已消失的条目按"无事可做"处理而不是中止扫描。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_name_that_is_not_utf8_neither_uploads_nor_aborts_the_scan`（已验证：无修复时 RED）。
+
+## SC-010 · 上传期间本地再次保存 → 自触发 412 → 伪冲突副本，原名回退到中间版本
+
+- **首次发现**：2026-09-15（代码审计）
+- **现象**：编辑器连续两次保存，第二次落在第一次的上传期间：文件名变成"冲突副本"，原文件名回到第一次保存的内容，而云端并没有其他人改过它。
+- **根因**：`transfer/upload.rs` 在 PUT/最后一块提交**成功后**才比较文件版本，不一致就返回 Err；`queue.rs::run_upload` 因此在 `upsert_item_after_mutation` 之前退出，DB 仍是旧 etag。重试时 `If-Match` 撞上我们自己刚提交的版本，Graph 返回 412，走冲突分支。
+- **修复**：上传成功即为成功。`UploadedFile.source_changed` 报告文件在传输中变化；队列提交云端已接受的版本（本地 stat 记录为被上传的那个版本，而不是描述符当前的元数据），再为更新的内容排队一次 `Upload`。
+- **回归测试**：`crates/gonedrive-core/src/sync/transfer/tests.rs::a_local_edit_during_upload_is_committed_and_reported`。
+
+## SC-011 · 磁盘空间不足时显式同步永不完成
+
+- **首次发现**：2026-09-15（代码审计）
+- **现象**：可用空间低于 `min_free_bytes` 时 `gonedrived sync` 永远挂着，GTK 的"立即同步"也不结束。
+- **根因**：`queue.rs::drain_queue` 把下载操作直接过滤掉而不推进 `next_attempt_at`，它们永远"到期"；协调器的显式同步完成条件（无待办，或待办全部在退避中）两者都不满足。
+- **修复**：被空间闸门挡下的下载调用 `fail_op` 推迟五分钟并记录原因，显式同步随即以"仍排队 N 项"完成。
+
+## SC-012 · 同批 delta 里"删除 + 同名新建"被当成冲突 → 伪冲突副本被上传
+
+- **首次发现**：2026-09-15（代码审计）
+- **现象**：另一端用"先删后建"的方式保存文件（备份工具、rclone），本地凭空多出一份"冲突副本"并上传到云端；按需模式下旧占位符还会成为无记录的孤儿。
+- **根因**：`remote/delta.rs::apply_staged_delta` 先应用全部 upsert 再处理 tombstone。新项 Y 应用时在路径上撞见旧项 X 的文件 → `(None, Some(local))` 判 `ConflictCopy`；随后 `upsert_item(Y)` 又撞上大小写折叠唯一索引（X 仍占着名字）。
+- **修复**：先找出"名字将被同批 upsert 占用"的 tombstone（按 (parent, fold_case(name)) 匹配），在 upsert 之前应用它们。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_same_batch_delete_and_recreate_under_one_name_is_not_a_conflict`（已验证：无修复时 RED）。
+
+## SC-013 · 占位符刷新后 `local_size` 陈旧 → 远端删除被误判为"本地已修改" → 孤儿占位符
+
+- **首次发现**：2026-09-15（代码审计）
+- **现象**：云端先改了一个从未下载的文件（占位符按新尺寸刷新），再把它删掉；本地占位符留在磁盘上，看得见、打不开、永远不会清理，还会反复尝试上传被拒。
+- **根因**：`remote.rs` 刷新占位符时改写磁盘 size/mtime 但不写 `local_*`；tombstone 路径不区分占位符，`local_is_modified` 因尺寸不等返回 true → `KeepLocalAndReupload`。从 Download 分支直接创建的占位符也从不记录 stat。
+- **修复**：tombstone 路径与 resync 扫尾对"自有且仍为 Dehydrated 的占位符"一律删除；刷新占位符时同步更新记录的本地 stat。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_refreshed_placeholder_is_removed_by_a_later_tombstone_not_kept_as_edited`（已验证：无修复时 RED）。

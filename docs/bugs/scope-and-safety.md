@@ -39,3 +39,10 @@
 - **修复**：新增协议 `RegisterRoots`（`Features.sync_roots`）。守护进程连接后先声明同步根；helper 校验根为对端拥有的真实目录且不在 FUSE/网络文件系统上，此后所有 mark 与暂存文件都相对根描述符以 `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV` 解析，未声明根的会话什么都不能 mark。同时补上 `O_NOCTTY`（对端拥有的 pts 曾可成为 helper 的控制终端，关闭 master 即 SIGHUP 杀死 helper）并将 unit 改为 `Restart=always`。
 - **回归测试**：`crates/gonedrive-hsm/src/tests.rs::a_file_outside_every_registered_root_is_refused`、`::a_root_prefix_is_matched_by_whole_component`、`::a_root_must_be_a_directory_the_peer_owns_reached_without_symlinks`、`::helper_unit_restarts_after_any_exit`。
 - **兼容性**：新 helper 会拒绝旧守护进程的所有 mark（它不会声明根）；两者随包一起升级，deb 的 postinst 同时重启两个服务。
+
+## SS-005 · 登录完成时用陈旧的配置快照覆盖 config.toml
+
+- **首次发现**：2026-09-15（代码审计）
+- **现象**：浏览器登录窗口期间切换了同步模式，登录一完成，磁盘上的模式被还原成登录开始前的值；下次重启回到旧模式。
+- **根因**：`service.rs::start_login` 在 spawn 前取得 `app.config()` 快照并持有最长 300 秒，`login.rs::complete` 结束时把这个快照 `save()` 回磁盘。
+- **修复**：`complete` 不再写配置；调用方在登录完成后用**当时的**实时配置保存。

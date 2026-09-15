@@ -49,6 +49,10 @@ pub struct UploadTarget<'a> {
 pub(crate) struct UploadedFile {
     pub(crate) item: DriveItem,
     pub(crate) quickxor: String,
+    /// The file changed after the uploaded bytes were captured. The service
+    /// holds a consistent earlier version; the caller commits that and queues
+    /// the newer content rather than treating the upload as failed.
+    pub(crate) source_changed: bool,
 }
 
 /// Upload a local file, resuming a previous attempt when one is recorded.
@@ -151,10 +155,12 @@ async fn upload_file_inner(
                 target.etag,
             )
             .await?;
-        if capture(rooted, source)? != source_version {
-            return Err(file_changed_error(source, "uploading"));
-        }
-        return Ok(UploadedFile { item, quickxor });
+        let source_changed = capture(rooted, source)? != source_version;
+        return Ok(UploadedFile {
+            item,
+            quickxor,
+            source_changed,
+        });
     }
 
     let hash = crate::hash::quick_xor_reader(&mut source_file)?;
@@ -186,10 +192,12 @@ async fn upload_file_inner(
         rooted,
     )
     .await?;
-    if capture(rooted, source)? != source_version {
-        return Err(file_changed_error(source, "uploading"));
-    }
-    Ok(UploadedFile { item, quickxor })
+    let source_changed = capture(rooted, source)? != source_version;
+    Ok(UploadedFile {
+        item,
+        quickxor,
+        source_changed,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

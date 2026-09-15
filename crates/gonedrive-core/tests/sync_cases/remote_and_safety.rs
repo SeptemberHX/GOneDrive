@@ -905,3 +905,50 @@ async fn mock_upload(server: &MockServer, new_id: &str, name: &str) {
 // sight fills the disk and fails, after hours of transfer — so the default has
 // to be that content arrives only when it is asked for.
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_same_batch_delete_and_recreate_under_one_name_is_not_a_conflict() {
+    // A backup tool saves by deleting `a.txt` and creating a new one. Both
+    // land in one delta batch. Applying the new item before the old one's
+    // tombstone found the old file at the path and filed a conflict copy of
+    // content the user never touched — then hit the unique name index.
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"hello").await;
+    h.sync().await;
+    assert_eq!(h.read("a.txt"), "hello");
+
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![
+            file("F2", ROOT, "a.txt", "c2", 5, "2026-08-21T10:00:00Z"),
+            tombstone("F1", ROOT),
+        ],
+        "v2",
+    )
+    .await;
+    h.mock_download("F2", b"world").await;
+    let summary = h.sync().await;
+
+    assert_eq!(summary.conflicts, 0);
+    assert_eq!(h.read("a.txt"), "world");
+    assert!(h.store.item("F1").unwrap().is_none());
+    assert!(h.store.item("F2").unwrap().is_some());
+    assert!(
+        h.store.due_outbound_ops(ACCOUNT, 10).unwrap().is_empty(),
+        "nothing local was changed, so nothing is uploaded"
+    );
+    let stray: Vec<_> = std::fs::read_dir(&h.root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "a.txt" && !name.starts_with('.'))
+        .collect();
+    assert!(stray.is_empty(), "no conflict copy may appear: {stray:?}");
+}

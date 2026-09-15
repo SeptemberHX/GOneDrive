@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind, RenameMode};
@@ -21,6 +21,16 @@ const BATCH_QUEUE: usize = 64;
 /// Files the client writes itself, whose events would otherwise wake the loop
 /// once per chunk of every download.
 const IGNORED_SUFFIXES: &[&str] = &[".gonedrive-partial"];
+/// How long an observed writer may hold reconciliation of its scope. A hard
+/// link, a FIFO, or `O_TMPFILE`+`linkat` produce a create without any
+/// close-write; a database or VM image is written for hours. Without a bound,
+/// one such entry stops every incremental and full scan of its scope until the
+/// daemon restarts. After this long the scan proceeds; a torn upload of a file
+/// still being written is corrected by the next scan once it settles.
+const OPEN_WRITE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Re-check a blocked batch at this interval even without a close event, so
+/// an expired entry releases it.
+const OPEN_WRITE_RECHECK: Duration = Duration::from_secs(30);
 
 pub struct LocalWatcher {
     /// Dropping this stops the watch.
@@ -64,7 +74,8 @@ pub struct LocalChangeBatch {
 /// report, preventing the periodic verifier from racing an application write.
 #[derive(Debug, Clone, Default)]
 pub struct OpenWrites {
-    paths: Arc<Mutex<HashMap<PathBuf, usize>>>,
+    /// Path to the moment its writer was first observed.
+    paths: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     changed: Arc<tokio::sync::Notify>,
 }
 
@@ -86,7 +97,7 @@ impl OpenWrites {
         match kind {
             EventKind::Create(CreateKind::File) => {
                 for path in paths {
-                    open.entry(path.clone()).or_insert(1);
+                    open.entry(path.clone()).or_insert_with(Instant::now);
                     changed = true;
                 }
             }
@@ -99,7 +110,7 @@ impl OpenWrites {
                     // cheap relative to a write event and keeps the gate tied
                     // strictly to regular file content.
                     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
-                        open.entry(path.clone()).or_insert(1);
+                        open.entry(path.clone()).or_insert_with(Instant::now);
                         changed = true;
                     }
                 }
@@ -126,7 +137,8 @@ impl OpenWrites {
     }
 
     pub fn blocks(&self, scopes: &HashSet<PathBuf>) -> bool {
-        let open = self.paths.lock().unwrap_or_else(|e| e.into_inner());
+        let mut open = self.paths.lock().unwrap_or_else(|e| e.into_inner());
+        Self::expire(&mut open);
         open.keys().any(|path| {
             scopes
                 .iter()
@@ -135,14 +147,25 @@ impl OpenWrites {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.paths
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
+        let mut open = self.paths.lock().unwrap_or_else(|e| e.into_inner());
+        Self::expire(&mut open);
+        open.is_empty()
+    }
+
+    fn expire(open: &mut HashMap<PathBuf, Instant>) {
+        open.retain(|path, since| {
+            let live = since.elapsed() < OPEN_WRITE_TTL;
+            if !live {
+                tracing::info!(path = %path.display(), "writer never closed; no longer holding its scope");
+            }
+            live
+        });
     }
 
     async fn wait_for_change(&self) {
-        self.changed.notified().await;
+        // Bounded so an entry that expires without any event still releases
+        // the batch that is waiting on it.
+        let _ = tokio::time::timeout(OPEN_WRITE_RECHECK, self.changed.notified()).await;
     }
 }
 
@@ -439,6 +462,24 @@ mod tests {
             &EventKind::Access(AccessKind::Close(AccessMode::Write)),
             std::slice::from_ref(&path),
         );
+        assert!(tracker.is_idle());
+    }
+
+    #[test]
+    fn a_writer_that_never_closes_stops_holding_its_scope_after_the_ttl() {
+        // A hard link, a FIFO, or a database written for hours: none of them
+        // ever produce the close-write that would release the entry.
+        let scope = PathBuf::from("/sync/A");
+        let path = scope.join("never-closed.bin");
+        let Some(long_ago) = Instant::now().checked_sub(OPEN_WRITE_TTL + Duration::from_secs(1))
+        else {
+            eprintln!("skipping: the monotonic clock is younger than the TTL");
+            return;
+        };
+        let tracker = OpenWrites::default();
+        tracker.paths.lock().unwrap().insert(path, long_ago);
+
+        assert!(!tracker.blocks(&HashSet::from([scope])));
         assert!(tracker.is_idle());
     }
 

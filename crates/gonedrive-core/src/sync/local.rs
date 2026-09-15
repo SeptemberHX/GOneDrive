@@ -838,6 +838,13 @@ impl Engine {
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                 return Ok(false);
             }
+            // Collected by the walk, gone by the time the appeared list is
+            // processed (an editor's probe file, a build's temporary). It is
+            // nothing to upload — and it must not abort the whole scan, which
+            // would also discard every deletion the walk found.
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
             Err(error) => return Err(error),
         };
         let Some(claimed_id) = Placeholder::item_id_file(&file) else {
@@ -908,7 +915,7 @@ fn placeholder_claim(rooted: &RootedFs, path: &Path) -> Option<(String, Placehol
     Some((item_id, Placeholder::state_file(&file)))
 }
 
-fn owned_placeholder_state(
+pub(super) fn owned_placeholder_state(
     rooted: &super::rooted_fs::RootedFs,
     path: &Path,
     expected_item_id: &str,
@@ -945,7 +952,9 @@ fn read_dir(
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(name) = utf8_name(&entry) else {
+            continue;
+        };
         if INTERNAL_SUFFIXES.iter().any(|s| name.ends_with(s)) {
             // Staging leftovers are pure cache: consumed within seconds when
             // things work, so one still here after fifteen minutes is an
@@ -975,6 +984,20 @@ fn read_dir(
     Ok(out)
 }
 
+/// A directory entry's name as a `String`, or `None` for a name that is not
+/// valid UTF-8. OneDrive names are Unicode, so such an entry could never
+/// round-trip; worse, a lossy conversion yields a path that does not exist on
+/// disk, and opening it used to abort the whole scan.
+fn utf8_name(entry: &std::fs::DirEntry) -> Option<String> {
+    match entry.file_name().to_str() {
+        Some(name) => Some(name.to_owned()),
+        None => {
+            tracing::warn!(path = ?entry.path(), "skipping a name that is not valid UTF-8");
+            None
+        }
+    }
+}
+
 /// Read-only counterpart used by background discovery. It neither removes
 /// stale staging files nor follows symlinks, so running it concurrently with
 /// remote polling cannot mutate the sync tree.
@@ -982,7 +1005,9 @@ fn read_dir_readonly(dir: &Path) -> std::io::Result<Vec<(String, LocalStat)>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(name) = utf8_name(&entry) else {
+            continue;
+        };
         if INTERNAL_SUFFIXES
             .iter()
             .any(|suffix| name.ends_with(suffix))

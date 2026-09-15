@@ -138,9 +138,30 @@ fn fill_from_places_content_at_offset_zero_exactly() {
         .unwrap()
         .into();
     let mut source = std::fs::File::open(&source).unwrap();
-    let n = fill_from(&mut source, &fd, 0).unwrap();
+    let n = fill_from(&mut source, &fd, 0, 16).unwrap();
     assert_eq!(n, 16);
     assert_eq!(std::fs::read(&target).unwrap(), b"the real content");
+}
+
+#[test]
+fn fill_from_never_writes_past_the_validated_length() {
+    use std::os::unix::io::OwnedFd;
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("staged");
+    let target = dir.path().join("placeholder");
+    // The source grew after its length was validated as 8.
+    std::fs::write(&source, b"12345678EXTRA-BYTES").unwrap();
+    std::fs::write(&target, vec![0u8; 8]).unwrap();
+
+    let fd: OwnedFd = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .into();
+    let mut source = std::fs::File::open(&source).unwrap();
+    let n = fill_from(&mut source, &fd, 0, 8).unwrap();
+    assert_eq!(n, 8);
+    assert_eq!(std::fs::read(&target).unwrap(), b"12345678");
 }
 
 #[test]
@@ -159,7 +180,7 @@ fn fill_from_lands_a_range_at_its_offset_and_leaves_the_rest() {
         .unwrap()
         .into();
     let mut source = std::fs::File::open(&source).unwrap();
-    let n = fill_from(&mut source, &fd, 10).unwrap();
+    let n = fill_from(&mut source, &fd, 10, 6).unwrap();
     assert_eq!(n, 6);
 
     let got = std::fs::read(&target).unwrap();
@@ -320,17 +341,12 @@ fn a_root_prefix_is_matched_by_whole_component() {
 }
 
 #[test]
-fn a_root_must_be_a_directory_the_peer_owns_reached_without_symlinks() {
-    use std::os::unix::fs::symlink;
+fn a_root_must_be_a_directory_the_peer_owns() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("file");
     std::fs::write(&file, b"x").unwrap();
-    let link = dir.path().join("link");
-    symlink(dir.path(), &link).unwrap();
 
     let err = open_root(&file, my_uid()).unwrap_err().to_string();
-    assert!(err.contains("cannot open"), "{err}");
-    let err = open_root(&link, my_uid()).unwrap_err().to_string();
     assert!(err.contains("cannot open"), "{err}");
     let err = open_root(dir.path(), my_uid().wrapping_add(1))
         .unwrap_err()
@@ -340,6 +356,27 @@ fn a_root_must_be_a_directory_the_peer_owns_reached_without_symlinks() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("absolute"), "{err}");
+}
+
+#[test]
+fn a_root_named_through_a_symlink_is_accepted_but_links_beneath_it_are_not() {
+    // `/home -> var/home` and `~/OneDrive -> /mnt/data/OneDrive` are ordinary
+    // layouts. The descriptor is the boundary, so the root's own name may go
+    // through a link; a link *inside* the tree still may not be followed.
+    use std::os::unix::fs::symlink;
+    let real = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let link = elsewhere.path().join("OneDrive");
+    symlink(real.path(), &link).unwrap();
+    std::fs::write(real.path().join("mine.bin"), b"x").unwrap();
+    symlink(real.path().join("mine.bin"), real.path().join("alias.bin")).unwrap();
+
+    let roots = vec![open_root(&link, my_uid()).unwrap()];
+    assert!(open_authorised(&roots, &link.join("mine.bin"), my_uid(), libc::O_RDONLY).is_ok());
+    let err = open_authorised(&roots, &link.join("alias.bin"), my_uid(), libc::O_RDONLY)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("cannot open"), "{err}");
 }
 
 #[test]

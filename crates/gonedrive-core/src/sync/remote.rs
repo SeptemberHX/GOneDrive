@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::hydrate::{DirectoryPopulation, Placeholder, PlaceholderState};
 use crate::models::DriveItem;
 use crate::names::{conflict_copy_name, split_extension};
-use crate::sync::plan::{decide_remote, record_from_remote, RemoteAction, SkipReason};
+use crate::sync::plan::{decide_remote, record_from_remote, LocalStat, RemoteAction, SkipReason};
 
 use super::engine::{stat_of, Engine, SyncEvent, SyncSummary};
 use super::transfer;
@@ -70,8 +70,16 @@ impl Engine {
                 return Ok(());
             };
             let local = stat_of(&path);
+            // An owned, still-dehydrated placeholder holds no local content
+            // whatever its recorded stat says: a refresh rewrote its size on
+            // disk without touching `local_size`, and one created from the
+            // download branch never recorded a stat at all. Keeping it as a
+            // "local edit" left an orphan the user could see but never open.
+            let untouched_placeholder = !known.is_folder
+                && super::local::owned_placeholder_state(&self.rooted(account)?, &path, &known.id)
+                    == Some(PlaceholderState::Dehydrated);
             match decide_remote(remote, Some(&known), local.as_ref()) {
-                RemoteAction::KeepLocalAndReupload => {
+                RemoteAction::KeepLocalAndReupload if !untouched_placeholder => {
                     // Detach it from the remote item that no longer exists and
                     // re-offer the local content as something new.
                     self.store.delete_subtree(&known.id)?;
@@ -198,6 +206,20 @@ impl Engine {
                 );
                 record.pin_state = existing.pin_state;
                 self.store.upsert_item(&record)?;
+                if changed {
+                    // The placeholder's on-disk size and mtime just changed;
+                    // keep the recorded local version in step so the scan does
+                    // not read the refresh as a local edit.
+                    if let Ok(Some(meta)) = self.rooted(account)?.metadata(&path) {
+                        let local = LocalStat::from_metadata(&meta);
+                        self.store.set_local_stat(
+                            &existing.id,
+                            OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
+                            Some(local.size),
+                            Some(local.ino),
+                        )?;
+                    }
+                }
                 return Ok(());
             }
         }

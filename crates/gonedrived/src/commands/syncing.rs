@@ -150,6 +150,10 @@ async fn sync_via_daemon(proxy: &gonedrive_ipc::DaemonProxy<'static>) -> Result<
             "keyring_locked" | "signed_out" | "error" => {
                 anyhow::bail!("the daemon reports: {}", status.last_error)
             }
+            "offline" => anyhow::bail!(
+                "the daemon is offline and will retry on its own: {}",
+                status.last_error
+            ),
             "paused" => anyhow::bail!("the daemon paused for safety: {}", status.last_error),
             _ => tokio::time::sleep(Duration::from_millis(500)).await,
         }

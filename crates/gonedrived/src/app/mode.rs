@@ -78,6 +78,7 @@ impl App {
     /// change of policy ends with a daemon restart; the on-demand flag itself
     /// is applied live.
     pub async fn set_sync_mode(self: &Arc<Self>, mode: SyncMode) -> Result<ModeSwitch> {
+        let _one_at_a_time = self.mode_switch.lock().await;
         let current = self.sync_mode();
         let previous = self.config();
         let mut config = (*previous).clone();

@@ -344,6 +344,10 @@ pub struct App {
     /// file; letting both write concurrently would materialise it again after
     /// the release returns.
     pub(crate) download_gate: Arc<Mutex<()>>,
+    /// Serialises sync-mode switches. Two concurrent switches would each
+    /// prune the tree and publish a configuration derived from a snapshot the
+    /// other has already replaced.
+    pub(crate) mode_switch: Mutex<()>,
 
     /// The privileged helper, when files-on-demand is available. Without it a
     /// placeholder is just a file full of zeroes that nothing will ever fill.
@@ -415,6 +419,7 @@ impl App {
             hydrations: Arc::new(RwLock::new(HashMap::new())),
             hydration_locks: PathLocks::default(),
             download_gate: Arc::new(Mutex::new(())),
+            mode_switch: Mutex::new(()),
             hsm: RwLock::new(None),
             pending_placeholder_reports: Mutex::new(PendingPlaceholderReports::default()),
             open_intents,
@@ -566,9 +571,11 @@ impl App {
         // Reading the refresh token can block on the Secret Service: a locked
         // keyring makes it wait on an unlock prompt that may never be answered.
         // Bound it so a stuck credential read can never hang daemon startup —
-        // we are already on the bus (see runtime::run), and on timeout we
-        // report a (transient) keyring lock and carry on. An explicit unlock
-        // followed by SyncNow re-attaches the account via attach_missing_accounts.
+        // we are already on the bus (see runtime::run). The bound covers the
+        // keyring read *and* the first token refresh, so a slow network trips
+        // it as easily as a locked keyring; report it as the transient it is
+        // (the account re-attaches on the ordinary remote timer) rather than
+        // as a keyring lock, which only an explicit wake retries.
         let auth = match tokio::time::timeout(
             CREDENTIAL_LOAD_TIMEOUT,
             Authenticator::restore(
@@ -582,9 +589,10 @@ impl App {
         {
             Ok(result) => result?,
             Err(_elapsed) => {
-                return Err(Error::KeyringLocked(
-                    "timed out reading credentials (the login keyring may be locked)".into(),
-                )
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out loading credentials (slow token endpoint or locked keyring)",
+                ))
                 .into())
             }
         };

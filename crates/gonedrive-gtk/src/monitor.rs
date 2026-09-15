@@ -162,6 +162,7 @@ impl Monitor {
         self.cancel_close();
         // Any prior failure message is stale the moment a new transfer starts.
         self.status.set_visible(false);
+        let newly_shown = !self.window.is_visible();
         self.window.set_visible(true);
 
         let mut rows = self.rows.borrow_mut();
@@ -219,7 +220,12 @@ impl Monitor {
             0 | 1 => "OneDrive 下载中".to_string(),
             n => format!("OneDrive · {n} 个文件下载中"),
         });
-        self.window.present();
+        // Present only when the window first appears. Every progress tick
+        // used to re-present it, which on X11 steals focus from whatever the
+        // user is typing into for the whole download.
+        if newly_shown {
+            self.window.present();
+        }
     }
 
     fn build_row(self: &Rc<Self>, hydration: &Hydration) -> Row {

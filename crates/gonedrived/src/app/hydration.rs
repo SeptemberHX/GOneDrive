@@ -110,12 +110,28 @@ impl App {
                 }
             }
         };
-        if let Ok(StageOutcome::Fill(staged, _, _)) = &result {
-            if let Some(entry) = self.hydrations.write().await.get_mut(path) {
-                if entry.request_id == request_id {
-                    entry.staged = Some(staged.clone());
+        match &result {
+            Ok(StageOutcome::Fill(staged, _, _)) => {
+                if let Some(entry) = self.hydrations.write().await.get_mut(path) {
+                    if entry.request_id == request_id {
+                        entry.staged = Some(staged.clone());
+                    }
                 }
             }
+            Err(error) => {
+                // This hydration was started, so it must be unwound here. The
+                // helper answers a refused fill with `full: false`, which the
+                // Filled handler rightly reads as "nothing to unwind" — the
+                // same shape as an offline browse refusal. Left alone, the
+                // path guard, the in-flight entry and the Hydrating row all
+                // outlived the failure until the daemon restarted, blocking
+                // every later read, fetch and release of the file.
+                tracing::debug!(path = %path.display(), %error, "unwinding failed hydration");
+                if let Err(unwind) = self.fail_hydration(path, request_id).await {
+                    tracing::warn!(path = %path.display(), error = %unwind, "could not unwind hydration");
+                }
+            }
+            Ok(_) => {}
         }
         result
     }
@@ -519,10 +535,22 @@ impl App {
             for entry in hydrations.values() {
                 entry.cancel.store(true, Ordering::Relaxed);
             }
+            let abandoned: Vec<_> = hydrations.keys().cloned().collect();
             hydrations.clear();
             drop(hydrations);
             for path in staged {
                 self.remove_staged_file(&path).await;
+            }
+            // The helper will never report these fills. Put their rows back
+            // to Dehydrated now rather than leaving them Hydrating — a state
+            // the local scan skips — until the next restart repairs them.
+            let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+            for path in abandoned {
+                for engine in &engines {
+                    if engine.fail_hydration(&path).is_ok() {
+                        break;
+                    }
+                }
             }
         }
         *self.hsm.write().await = client;

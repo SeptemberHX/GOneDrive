@@ -207,6 +207,7 @@ impl Config {
             }
         }
 
+        cfg.sync_root = expand_home(&cfg.sync_root);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -223,6 +224,20 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if !self.sync_root.is_absolute() {
+            return Err(Error::Config(format!(
+                "sync_root ({}) must be an absolute path; the daemon, the CLI and the \
+                 file-manager extension do not share a working directory",
+                self.sync_root.display()
+            )));
+        }
+        if self.sync_root == home() || self.sync_root == Path::new("/") {
+            return Err(Error::Config(format!(
+                "sync_root ({}) must be a dedicated folder, not the home directory or /: \
+                 the daemon's own state files would be synced as user changes",
+                self.sync_root.display()
+            )));
+        }
         let client_id = self.client_id.trim();
         if client_id.is_empty() || client_id == PLACEHOLDER_CLIENT_ID {
             let what = if client_id.is_empty() {
@@ -294,6 +309,14 @@ fn home() -> PathBuf {
 
 fn default_sync_root() -> PathBuf {
     home().join("OneDrive")
+}
+
+/// `~` and `~/...` mean the home directory, as every shell user expects.
+fn expand_home(path: &Path) -> PathBuf {
+    match path.strip_prefix("~") {
+        Ok(rest) => home().join(rest),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// `$XDG_CONFIG_HOME/gonedrive`
@@ -487,6 +510,31 @@ mod tests {
         };
         let error = cfg.validate().unwrap_err().to_string();
         assert!(error.contains("full_scan_interval_secs"), "{error}");
+    }
+
+    #[test]
+    fn sync_root_must_be_absolute_and_a_dedicated_folder() {
+        for root in [PathBuf::from("OneDrive"), home(), PathBuf::from("/")] {
+            let cfg = Config {
+                client_id: "test".into(),
+                sync_root: root.clone(),
+                ..Config::default()
+            };
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("sync_root"), "{}: {error}", root.display());
+        }
+    }
+
+    #[test]
+    fn a_tilde_sync_root_expands_to_the_home_directory() {
+        assert_eq!(
+            expand_home(Path::new("~/Cloud/OneDrive")),
+            home().join("Cloud/OneDrive")
+        );
+        assert_eq!(expand_home(Path::new("~")), home());
+        assert_eq!(expand_home(Path::new("/srv/x")), PathBuf::from("/srv/x"));
+        // `~user` is a different shell feature; leave it alone.
+        assert_eq!(expand_home(Path::new("~user/x")), PathBuf::from("~user/x"));
     }
 
     #[test]

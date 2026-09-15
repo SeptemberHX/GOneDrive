@@ -111,10 +111,17 @@ impl Engine {
                     .due_non_delete_outbound_ops(&self.account_id, QUEUE_BATCH)?,
                 QueueScope::All => self.store.due_ops(&self.account_id, QUEUE_BATCH)?,
             };
-            let ops: Vec<_> = ops
+            let (ops, held): (Vec<_>, Vec<_>) = ops
                 .into_iter()
-                .filter(|op| downloads_allowed || op.kind != OpKind::Download)
-                .collect();
+                .partition(|op| downloads_allowed || op.kind != OpKind::Download);
+            for op in held {
+                // Push the retry out rather than leaving the row perpetually
+                // due. A due-but-unrunnable download otherwise never lets an
+                // explicit sync report completion, and the recorded reason
+                // tells the user what is holding the transfer.
+                self.store
+                    .fail_op(op.id, "not enough free disk space", LOW_SPACE_RETRY)?;
+            }
             if ops.is_empty() {
                 return Ok(());
             }
@@ -504,9 +511,15 @@ impl Engine {
             Err(e) => return Err(e),
         };
 
-        if !transfer::FileVersion::capture_rooted(&rooted, &path)?.same_content_as(source_version) {
-            return Err(transfer::file_changed_error(&path, "uploading"));
-        }
+        // The service now holds the version captured before the upload began.
+        // If the file moved on meanwhile, that version is still the truth
+        // about the *remote* item and must be committed as such. Aborting
+        // here used to leave the store on the old etag: the retry's If-Match
+        // then met our own upload, Graph answered 412, and the user's newest
+        // save became a conflict copy of a file nobody else had touched.
+        let source_changed = uploaded.source_changed
+            || !transfer::FileVersion::capture_rooted(&rooted, &path)?
+                .same_content_as(source_version);
         let item = uploaded.item;
         let content_hash = uploaded.quickxor;
 
@@ -543,19 +556,49 @@ impl Engine {
             summary.uploaded += 1;
             return Ok(());
         }
-        if let Ok(meta) = source_file.metadata() {
-            let local = LocalStat::from_metadata(&meta);
-            if let Err(error) = self.store.set_local_stat(
-                &record.id,
-                OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
-                Some(local.size),
-                Some(local.ino),
-            ) {
-                // The service has already committed the upload. Retrying a
-                // brand-new create could only collide with that same item;
-                // leave reconciliation to the next local/delta pass instead.
-                tracing::warn!(path = %path.display(), %error, "could not record uploaded local version");
+        // Record the version that was actually uploaded. When the file moved
+        // on during the transfer, the descriptor's current metadata would
+        // describe bytes the service never received and hide them from the
+        // next scan as "already synced".
+        let uploaded_version = (
+            source_version.mtime_secs(),
+            source_version.size(),
+            source_version.ino(),
+        );
+        let (mtime, size, ino) = if source_changed {
+            uploaded_version
+        } else {
+            match source_file.metadata() {
+                Ok(meta) => {
+                    let local = LocalStat::from_metadata(&meta);
+                    (local.mtime, local.size, local.ino)
+                }
+                Err(_) => uploaded_version,
             }
+        };
+        if let Err(error) = self.store.set_local_stat(
+            &record.id,
+            OffsetDateTime::from_unix_timestamp(mtime).ok(),
+            Some(size),
+            Some(ino),
+        ) {
+            // The service has already committed the upload. Retrying a
+            // brand-new create could only collide with that same item;
+            // leave reconciliation to the next local/delta pass instead.
+            tracing::warn!(path = %path.display(), %error, "could not record uploaded local version");
+        }
+        if source_changed {
+            tracing::info!(path = %path.display(), "file changed during upload; queuing the newer content");
+            self.store.enqueue_conditional(
+                &self.account_id,
+                OpKind::Upload,
+                &record.id,
+                Some(&path),
+                record.parent_id.as_deref(),
+                record.etag.as_deref().or(record.ctag.as_deref()),
+            )?;
+            self.store
+                .set_item_state(&record.id, ItemState::DirtyLocal)?;
         }
 
         // Do not publish xattrs onto an application's source inode here. GTK's
@@ -789,6 +832,9 @@ impl Engine {
 }
 
 /// Backoff between retries of a queued operation: 2s, 4s, 8s … capped at 5min.
+/// How long a download waits when the disk is below the free-space floor.
+const LOW_SPACE_RETRY: Duration = Duration::from_secs(300);
+
 fn retry_delay(attempts: u32) -> Duration {
     Duration::from_secs(1u64 << (attempts + 1).min(8)).min(Duration::from_secs(300))
 }

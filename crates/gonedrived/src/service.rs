@@ -158,6 +158,13 @@ impl DaemonService {
                 .await;
             match result {
                 Ok(account_id) => {
+                    // Persist the client id the sign-in just succeeded with —
+                    // from the *live* configuration, not the snapshot taken
+                    // before the browser round trip. A mode switch made while
+                    // the user was typing a password used to be undone here.
+                    if let Err(e) = app.config().save() {
+                        tracing::warn!(error = %e, "could not persist the configuration");
+                    }
                     if let Err(e) = app.attach_account(&account_id).await {
                         app.notify_login_failed(&e.to_string());
                         return;

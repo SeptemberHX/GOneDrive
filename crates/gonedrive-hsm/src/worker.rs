@@ -471,7 +471,8 @@ fn hydrate(
 
     // Written through the event's own descriptor. Any other descriptor would
     // fault the hole back through this same hook and loop forever.
-    let written = fill_from(&mut staged, &event.fd, offset).context("filling staged content")?;
+    let written =
+        fill_from(&mut staged, &event.fd, offset, expected).context("filling staged content")?;
     if written != expected {
         bail!(
             "filled {written} bytes, expected {expected} for {}",
@@ -626,12 +627,18 @@ pub(super) fn expected_fill_len(
 
 /// Copy a staged file into the placeholder through the event descriptor,
 /// starting at `offset` within the placeholder.
+/// Copy at most `limit` bytes from the staged source into the placeholder at
+/// `offset`. The limit is the length validated against the placeholder before
+/// the copy; the source is a peer-owned file that could grow underneath us,
+/// and its EOF must never decide how far a root-owned write reaches.
 pub(super) fn fill_from(
     reader: &mut std::fs::File,
     target: &std::os::unix::io::OwnedFd,
     offset: u64,
+    limit: u64,
 ) -> Result<u64> {
     let mut buf = vec![0u8; 1024 * 1024];
+    let mut reader = (&mut *reader).take(limit);
     let mut offset = offset;
     let mut total = 0u64;
 

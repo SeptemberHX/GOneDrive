@@ -142,13 +142,13 @@ fn validate_path(path: &Path) -> Result<()> {
 }
 
 /// Resolution rules for everything opened beneath a root: no symlink anywhere
-/// in the path, no magic link, no escape above the root, and no crossing into
-/// another mount — a FUSE tree bind-mounted inside the root would otherwise be
-/// reachable despite the root itself being local.
-const BENEATH_ROOT: u64 = libc::RESOLVE_BENEATH
-    | libc::RESOLVE_NO_SYMLINKS
-    | libc::RESOLVE_NO_MAGICLINKS
-    | libc::RESOLVE_NO_XDEV;
+/// in the relative path, no magic link, no escape above the root. Crossing
+/// into a sub-mount is allowed — a separate disk mounted inside the sync
+/// folder is a legitimate layout — but every opened file is then checked
+/// against [`REFUSED_FILESYSTEMS`], so a FUSE tree bind-mounted beneath a
+/// local root still gets nothing.
+const BENEATH_ROOT: u64 =
+    libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
 
 /// Filesystem magic numbers on which the helper refuses to operate. A FUSE or
 /// network mount can block a root-owned worker for as long as its server
@@ -192,15 +192,21 @@ fn openat2(dirfd: i32, path: &Path, flags: i32, resolve: u64) -> std::io::Result
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-/// Authorise a directory as a sync root: absolute, no symlink anywhere in the
-/// path, a real directory owned by the peer, on a local filesystem.
+/// Authorise a directory as a sync root: absolute, a real directory owned by
+/// the peer, on a local filesystem.
+///
+/// Symlinks in the root's own path are followed on purpose: `/home` is a
+/// symlink on some distributions and users routinely point `~/OneDrive` at
+/// another disk. What matters for confinement is the descriptor this returns
+/// — every later path resolves relative to it and may not follow links — not
+/// how the root itself was named.
 pub(super) fn open_root(path: &Path, uid: u32) -> Result<SyncRoot> {
     validate_path(path)?;
     let dir = openat2(
         libc::AT_FDCWD,
         path,
-        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        libc::RESOLVE_NO_MAGICLINKS,
     )
     .with_context(|| format!("cannot open {}", path.display()))?;
     let meta = dir
@@ -324,6 +330,14 @@ fn open_authorised_kind(
             "{} belongs to uid {}, not to the connecting uid {uid}",
             path.display(),
             meta.uid()
+        );
+    }
+    // The root was checked at registration, but a sub-mount beneath it may be
+    // anything; a FUSE file here could park a root-owned worker forever.
+    if let Some(name) = refused_filesystem(&file)? {
+        bail!(
+            "{} is on a {name} filesystem, which the helper does not serve",
+            path.display()
         );
     }
     Ok(AuthorisedFile {

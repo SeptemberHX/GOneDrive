@@ -336,9 +336,21 @@ async fn serve(
     let Ok(mut hydration_finished) = proxy.receive_hydration_finished().await else {
         return;
     };
+    // The daemon exiting does not end the signal streams; only the name
+    // losing its owner says so. Without this the tray froze on its last
+    // state until the window happened to be focused.
+    let Ok(mut owner_changed) = proxy.inner().receive_owner_changed().await else {
+        return;
+    };
 
     loop {
         tokio::select! {
+            Some(owner) = owner_changed.next() => {
+                if owner.is_none() {
+                    tracing::info!("the daemon left the bus");
+                    return;
+                }
+            }
             Some(signal) = status_changed.next() => {
                 if let Ok(args) = signal.args() {
                     tray_set_status(tray, cell, args.status.clone()).await;
@@ -552,7 +564,20 @@ async fn refresh_sync_mode(proxy: &DaemonProxy<'static>, ui: &async_channel::Sen
 /// Only the latter should tear down the connection and reconnect; a refused
 /// sign-in is an ordinary answer.
 fn is_disconnected(error: &zbus::Error) -> bool {
-    matches!(error, zbus::Error::InputOutput(_))
+    match error {
+        zbus::Error::InputOutput(_) => true,
+        // The bus is fine but the daemon is not: it exited mid-call, or its
+        // name has no owner. Signal streams do not end on that, so this is
+        // how a method call notices.
+        zbus::Error::MethodError(name, ..) => matches!(
+            name.as_str(),
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+                | "org.freedesktop.DBus.Error.NameHasNoOwner"
+                | "org.freedesktop.DBus.Error.NoReply"
+                | "org.freedesktop.DBus.Error.Disconnected"
+        ),
+        _ => false,
+    }
 }
 
 /// Whether the connection survives a call's outcome. A daemon that answered

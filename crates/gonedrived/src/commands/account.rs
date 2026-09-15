@@ -32,6 +32,13 @@ pub(crate) async fn login() -> Result<()> {
         .build()
         .unwrap_or_default();
     let account_id = flow.complete(http, &config, &store, tokens).await?;
+    // Persist the client id the sign-in just succeeded with. Baked-in and
+    // environment ids are conveniences of the build that produced them; a
+    // rebuild without the variable silently loses the bake, and the daemon
+    // then refuses to start for no visible reason. The config file survives.
+    if let Err(e) = config.save() {
+        tracing::warn!(error = %e, "could not persist the configuration");
+    }
 
     let account = store.account(&account_id)?;
     let who = account

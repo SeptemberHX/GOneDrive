@@ -310,7 +310,11 @@ async fn a_local_edit_during_download_is_not_overwritten() {
 }
 
 #[tokio::test]
-async fn a_local_edit_during_upload_is_retried() {
+async fn a_local_edit_during_upload_is_committed_and_reported() {
+    // The service accepted the bytes captured before the edit; that version
+    // is real and must be committed, or the retry's If-Match meets our own
+    // upload and turns the user's newest save into a conflict copy. The edit
+    // is reported so the caller queues the newer content.
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -353,8 +357,10 @@ async fn a_local_edit_during_upload_is_retried() {
     std::fs::write(&source, b"old version").unwrap();
     let store = Store::open_in_memory().unwrap();
     let config = Config::default();
+    let rooted = crate::sync::rooted_fs::RootedFs::open(dir.path()).unwrap();
 
-    let upload = upload_file(
+    let upload = upload_file_rooted(
+        &rooted,
         &graph,
         &store,
         &config,
@@ -375,12 +381,11 @@ async fn a_local_edit_during_upload_is_retried() {
     };
     let (result, ()) = tokio::join!(upload, edit);
 
+    let uploaded = result.expect("the committed earlier version is a success, not a failure");
+    assert_eq!(uploaded.item.id, "F1");
     assert!(
-        matches!(
-            result,
-            Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::WouldBlock
-        ),
-        "unexpected upload result: {result:?}"
+        uploaded.source_changed,
+        "the newer bytes must be reported for a follow-up upload"
     );
     assert_eq!(std::fs::read(&source).unwrap(), b"local edit!");
 }

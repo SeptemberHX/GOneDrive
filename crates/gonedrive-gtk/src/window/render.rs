@@ -126,7 +126,10 @@ impl Ui {
     }
 
     fn show_banner(&self, message: &str) {
-        self.banner.set_title(message);
+        // AdwBanner parses its title as Pango markup. Messages carry file
+        // names and service error text; an unescaped `&` or `<` makes the
+        // label refuse the update and the banner reveal its previous text.
+        self.banner.set_title(&glib::markup_escape_text(message));
         self.banner.set_revealed(true);
     }
 
@@ -140,7 +143,8 @@ impl Ui {
         self.account_name
             .set_markup(&format!("<b>{}</b>", glib::markup_escape_text(&name)));
         self.account_email.set_text(&account.address);
-        self.folder_row.set_subtitle(&account.root_path);
+        self.folder_row
+            .set_subtitle(&glib::markup_escape_text(&account.root_path));
         *self.root_path.borrow_mut() = account.root_path.clone();
 
         if account.quota_total > 0 {

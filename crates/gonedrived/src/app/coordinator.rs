@@ -143,6 +143,10 @@ impl App {
         let mut next_remote = Instant::now();
         let mut next_full = Instant::now();
         let mut force_remote = false;
+        // Set only by an explicit wake (SyncNow, a login, an unlock). Watcher
+        // batches also force a remote pass, but must not re-probe a locked
+        // keyring: that prompts the user on every local file change.
+        let mut explicit_wake = false;
         let mut remote_required_for_local = false;
         let mut dirty_paths = HashSet::new();
         let mut completed_writes = HashSet::new();
@@ -258,6 +262,7 @@ impl App {
                     }
                     _ = self.wake.notified() => {
                         force_remote = true;
+                        explicit_wake = true;
                         if self.force_full_scan.swap(false, Ordering::AcqRel) {
                             if discovery_running { discovery_again = true; }
                             else { next_full = Instant::now(); }
@@ -363,7 +368,7 @@ impl App {
                 // can prompt the user on every timer tick.
                 let retry_missing = {
                     let status = self.status.read().await;
-                    missing_account_retry_due(force_remote, &status.state)
+                    missing_account_retry_due(explicit_wake, &status.state)
                 };
                 if retry_missing {
                     if let Err(error) = self.attach_missing_accounts().await {
@@ -418,6 +423,7 @@ impl App {
                     queue_work = false;
                 }
                 force_remote = false;
+                explicit_wake = false;
 
                 let target = self.requested_sync_generation.load(Ordering::Acquire);
                 let newest_tracked = explicit_sync
@@ -629,6 +635,7 @@ impl App {
                 }
                 _ = self.wake.notified() => {
                     force_remote = true;
+                    explicit_wake = true;
                     if self.force_full_scan.swap(false, Ordering::AcqRel) {
                         if discovery_running { discovery_again = true; }
                         else { next_full = Instant::now(); }
@@ -642,8 +649,8 @@ impl App {
 /// Decide whether an unattached account may be retried without user input.
 /// Only `offline` is self-healing. A locked keyring could repeatedly display
 /// an unlock prompt, and a rejected refresh token needs a real sign-in.
-pub(super) fn missing_account_retry_due(force_remote: bool, state: &str) -> bool {
-    force_remote || state == "offline"
+pub(super) fn missing_account_retry_due(explicit_wake: bool, state: &str) -> bool {
+    explicit_wake || state == "offline"
 }
 
 /// A delta must not observe a remote mutation that an outbound worker has

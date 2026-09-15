@@ -924,3 +924,65 @@ async fn a_finished_edited_copy_is_detached_after_close_write() {
     assert_eq!(Placeholder::state(&copy), PlaceholderState::Unmanaged);
     assert_eq!(std::fs::read(&copy).unwrap(), b"a different finished document");
 }
+
+#[tokio::test]
+async fn a_refreshed_placeholder_is_removed_by_a_later_tombstone_not_kept_as_edited() {
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState};
+
+    let h = Harness::metadata_only().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "Docs"),
+            file(
+                "F1",
+                "D1",
+                "huge.bin",
+                "c1",
+                4 * 1024 * 1024,
+                "2022-03-12T01:55:00Z",
+            ),
+        ],
+        "v1",
+    )
+    .await;
+    h.sync().await;
+    h.engine.make_on_demand(Path::new("Docs")).unwrap();
+    let path = h.path("Docs/huge.bin");
+    assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
+
+    // The remote content changes: the placeholder is refreshed to the new
+    // size on disk, which used to leave the recorded local size behind.
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![file(
+            "F1",
+            "D1",
+            "huge.bin",
+            "c2",
+            6 * 1024 * 1024,
+            "2022-03-13T01:55:00Z",
+        )],
+        "v2",
+    )
+    .await;
+    h.sync().await;
+    assert_eq!(Placeholder::state(&path), PlaceholderState::Dehydrated);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 6 * 1024 * 1024);
+
+    // Then it is deleted remotely. Nothing local was ever written into it,
+    // so it must go — not be kept as an "edit" and re-offered for upload.
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v2")), vec![tombstone("F1", "D1")], "v3")
+        .await;
+    let summary = h.sync().await;
+    assert_eq!(summary.deleted_local, 1);
+    assert!(!path.exists(), "an untouched placeholder must not survive its tombstone");
+    assert!(h.store.item("F1").unwrap().is_none());
+    assert!(
+        h.store.pending_ops(ACCOUNT, 10).unwrap().is_empty(),
+        "nothing to re-upload"
+    );
+}

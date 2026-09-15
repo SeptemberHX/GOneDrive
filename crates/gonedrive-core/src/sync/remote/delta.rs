@@ -269,9 +269,18 @@ impl Engine {
             };
             // Honour the tombstone guarantee during a sweep too: a local edit
             // that never reached Graph is detached and re-offered, never erased.
+            // An untouched placeholder is not an edit, whatever its stale
+            // recorded stat says (see the tombstone path in `apply_remote`).
             if !stale.is_folder {
+                let untouched_placeholder = crate::sync::local::owned_placeholder_state(
+                    &self.rooted(account)?,
+                    &path,
+                    &stale.id,
+                ) == Some(crate::hydrate::PlaceholderState::Dehydrated);
                 if let Some(local) = stat_of(&path) {
-                    if crate::sync::plan::local_is_modified(&stale, &local) {
+                    if crate::sync::plan::local_is_modified(&stale, &local)
+                        && !untouched_placeholder
+                    {
                         self.store.delete_subtree(&stale.id)?;
                         self.store.enqueue(
                             &self.account_id,
@@ -388,6 +397,13 @@ impl Engine {
     }
 
     /// Apply every final-per-id row, then process tombstones deepest-first.
+    ///
+    /// One exception to "upserts first": a tombstone whose name an incoming
+    /// upsert reuses (delete `foo`, create a new `foo`, both in one batch — a
+    /// backup tool's save) is applied before the upserts. Otherwise the new
+    /// item finds the old file at its path, files a conflict copy of content
+    /// the user never touched, and then fails the case-folded unique index
+    /// until the tombstone finally runs.
     async fn apply_staged_delta(
         &self,
         account: &Account,
@@ -395,6 +411,14 @@ impl Engine {
         generation: Option<i64>,
     ) -> Result<Vec<String>> {
         let mut exclusions = self.store.remote_exclusion_ids(&self.account_id)?;
+        let displaced = self.tombstones_displaced_by_upserts()?;
+        let mut applied = Vec::with_capacity(displaced.len());
+        for item in &displaced {
+            self.apply_staged_tombstone(account, item, summary)?;
+            applied.push(item.id.clone());
+        }
+        self.store.mark_staged_applied(&self.account_id, &applied)?;
+
         self.apply_staged_upserts(account, summary, generation, true, &mut exclusions)
             .await?;
         self.protect_pending_placeholders().await?;
@@ -406,27 +430,79 @@ impl Engine {
             .map(|payload| serde_json::from_str::<DriveItem>(&payload).map_err(Error::from))
             .collect::<Result<Vec<_>>>()?;
         let (_, deletes) = partition_delta(items);
-        let mut applied = Vec::with_capacity(deletes.len());
         for item in &deletes {
-            self.store
-                .delete_deferred_remote_subtree(&self.account_id, &item.id)?;
-            let excluded = self.store.remote_is_excluded(&self.account_id, &item.id)?;
-            if excluded {
-                self.store
-                    .delete_remote_exclusion_subtree(&self.account_id, &item.id)?;
-            }
-            if !excluded || self.store.item(&item.id)?.is_some() {
-                if let Err(error) = self.apply_remote(account, item, summary) {
-                    if !is_item_scoped_error(&error) {
-                        return Err(error);
-                    }
-                    self.defer_item_apply_failure(account, item, &error, summary)?;
-                }
-            }
+            self.apply_staged_tombstone(account, item, summary)?;
             applied.push(item.id.clone());
         }
         self.store.mark_staged_applied(&self.account_id, &applied)?;
         self.store.staged_upsert_ids(&self.account_id)
+    }
+
+    fn apply_staged_tombstone(
+        &self,
+        account: &Account,
+        item: &DriveItem,
+        summary: &mut SyncSummary,
+    ) -> Result<()> {
+        self.store
+            .delete_deferred_remote_subtree(&self.account_id, &item.id)?;
+        let excluded = self.store.remote_is_excluded(&self.account_id, &item.id)?;
+        if excluded {
+            self.store
+                .delete_remote_exclusion_subtree(&self.account_id, &item.id)?;
+        }
+        if !excluded || self.store.item(&item.id)?.is_some() {
+            if let Err(error) = self.apply_remote(account, item, summary) {
+                if !is_item_scoped_error(&error) {
+                    return Err(error);
+                }
+                self.defer_item_apply_failure(account, item, &error, summary)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Staged tombstones for items whose current (parent, name) an unapplied
+    /// upsert in the same batch is about to take.
+    fn tombstones_displaced_by_upserts(&self) -> Result<Vec<DriveItem>> {
+        let upserts = self
+            .store
+            .unapplied_delta_upserts(&self.account_id)?
+            .into_iter()
+            .map(|payload| serde_json::from_str::<DriveItem>(&payload).map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        let targets: HashSet<(String, String)> = upserts
+            .iter()
+            .filter_map(|item| {
+                Some((
+                    item.parent_id()?.to_string(),
+                    crate::names::fold_case(item.name.as_deref()?),
+                ))
+            })
+            .collect();
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let deletes = self
+            .store
+            .unapplied_delta_deletes(&self.account_id)?
+            .into_iter()
+            .map(|payload| serde_json::from_str::<DriveItem>(&payload).map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        let (_, deletes) = partition_delta(deletes);
+        let mut displaced = Vec::new();
+        for item in deletes {
+            let Some(known) = self.store.item(&item.id)? else {
+                continue;
+            };
+            let Some(parent) = known.parent_id.as_deref() else {
+                continue;
+            };
+            if targets.contains(&(parent.to_string(), crate::names::fold_case(&known.name))) {
+                displaced.push(item);
+            }
+        }
+        Ok(displaced)
     }
 
     /// Apply only upserts whose parent chain is already known. Unknown parents

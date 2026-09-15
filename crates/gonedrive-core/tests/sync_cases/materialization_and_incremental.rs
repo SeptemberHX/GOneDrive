@@ -729,6 +729,29 @@ async fn a_mass_delete_approval_survives_an_unrelated_scan() {
     assert_eq!(deletes, 12);
 }
 
+#[tokio::test]
+async fn a_name_that_is_not_utf8_neither_uploads_nor_aborts_the_scan() {
+    // OneDrive names are Unicode, so such a file can never sync. It used to
+    // be worse than skipped: the lossy name pointed at a path that does not
+    // exist, opening it failed, and the whole scan — every deletion it had
+    // found included — was thrown away, on every scan, forever.
+    use std::os::unix::ffi::OsStrExt;
+
+    let h = Harness::new().await;
+    seed_two_synced_folders(&h);
+    std::fs::remove_file(h.path("A/0.txt")).unwrap();
+    let bad = h
+        .path("A")
+        .join(std::ffi::OsStr::from_bytes(b"bad\xff.txt"));
+    std::fs::write(&bad, b"x").unwrap();
+
+    let summary = h.engine.sync_local_paths(&[h.path("A")]).unwrap();
+    assert_eq!(summary.refused_deletions, 0);
+    let ops = h.store.pending_ops(ACCOUNT, 100).unwrap();
+    assert_eq!(ops.len(), 1, "only the deletion is queued");
+    assert_eq!(ops[0].kind, gonedrive_core::db::OpKind::DeleteRemote);
+}
+
 /// Two synced folders of ten files each, plus the root: 23 records that all
 /// exist on disk with matching inode and size metadata.
 fn seed_two_synced_folders(h: &Harness) {

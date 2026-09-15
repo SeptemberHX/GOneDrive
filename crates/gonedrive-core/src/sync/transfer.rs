@@ -160,6 +160,18 @@ impl FileVersion {
 
     /// Compare the bytes-bearing properties while ignoring ctime. Writing the
     /// placeholder xattrs changes ctime even though the file content does not.
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    pub(crate) fn mtime_secs(&self) -> i64 {
+        self.mtime
+    }
+
     pub(crate) fn same_content_as(self, other: Self) -> bool {
         self.exists == other.exists
             && self.dev == other.dev
