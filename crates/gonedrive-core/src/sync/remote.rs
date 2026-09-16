@@ -14,6 +14,15 @@ use crate::names::{conflict_copy_name, split_extension};
 use crate::sync::plan::{decide_remote, record_from_remote, LocalStat, RemoteAction, SkipReason};
 
 use super::engine::{stat_of, Engine, SyncEvent, SyncSummary};
+
+/// Keep a reserved name to characters every filesystem accepts. Graph ids are
+/// already conservative; this guards against a future one that is not.
+fn sanitise_id(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect()
+}
 use super::transfer;
 impl Engine {
     pub(super) async fn remote_phase(&self, summary: &mut SyncSummary) -> Result<()> {
@@ -647,6 +656,46 @@ impl Engine {
     /// Apply a remote rename/move to the existing local inode before updating
     /// its database record. Folder descendants follow automatically because
     /// their paths are derived from the renamed parent's id.
+    /// Move whatever holds `path` aside when it is an item this delta batch is
+    /// about to move elsewhere. Returns where it was parked, or `None` when the
+    /// occupant is not ours to move.
+    fn park_rearranged_occupant(
+        &self,
+        rooted: &crate::sync::rooted_fs::RootedFs,
+        path: &Path,
+    ) -> Result<Option<PathBuf>> {
+        let account = self.account()?;
+        let Some(root_item_id) = account.root_item_id.as_deref() else {
+            return Ok(None);
+        };
+        let Ok(relative) = path.strip_prefix(&account.root_local_path) else {
+            return Ok(None);
+        };
+        let Some(occupant) = self
+            .store
+            .item_at_path(&self.account_id, root_item_id, relative)?
+        else {
+            // Nothing we track lives here, so the file is the user's.
+            return Ok(None);
+        };
+        if !self
+            .store
+            .staged_upsert_is_unapplied(&self.account_id, &occupant.id)?
+        {
+            // It is staying. Whatever is here is content this device owns.
+            return Ok(None);
+        }
+
+        // The id makes the reserved name unique within the directory, so two
+        // parked siblings cannot collide, and the dot keeps it out of the way
+        // in a file manager for the moments it exists.
+        let parked_name = format!(".gonedrive-moving-{}", sanitise_id(&occupant.id));
+        let parked = path.with_file_name(&parked_name);
+        rooted.rename_noreplace(path, &parked)?;
+        self.store.rename_item_local(&occupant.id, &parked_name)?;
+        Ok(Some(parked))
+    }
+
     fn move_local_for_remote(
         &self,
         old_path: &Path,
@@ -671,6 +720,21 @@ impl Engine {
                     break;
                 }
                 Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // The name may be held by an item this same batch is
+                    // moving elsewhere — a rename chain (a→b, b→c) or a swap.
+                    // That is a rearrangement, not a conflict: making the
+                    // occupant a conflict copy would duplicate content the
+                    // user never touched, upload it, and leave the wrong bytes
+                    // under the right name. Park it instead; its own entry
+                    // moves it on from there.
+                    if let Some(parked) = self.park_rearranged_occupant(&rooted, new_path)? {
+                        tracing::info!(
+                            name = %new_path.display(),
+                            parked = %parked.display(),
+                            "parked an item this batch moves elsewhere"
+                        );
+                        continue;
+                    }
                     let copy = match self.make_conflict_copy(new_path) {
                         Ok(copy) => copy,
                         // The occupant was removed after renameat2 reported it.

@@ -122,3 +122,11 @@
 - **修复**：新增 `SkipReason::TypeChanged`。记录类型与磁盘类型不符时判为跳过并上报（带去重，不刷屏）；扫描只在记录确实是目录时才按它下钻，只在记录确实是文件时才刷新它的角标。远端项保持不变——被拒绝的只是本地这次互换。
 - **限制**：这是止损，不是完整语义。把互换真正同步过去（删除旧身份 + 作为新项重建）尚未实现，用户需要自行改名或删除后重建。
 - **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_file_replaced_by_a_directory_is_reported_not_retried_for_ever`（已验证：无修复时 RED）。
+
+## SC-016 · 同批重命名链与互换：伪冲突副本、内容交叉、永久滞留
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：在网页端把一批文件夹或文件改名（`a→b`、`b→c`，或 `x↔y` 互换）之后，本地凭空多出"冲突副本"并被上传；更糟的是内容错位——某个名字下放的是另一个文件的字节。互换的情形两条记录双双撞上大小写折叠唯一索引进入延期表，此后每轮轮询互相搬动文件，永不收敛。
+- **根因**：`remote.rs::apply_remote_locked` 在写库之前先搬盘，`move_local_for_remote` 遇 `AlreadyExists` 就无条件把占位者做成冲突副本并入队上传——它不区分"占位者是用户自己的文件"与"占位者正是本批次要搬走的另一项"。
+- **修复**：`rename_noreplace` 失败时先判断占位者是不是本账户的已知项且在本批次仍未应用（新增 `staged_upsert_is_unapplied`）。是的话把它停到保留名 `.gonedrive-moving-<id>` 下，并用 `rename_item_local` 同步更新记录的名字——记录必须跟着 inode 走，否则下一次本地扫描会把停放的文件读成新增、把原名读成删除。占位者随后应用自己的条目时，`local_path` 解析到停放路径并搬到目的地。名字带 item id 保证同目录内不会相撞，点前缀让它在文件管理器里不显眼。占位者若不是本批次要动的，仍走原来的冲突副本逻辑。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_rename_chain_in_one_batch_lands_every_file_under_its_own_name`、`::two_files_swapping_names_in_one_batch_keep_their_own_contents`（均已验证：无修复时 RED，产生冲突副本）。

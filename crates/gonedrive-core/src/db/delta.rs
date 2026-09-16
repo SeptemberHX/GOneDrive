@@ -253,6 +253,25 @@ impl Store {
         })
     }
 
+    /// Whether this batch still has an unapplied upsert for `item_id`.
+    ///
+    /// Used to tell a rearrangement from a conflict: a name held by an item
+    /// the same batch is about to move elsewhere frees itself, while a name
+    /// held by anything else is content this device owns.
+    pub fn staged_upsert_is_unapplied(&self, account_id: &str, item_id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM delta_staging
+                      WHERE account_id = ?1 AND item_id = ?2
+                        AND applied = 0 AND deleted = 0
+                 )",
+                params![account_id, item_id],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     /// Final-per-id tombstones. These are deliberately read only after the
     /// complete deltaLink has arrived, so a partial enumeration cannot delete.
     pub fn unapplied_delta_deletes(&self, account_id: &str) -> Result<Vec<String>> {

@@ -817,6 +817,22 @@ impl Store {
         Ok(Some(current))
     }
 
+    /// Rename a record in place, without touching anything else about it.
+    ///
+    /// Used when an item has to be parked under a reserved name so another
+    /// item in the same delta batch can take the name it is vacating. The
+    /// record must follow the inode or the next local scan reads the parked
+    /// file as an unknown addition and the missing one as a deletion.
+    pub fn rename_item_local(&self, item_id: &str, name: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE items SET name = ?2, name_folded = ?3, updated_at = ?4 WHERE id = ?1",
+                params![item_id, name, fold_case(name), now()],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Every item that currently claims a local inode, keyed by inode.
     ///
     /// Used to recognise a rename or move: the same inode showing up at a new

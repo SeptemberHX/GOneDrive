@@ -401,3 +401,94 @@ async fn an_uploaded_file_is_not_recorded_as_pinned() {
     );
     assert!(!h.store.explicitly_excluded("NEW").unwrap());
 }
+
+#[tokio::test]
+async fn a_rename_chain_in_one_batch_lands_every_file_under_its_own_name() {
+    // a→b and b→c arrive together. Applying a→b finds b still occupied, and
+    // the occupant is not a conflict: it is leaving. Preserving it as a
+    // conflict copy duplicated content the user never touched and then put
+    // a's bytes under b's name.
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            file("A", ROOT, "a.txt", "c1", 3, "2026-08-20T10:00:00Z"),
+            file("B", ROOT, "b.txt", "c2", 3, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("A", b"aaa").await;
+    h.mock_download("B", b"bbb").await;
+    h.sync().await;
+    assert_eq!(h.read("a.txt"), "aaa");
+    assert_eq!(h.read("b.txt"), "bbb");
+
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![
+            file("A", ROOT, "b.txt", "c1", 3, "2026-08-20T10:00:00Z"),
+            file("B", ROOT, "c.txt", "c2", 3, "2026-08-20T10:00:00Z"),
+        ],
+        "v2",
+    )
+    .await;
+    let summary = h.sync().await;
+
+    assert_eq!(summary.conflicts, 0, "a rearrangement is not a conflict");
+    assert_eq!(h.read("b.txt"), "aaa");
+    assert_eq!(h.read("c.txt"), "bbb");
+    assert!(!h.path("a.txt").exists());
+    assert_no_strays(&h, &["b.txt", "c.txt"]);
+    assert!(h.store.due_outbound_ops(ACCOUNT, 10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn two_files_swapping_names_in_one_batch_keep_their_own_contents() {
+    // The hardest shape: neither can move until the other has. Without a way
+    // to step aside, one of them became a conflict copy and the other
+    // inherited the wrong bytes.
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            file("X", ROOT, "x.txt", "c1", 3, "2026-08-20T10:00:00Z"),
+            file("Y", ROOT, "y.txt", "c2", 3, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("X", b"xxx").await;
+    h.mock_download("Y", b"yyy").await;
+    h.sync().await;
+
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![
+            file("X", ROOT, "y.txt", "c1", 3, "2026-08-20T10:00:00Z"),
+            file("Y", ROOT, "x.txt", "c2", 3, "2026-08-20T10:00:00Z"),
+        ],
+        "v2",
+    )
+    .await;
+    let summary = h.sync().await;
+
+    assert_eq!(summary.conflicts, 0);
+    assert_eq!(h.read("y.txt"), "xxx", "X's bytes follow X to its new name");
+    assert_eq!(h.read("x.txt"), "yyy", "Y's bytes follow Y to its new name");
+    assert_no_strays(&h, &["x.txt", "y.txt"]);
+    assert!(h.store.due_outbound_ops(ACCOUNT, 10).unwrap().is_empty());
+}
+
+/// No conflict copies, and no file left parked under a reserved name.
+fn assert_no_strays(h: &Harness, expected: &[&str]) {
+    let strays: Vec<_> = std::fs::read_dir(&h.root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !expected.contains(&name.as_str()))
+        .collect();
+    assert!(strays.is_empty(), "unexpected leftovers: {strays:?}");
+}
