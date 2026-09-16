@@ -123,12 +123,30 @@ gonedrived sync      # 单次同步后退出
 gonedrived logout    # 移除凭据（本地文件保留）
 ```
 
-安装（含开机自启与按需下载 helper）：
+### 安装
+
+两条路径，**二选一**，不要同时使用。
+
+**一、deb 包（推荐给日常使用）**
+
+```bash
+GONEDRIVE_CLIENT_ID=<你的应用 ID> ./build-deb.sh
+sudo apt install ./gonedrive_*.deb
+```
+
+包内的二进制在 `/usr/bin`，helper 与用户服务由包自己注册，`apt upgrade` 即可升级。
+
+**二、源码安装（推荐给开发）**
 
 ```bash
 sudo ./install.sh     # 二进制 + 特权 helper 系统服务（唯一需要 root 的一半）
 ./install.sh --user   # 守护进程用户服务 + Nautilus 集成 + 图标
 ```
+
+它装到 `/usr/local/bin` 与 `$HOME`，两者都排在包内文件之前。所以装了 deb 之后再跑
+`install.sh`，升级包会"装上但跑不起来"——旧二进制继续运行，界面上看不出任何异常。
+`install.sh` 因此会检测到已安装的 deb 并直接拒绝执行；确实需要并存时用
+`GONEDRIVE_ALLOW_BESIDE_DEB=1` 覆盖。
 
 ---
 

@@ -55,11 +55,12 @@
 - **修复**：accept 后给 socket 设 30 秒写超时（回复只有一行，健康的守护进程永远不会触发）。写失败时主动关闭连接——超时可能已经写出半行 JSON，对端继续读会与之后所有回复失去同步；关闭后由会话守卫把待处理事件全部拒绝（fail-closed），守护进程重连。
 - **回归测试**：`crates/gonedrive-hsm/src/tests.rs::a_reply_to_a_peer_that_stopped_reading_gives_up_and_ends_the_connection`。
 
-## SS-007 · 拒绝文件系统清单遗漏 autofs 与 overlayfs
+## SS-007 · 拒绝文件系统清单遗漏 autofs
 
 - **首次发现**：2026-09-15（第三轮审计）
-- **根因**：`marks.rs::REFUSED_FILESYSTEMS` 覆盖了 fuse、nfs、smb/cifs、9p、afs、ceph 等，但缺 autofs（`0x0187`）与 overlayfs（`0x794c7630`）。autofs 挂载点被访问时可能触发按需挂载而长时间阻塞，overlay 的下层也可能由用户控制且缓慢——两者都能把一个 root worker 按住任意久，正是该清单要堵的那类"一个本地用户拖垮所有人"的路径。与 SS-006 叠加时后果更重。
-- **修复**：补入两项。
+- **根因**：`marks.rs::REFUSED_FILESYSTEMS` 覆盖了 fuse、nfs、smb/cifs、9p、afs、ceph 等，但缺 autofs（`0x0187`）。autofs 挂载点被访问时可能触发按需挂载而长时间阻塞，能把一个 root worker 按住任意久，正是该清单要堵的那类"一个本地用户拖垮所有人"的路径。与 SS-006 叠加时后果更重。
+- **修复**：补入 autofs。
+- **更正（2026-09-16）**：同一次修复还把 overlayfs（`0x794c7630`）加进了清单，那是错的，已在 `4514cd5` 撤回。挂载 overlay 需要特权或用户命名空间，有这两样的人本来就能挂 FUSE，而 FUSE 已经在清单里——真正的边界在那儿，不在 overlay。代价却是实打实的：容器里的 `/tmp` 常是 overlayfs，helper 因此拒绝服务整棵树，CI 上 11 个测试直接失败。新增 `ordinary_local_filesystems_are_served` 把这条策略钉住。
 
 ## SS-008 · 账户生命周期：移除账户后引擎继续运行，令牌被重新写回钥匙环
 
@@ -104,3 +105,25 @@
   5. **`gonedrived sync` 仍会空转**。协调器在"剩余操作全在退避"时就完成显式同步，但 CLI 的等待循环仍要求 `pending == 0`；磁盘满时它会在打印结果后继续自旋。改为把守护进程报告的待办数记下，空闲且不超过该数时正常退出。
   6. **`gonedrived login` 可能永远挂住**。等待登录信号没有超时，而信号流绑在 CLI 自己的总线连接上，守护进程退出并不会结束它。加了 360 秒上界（守护进程自身的登录超时是 300 秒）。
 - **回归测试**：无。六条都需要真实的 `App`（其构造连接 Secret Service）、会话总线或 dpkg 环境；这正是报告中"把回填编排与 `App` 解耦"那一项要解决的前置问题。
+
+## SS-013 · 模式切换：先暂停再发现没有服务可重启，守护进程永久停摆
+
+- **首次发现**：2026-09-16（报告复核）
+- **现象**：从终端手动跑守护进程时切换同步模式，之后它再也不同步；界面上只写着"已暂停"，没有任何错误说明为什么。
+- **根因**：`mode.rs` 有三个叠加的问题。一、`schedule_restart` 仅凭 `INVOCATION_ID` 判断"由 systemd 托管"，而任何从 systemd 管理的终端派生出的进程都会继承这个变量。二、它在 `systemctl` 真正执行之前就返回 true，调用方据此回报"正在重启"。三、`set_paused(true)` 发生在这个判断之前，于是重启没发生时暂停留了下来。
+- **修复**：`systemd_managed()` 改为同时要求 `INVOCATION_ID` 存在**且** `/proc/self/cgroup` 里出现 `gonedrived.service`——控制组路径指名道姓地写着进程真正属于哪个 unit，终端里派生的 shell 属于终端那个 unit。只有确认托管才暂停并派发重启；重启失败则解除暂停并把失败原因写进 `last_error`。
+- **回归测试**：无自动化测试（依赖 systemd 与 cgroup 布局）；判据本身已收敛为一个可读的函数。
+
+## SS-014 · 切到"仅元数据"模式后引擎仍在造占位符，而标记清单已空
+
+- **首次发现**：2026-09-16（报告复核）
+- **现象**：从按需下载切到仅元数据之后，新出现的文件仍被做成占位符，但守护进程已经不再为它们注册目录标记。没人监听的占位符读出来是一片零——静默的，没有错误。
+- **根因**：`Engine::enable_on_demand` 是单向闩锁，只能开不能关。而这条切换路径的 `download_new` 前后都是 `Never`，不触发重启，于是引擎的 `on_demand` 一直是 true，配置里的 `on_demand` 却已经是 false——`placeholder_inventory` 与 `population_watch_inventory` 读的是配置。
+- **修复**：新增 `Engine::disable_on_demand`。`set_sync_mode` 在 `on_demand` 发生任何方向的变化时都把新值推给所有引擎，随后跑一次 `watch_all` 让标记与新模式对齐。
+
+## SS-015 · `install.sh` 与 deb 并存导致升级静默失效
+
+- **首次发现**：2026-09-16（报告复核）
+- **现象**：`apt upgrade gonedrive` 装上了新版本，跑的却还是旧二进制，界面上看不出任何异常。
+- **根因**：`install.sh` 把二进制装进 `/usr/local/bin`（默认 PATH 里排在 `/usr/bin` 之前），把 unit 与 D-Bus 服务文件装进 `$HOME`（遮蔽包内的 `/usr/lib`、`/usr/share` 副本）。包内的 `Exec=/usr/bin/env gonedrived run` 于是解析到源码装的那份。README 也完全没提 deb 这条路径。
+- **修复**：`install.sh` 检测到已安装的 `gonedrive` 包时直接拒绝执行，并说明两条路径互斥；`GONEDRIVE_ALLOW_BESIDE_DEB=1` 可覆盖。README 补上两条安装路径与它们的取舍。

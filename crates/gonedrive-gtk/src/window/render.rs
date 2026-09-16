@@ -40,12 +40,20 @@ impl Ui {
                     }
                     None => {
                         *self.account_id.borrow_mut() = None;
-                        self.reset_login_button();
+                        // Not while one is running: this arm is reached by the
+                        // focus refresh too, and the user returning from the
+                        // browser is the most likely reason the window just
+                        // regained focus.
+                        if !self.login_in_flight.get() {
+                            self.reset_login_button();
+                        }
                         self.stack.set_visible_child_name("login");
                     }
                 }
             }
             UiEvent::Disconnected(reason) => {
+                // Whatever the daemon was doing for us ended with it.
+                self.login_in_flight.set(false);
                 self.stack.set_visible_child_name("offline");
                 self.on_demand_switch.set_sensitive(false);
                 tracing::debug!(%reason, "daemon unreachable");
@@ -84,11 +92,13 @@ impl Ui {
                     .set_text(&format!("浏览器没有打开？手动访问：\n{url}"));
             }
             UiEvent::LoginCompleted => {
+                self.login_in_flight.set(false);
                 self.reset_login_button();
                 self.login_hint.set_visible(false);
                 self.banner.set_revealed(false);
             }
             UiEvent::LoginFailed(message) => {
+                self.login_in_flight.set(false);
                 self.reset_login_button();
                 self.show_banner(&format!("登录失败：{message}"));
             }

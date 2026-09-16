@@ -309,8 +309,23 @@ impl Engine {
 
     /// Keep a materialised placeholder tree current for subsequent deltas.
     pub fn enable_on_demand(&self) {
+        self.set_on_demand(true);
+    }
+
+    /// Leaving files-on-demand has to reach the running engine too. It was a
+    /// one-way latch, so a switch that needed no restart — on-demand to
+    /// metadata-only, where the download policy does not change — left the
+    /// engine creating placeholders for every new item while the daemon no
+    /// longer registered any directory marks for them. Nothing would then be
+    /// listening when one was read, and a placeholder nobody is watching reads
+    /// back as zeroes.
+    pub fn disable_on_demand(&self) {
+        self.set_on_demand(false);
+    }
+
+    fn set_on_demand(&self, enabled: bool) {
         self.on_demand
-            .store(true, std::sync::atomic::Ordering::Release);
+            .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
     pub fn on_demand_enabled(&self) -> bool {

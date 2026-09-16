@@ -59,6 +59,12 @@ pub struct Ui {
 
     login_button: gtk::Button,
     login_hint: gtk::Label,
+    /// Set from the moment the sign-in button is pressed until the daemon
+    /// reports the attempt finished. The window refreshes whenever it regains
+    /// focus, and coming back from the browser is exactly that: without this,
+    /// the refresh re-enabled the button mid-sign-in and a second press
+    /// started a second sign-in against the same account.
+    login_in_flight: Rc<Cell<bool>>,
     commands: async_channel::Sender<Command>,
     account_id: Rc<RefCell<Option<String>>>,
     suppress: Rc<Cell<bool>>,
@@ -337,6 +343,7 @@ impl Ui {
             folder_row,
             login_button,
             login_hint,
+            login_in_flight: Rc::new(Cell::new(false)),
             commands,
             account_id: Rc::new(RefCell::new(None)),
             suppress: Rc::new(Cell::new(false)),
@@ -365,9 +372,11 @@ impl Ui {
         });
 
         let commands = self.commands.clone();
+        let in_flight = self.login_in_flight.clone();
         self.login_button.connect_clicked(move |button| {
             button.set_sensitive(false);
             button.set_label("正在打开浏览器…");
+            in_flight.set(true);
             let _ = commands.send_blocking(Command::StartLogin);
         });
 

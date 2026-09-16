@@ -138,3 +138,27 @@
 - **根因**：`local.rs::moved_candidate` 的判据是"同设备 + 同 inode + 旧路径已不存在"。inode 被内核激进复用，这三条对"移动"和"删除后新建"完全一样。
 - **修复**：用 inode 的**出生时间**作区分。改名不会改变出生时间，所以真正的移动（哪怕移动后又被编辑）其出生时间早于我们最后一次写入该记录的时间；复用的 inode 则晚于它。新增 `Store::item_recorded_at` 读取 `updated_at`，用 `statx(STATX_BTIME)` 取出生时间，判据抽成具名函数 `inode_was_recycled`。ext4、btrfs、xfs 都记录出生时间；tmpfs 与部分网络文件系统不记录，那里退回到只信 inode 号，与此前行为一致。
 - **回归测试**：`crates/gonedrive-core/src/sync/local.rs::recycled_inode_tests`（规则的三种情形）。比较方向由既有的 `a_cross_directory_rename_is_one_move_not_delete_plus_upload` 守住——把 `>` 写成 `>=` 会让它立刻失败（已验证）。
+
+## SC-018 · 下载失败后记录停留在 `Hydrating`，本地编辑与删除被静默跳过
+
+- **首次发现**：2026-09-16（报告复核）
+- **现象**：一次下载因为权限、磁盘或服务端 5xx 失败之后，该文件在本地怎么改、怎么删都不会被同步，直到守护进程重启由 `repair_states` 修好。用户看不到任何提示。
+- **根因**：`queue.rs::run_download` 在发起传输前把记录置为 `Hydrating`，只有"因切片超时被取消"这一条分支会恢复 `DirtyRemote`。而 `Hydrating` 的语义是"守护进程正在动这个文件"，本地扫描据此在三处跳过它（`local.rs` 的 405/616/846 行附近），连删除都不算数。
+- **修复**：`run_download` 拆成薄壳 + `download_into_place`。壳在任何失败之后检查记录是否仍停在 `Hydrating`，是则交还 `DirtyRemote`。永久失败随后由 `record_failure` 改写为 `Error`，那是个用户可见的终态；真正的问题是可重试失败会一直卡在 `Hydrating` 上。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_failed_download_hands_the_file_back_to_the_local_scanner`（已验证：无修复时 RED，停在 `Hydrating`）。
+
+## SC-019 · 纯元数据的远端变更把待下载意图改写成 `Synced`
+
+- **首次发现**：2026-09-16（报告复核）
+- **现象**：云端只改了名字（或只需重盖时间戳），本地那条还欠着下载的记录被标成"已同步"。个人盘没有可比的哈希，此后再没有任何东西发现这些字节根本没来过。
+- **根因**：`remote.rs::apply_remote_locked` 的 `state` 默认值是 `Synced`，而 `RestampMtime` 与 `Skip(UpToDate)` 两条被动分支都不改它。这两条分支都没有搬运任何内容，却做出了关于内容的断言。
+- **修复**：新增 `passive_state()`：不交付内容的分支保留记录原有的 `DirtyRemote` / `Hydrating` / `DirtyLocal` / `Conflict`，只有本来就是干净的记录才写 `Synced`。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_rename_only_delta_does_not_cancel_a_download_the_record_still_owes`（已验证：无修复时 RED，变成 `Synced`）。
+
+## SC-020 · `parent_id` 成环时递归 CTE 永不返回，整个守护进程静默卡死
+
+- **首次发现**：2026-09-16（报告复核）
+- **现象**：数据库里只要有一条 `parent_id` 形成回路（半应用的 delta、损坏的行、还原的旧库），同步线程进入某个递归查询后再也不出来。没有错误、没有日志，界面停在最后一个状态。
+- **根因**：`db/items.rs`、`db/pending.rs`、`db/delta.rs` 共 20 处 `WITH RECURSIVE`，其中 13 处向下遍历用 `UNION ALL`（不去重），5 处向上遍历带 `depth` 却从不设上限。SQLite 不会替你检测回路。
+- **修复**：向下遍历（只收集 id）一律改用 `UNION`——访问过的 id 不再访问，回路自然终止；向上遍历统一加 `depth < 512` 的天花板，远超任何真实网盘的层数。`relative_path` 对被截断的链返回 `None`，这正是它对"祖先还没到"已有的答案。
+- **回归测试**：`crates/gonedrive-core/src/db/tests.rs::a_parent_cycle_ends_every_tree_walk_instead_of_hanging`（已验证：无修复时测试超时不返回）。

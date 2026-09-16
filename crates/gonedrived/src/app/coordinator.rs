@@ -458,7 +458,14 @@ impl App {
                 continue;
             }
 
-            if !discovery_running && open_writes.is_idle() && Instant::now() >= next_full {
+            // Deliberately not gated on open writers. `discover_local_changes`
+            // only reads: it reports dirty scopes and placeholder identities and
+            // changes nothing on disk, and the scan that acts on those scopes is
+            // held below by `open_writes.blocks`, per scope. Gating the whole
+            // verification on a single global `is_idle` meant one never-closed
+            // writer anywhere in the tree — a database, a log, a VM image —
+            // suppressed periodic verification of every other file.
+            if !discovery_running && Instant::now() >= next_full {
                 let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
                 let tx = discovery_tx.clone();
                 discovery_running = true;
@@ -559,7 +566,7 @@ impl App {
                 continue;
             }
 
-            let timer = if discovery_running || !open_writes.is_idle() {
+            let timer = if discovery_running {
                 next_remote
             } else {
                 next_remote.min(next_full)

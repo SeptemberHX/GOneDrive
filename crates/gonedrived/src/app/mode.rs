@@ -120,9 +120,24 @@ impl App {
             );
         }
 
-        if mode == SyncMode::OnDemand {
+        // Both directions, live. `on_demand` decides whether the engine turns
+        // new items into placeholders, and the daemon's mark inventories are
+        // keyed off the same configuration flag: if the two disagree, the
+        // engine makes placeholders the helper is never told to watch.
+        if config.on_demand != previous.on_demand {
             for engine in self.engines.read().await.values() {
-                engine.enable_on_demand();
+                if config.on_demand {
+                    engine.enable_on_demand();
+                } else {
+                    engine.disable_on_demand();
+                }
+            }
+            // The marks that belonged to the old mode are now wrong in one
+            // direction or the other; one registration pass settles it.
+            if let Some(hsm) = self.hsm.read().await.clone() {
+                if let Err(error) = hsm.watch_all(self).await {
+                    tracing::warn!(%error, "could not reconcile placeholder marks after the switch");
+                }
             }
         }
 
@@ -131,14 +146,23 @@ impl App {
         // folders, and the download-everything policy has to see every file.
         if config.download_new != previous.download_new {
             switch.policy_changed = true;
-            self.set_paused(true).await;
             if mode == SyncMode::Full {
                 for engine in self.engines.read().await.values() {
                     self.store.abort_delta_batch(engine.account_id())?;
                     self.store.set_delta_link(engine.account_id(), None)?;
                 }
             }
-            switch.restarting = self.schedule_restart();
+            // Pause only once we know a restart is coming. Pausing first and
+            // then discovering there is no service to restart left the daemon
+            // stopped for good, with "paused" as the only explanation on
+            // screen and no way back but a manual resume.
+            switch.restarting = self.systemd_managed();
+            if switch.restarting {
+                self.set_paused(true).await;
+                self.spawn_restart();
+            } else {
+                tracing::warn!("restart gonedrived to apply the new sync mode");
+            }
         }
         Ok(switch)
     }
@@ -184,27 +208,48 @@ impl App {
         Ok(total)
     }
 
+    /// Whether *this* process is the `gonedrived.service` unit.
+    ///
+    /// `INVOCATION_ID` alone is not that question. Every child of a
+    /// systemd-managed process inherits it, so a daemon run by hand from a
+    /// terminal — itself a unit — claimed to be a service and promised a
+    /// restart nothing would perform. The control group path names the unit
+    /// that actually owns the process, and a shell run from a terminal is in
+    /// the terminal's group, not this one's.
+    fn systemd_managed(&self) -> bool {
+        std::env::var_os("INVOCATION_ID").is_some()
+            && std::fs::read_to_string("/proc/self/cgroup")
+                .is_ok_and(|cgroup| cgroup.contains("gonedrived.service"))
+    }
+
     /// Restart through systemd once the current D-Bus reply has gone out.
-    /// Returns false when this process is not a systemd service, in which case
-    /// the caller tells the user to restart it by hand.
-    fn schedule_restart(&self) -> bool {
-        if std::env::var_os("INVOCATION_ID").is_none() {
-            tracing::warn!("restart gonedrived to apply the new sync mode");
-            return false;
-        }
-        std::thread::Builder::new()
-            .name("gonedrive-mode-restart".into())
-            .spawn(|| {
-                std::thread::sleep(Duration::from_secs(1));
-                match std::process::Command::new("systemctl")
-                    .args(["--user", "restart", "gonedrived.service"])
-                    .status()
-                {
-                    Ok(status) if status.success() => {}
-                    Ok(status) => tracing::error!(%status, "could not restart the daemon"),
-                    Err(error) => tracing::error!(%error, "could not launch systemctl"),
-                }
-            })
-            .is_ok()
+    ///
+    /// A failure here has to undo the pause. The pause exists only to keep the
+    /// old policy from acting in the seconds before the process goes away; if
+    /// it is not going away, leaving it paused strands the user with a daemon
+    /// that has silently stopped syncing.
+    fn spawn_restart(self: &Arc<Self>) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let outcome = tokio::process::Command::new("systemctl")
+                .args(["--user", "restart", "gonedrived.service"])
+                .status()
+                .await;
+            let failure = match outcome {
+                Ok(status) if status.success() => return,
+                Ok(status) => format!("systemctl exited with {status}"),
+                Err(error) => format!("could not launch systemctl: {error}"),
+            };
+            tracing::error!(%failure, "the sync mode restart did not happen");
+            app.set_paused(false).await;
+            app.set_state(
+                "idle",
+                Some(format!(
+                    "切换同步模式需要重启守护进程，但自动重启失败（{failure}）。请手动运行 systemctl --user restart gonedrived"
+                )),
+            )
+            .await;
+        });
     }
 }

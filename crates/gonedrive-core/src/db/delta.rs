@@ -66,14 +66,40 @@ impl Store {
         })
     }
 
-    pub fn deferred_remote_payloads(&self, account_id: &str) -> Result<Vec<String>> {
+    /// Each payload with the number of seconds it has been waiting.
+    ///
+    /// The replay needs the age: an item that cannot be applied is retried
+    /// silently on every pass, and without knowing how long that has been going
+    /// on there is no way to tell a parent that arrives two minutes later from
+    /// one that is never coming.
+    pub fn deferred_remote_payloads(&self, account_id: &str) -> Result<Vec<(String, i64)>> {
+        let now = now();
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT payload FROM deferred_remote_changes
+                "SELECT payload, updated_at FROM deferred_remote_changes
                   WHERE account_id = ?1 ORDER BY updated_at, item_id",
             )?;
-            let rows = stmt.query_map(params![account_id], |row| row.get(0))?;
-            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            let rows = stmt.query_map(params![account_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            Ok(rows
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|(payload, updated_at)| (payload, now.saturating_sub(updated_at).max(0)))
+                .collect())
+        })
+    }
+
+    /// Restart one entry's clock, after reporting how long it has been stuck.
+    /// Without this the same item would be reported on every single pass.
+    pub fn touch_deferred_remote(&self, account_id: &str, item_id: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE deferred_remote_changes SET updated_at = ?3
+                  WHERE account_id = ?1 AND item_id = ?2",
+                params![account_id, item_id, now()],
+            )?;
+            Ok(())
         })
     }
 
@@ -105,7 +131,7 @@ impl Store {
             conn.execute(
                 "WITH RECURSIVE doomed(id) AS (
                      SELECT ?2
-                     UNION ALL
+                     UNION
                      SELECT child.item_id
                        FROM deferred_remote_changes child
                        JOIN doomed parent ON child.parent_id = parent.id
@@ -394,7 +420,7 @@ impl Store {
                 "WITH RECURSIVE subtree(id) AS (
                      SELECT item_id FROM remote_exclusions
                       WHERE account_id = ?1 AND item_id = ?2
-                     UNION ALL
+                     UNION
                      SELECT child.item_id
                        FROM remote_exclusions child
                        JOIN subtree parent ON child.parent_id = parent.id

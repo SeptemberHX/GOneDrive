@@ -542,7 +542,7 @@ fn prepare_local_move(
     conn.execute(
         "WITH RECURSIVE moved_tree(id) AS (
              SELECT id FROM items WHERE account_id = ?1 AND id = ?2
-             UNION ALL
+             UNION
              SELECT child.id
                FROM items AS child
                JOIN moved_tree AS parent ON child.parent_id = parent.id

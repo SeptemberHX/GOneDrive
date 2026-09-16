@@ -1109,3 +1109,84 @@ async fn a_queued_downloads_partial_file_survives_the_janitor() {
         .unwrap();
     assert!(!partial.exists(), "an abandoned staging file is swept");
 }
+
+#[tokio::test]
+async fn a_failed_download_hands_the_file_back_to_the_local_scanner() {
+    // `Hydrating` means "the daemon owns this file right now", and the local
+    // scan honours it by skipping the file — the user's edits and deletions to
+    // it included. A download that fails has to give that ownership back, or
+    // those changes stay invisible until the next start repairs the states.
+    let h = Harness::metadata_only().await;
+    h.mock_delta(
+        None,
+        vec![
+            folder("D1", ROOT, "Wanted"),
+            file("F1", "D1", "yes.txt", "c1", 5, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.sync().await;
+    h.engine
+        .set_pin(Path::new("Wanted"), PinState::Pinned)
+        .unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    // A transient refusal, which is the case that matters: the operation stays
+    // queued for a later attempt, so nothing else will revisit the record in
+    // the meantime.
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/F1/content"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.downloaded, 0);
+    assert!(summary.still_queued > 0, "a transient failure keeps the work");
+
+    let record = h.store.item("F1").unwrap().unwrap();
+    assert_eq!(
+        record.state,
+        ItemState::DirtyRemote,
+        "a failed download must not leave the record claiming to be hydrating"
+    );
+}
+
+#[tokio::test]
+async fn a_rename_only_delta_does_not_cancel_a_download_the_record_still_owes() {
+    // A metadata-only remote change does not deliver content, so it is not
+    // evidence that content arrived. Recording `Synced` anyway erased the
+    // pending download, and on a personal drive — where there is no remote
+    // hash to compare against — nothing afterwards noticed the new bytes had
+    // never been fetched.
+    let h = harness_with_a_downloaded_file(b"the old bytes").await;
+    h.store
+        .set_item_state("F1", ItemState::DirtyRemote)
+        .unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        // Same cTag, new name: the rename is applied, the content is not.
+        vec![file(
+            "F1",
+            "D1",
+            "renamed.bin",
+            "c1",
+            13,
+            "2022-03-12T01:55:00Z",
+        )],
+        "v2",
+    )
+    .await;
+    h.sync().await;
+
+    assert!(h.path("Docs/renamed.bin").exists(), "the rename applies");
+    assert_eq!(
+        h.store.item("F1").unwrap().unwrap().state,
+        ItemState::DirtyRemote,
+        "the record still owes a download and must keep saying so"
+    );
+}

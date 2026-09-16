@@ -12,6 +12,10 @@ use crate::sync::plan::{order_parents_first, partition_delta, record_from_remote
 use super::super::engine::{stat_of, Engine, SyncEvent, SyncSummary};
 
 const APPLY_CHECKPOINT_ITEMS: usize = 1_000;
+/// How long a deferred remote change may keep failing to apply before the user
+/// is told about it. Generous on purpose: an ordinary deferral is resolved on
+/// the next pass, and reporting those would bury the ones that never resolve.
+const STUCK_AFTER_SECS: i64 = 6 * 60 * 60;
 
 impl Engine {
     pub(super) async fn pull_remote(&self, summary: &mut SyncSummary) -> Result<()> {
@@ -675,9 +679,14 @@ impl Engine {
         if payloads.is_empty() {
             return Ok(());
         }
+        let mut waiting_for = std::collections::HashMap::new();
         let items = payloads
             .into_iter()
-            .map(|payload| serde_json::from_str::<DriveItem>(&payload).map_err(Error::from))
+            .map(|(payload, waited)| {
+                let item = serde_json::from_str::<DriveItem>(&payload).map_err(Error::from)?;
+                waiting_for.insert(item.id.clone(), waited);
+                Ok(item)
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut applied = 0usize;
         for item in order_parents_first(items) {
@@ -690,6 +699,7 @@ impl Engine {
                     }
                     Err(error) if is_item_scoped_error(&error) => {
                         tracing::warn!(item_id = %item.id, %error, "deferred remote deletion is still not locally representable");
+                        self.report_if_stuck(&item, &waiting_for, &error.to_string(), summary)?;
                     }
                     Err(error) => return Err(error),
                 }
@@ -709,9 +719,16 @@ impl Engine {
                 continue;
             }
             let Some(parent_id) = item.parent_id() else {
+                self.report_if_stuck(&item, &waiting_for, "the item has no parent", summary)?;
                 continue;
             };
             if self.store.relative_path(parent_id)?.is_none() {
+                self.report_if_stuck(
+                    &item,
+                    &waiting_for,
+                    "its parent folder has never arrived",
+                    summary,
+                )?;
                 continue;
             }
             match self.apply_remote(account, &item, summary) {
@@ -722,6 +739,7 @@ impl Engine {
                 }
                 Err(error) if is_item_scoped_error(&error) => {
                     tracing::warn!(item_id = %item.id, %error, "deferred remote item is still not locally representable");
+                    self.report_if_stuck(&item, &waiting_for, &error.to_string(), summary)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -730,6 +748,37 @@ impl Engine {
         if applied > 0 {
             tracing::info!(applied, "replayed deferred remote items");
         }
+        Ok(())
+    }
+
+    /// Say out loud that an item has been unappliable for a long time.
+    ///
+    /// A deferral is normal and usually lasts one pass: the parent folder is
+    /// two rows further down the same delta. One that outlives
+    /// [`STUCK_AFTER_SECS`] is a different thing — a file the user can see in
+    /// the web client and will never find on disk — and it used to produce
+    /// nothing but a debug-level line. Reported once per interval rather than
+    /// once per pass, because the poll runs every few minutes.
+    fn report_if_stuck(
+        &self,
+        item: &DriveItem,
+        waiting_for: &std::collections::HashMap<String, i64>,
+        reason: &str,
+        summary: &mut SyncSummary,
+    ) -> Result<()> {
+        if waiting_for.get(&item.id).copied().unwrap_or(0) < STUCK_AFTER_SECS {
+            return Ok(());
+        }
+        let name = item.name.clone().unwrap_or_else(|| item.id.clone());
+        tracing::warn!(item_id = %item.id, %name, %reason, "a remote change has been stuck for hours");
+        summary.failed = summary.failed.saturating_add(1);
+        self.emit(SyncEvent::Failed {
+            name,
+            path: None,
+            error: format!("远端变更长时间无法应用：{reason}"),
+        });
+        self.store
+            .touch_deferred_remote(&self.account_id, &item.id)?;
         Ok(())
     }
 

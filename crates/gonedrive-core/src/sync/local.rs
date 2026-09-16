@@ -807,7 +807,7 @@ impl Engine {
     ) -> Result<(HashSet<String>, HashSet<PathBuf>)> {
         let mut ids = HashSet::new();
         let mut paths = HashSet::new();
-        for payload in self.store.deferred_remote_payloads(&self.account_id)? {
+        for (payload, _waited) in self.store.deferred_remote_payloads(&self.account_id)? {
             let item: DriveItem = serde_json::from_str(&payload)?;
             ids.insert(item.id.clone());
             if let Some(known) = self.store.item(&item.id)? {

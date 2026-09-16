@@ -248,6 +248,7 @@ impl Engine {
                         .set_modified(crate::sync::plan::to_filetime(mtime));
                     self.rooted(account)?.set_times(&path, times)?;
                 }
+                state = passive_state(known.as_ref());
             }
             RemoteAction::ConflictCopy => {
                 let copy = self.make_conflict_copy(&path)?;
@@ -316,6 +317,8 @@ impl Engine {
                         None,
                         remote.etag.as_deref().or(remote.ctag.as_deref()),
                     )?;
+                } else {
+                    state = passive_state(known.as_ref());
                 }
             }
             RemoteAction::DeleteLocal | RemoteAction::KeepLocalAndReupload => {
@@ -883,4 +886,24 @@ fn numbered_copy_path(base: &Path, number: u32) -> PathBuf {
         None => format!("{stem} ({number})"),
     };
     base.with_file_name(numbered)
+}
+
+/// The state a branch that neither fetched nor published content may record.
+///
+/// `Synced` is a claim about local content, and these branches make no such
+/// claim: restamping a timestamp and applying a metadata-only change both leave
+/// the bytes exactly as they were. Writing `Synced` anyway discarded whatever
+/// the record was still owed — a queued download, a hydration in flight — and
+/// on a personal drive, where there is no remote hash to compare against,
+/// nothing afterwards noticed the file had never arrived.
+fn passive_state(known: Option<&ItemRecord>) -> ItemState {
+    match known.map(|known| known.state) {
+        Some(
+            state @ (ItemState::DirtyRemote
+            | ItemState::Hydrating
+            | ItemState::DirtyLocal
+            | ItemState::Conflict),
+        ) => state,
+        _ => ItemState::Synced,
+    }
 }

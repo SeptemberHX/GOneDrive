@@ -1,4 +1,20 @@
 //! Remote item tree, derived paths, selection state, and resync generations.
+//!
+//! # Cycles
+//!
+//! Every path here is derived by walking `parent_id`, and nothing in SQLite
+//! stops that column from describing a loop: a corrupted row, a half-applied
+//! delta, a restored database. A recursive CTE that meets one never returns, so
+//! a single bad row would hang the sync thread — and, through it, the daemon —
+//! with no error and nothing in the log.
+//!
+//! Two defences, applied to every recursive query in this file. A walk *down*
+//! the tree collects ids, so `UNION` rather than `UNION ALL` makes it
+//! self-limiting: an id already visited is not visited again. A walk *up* the
+//! tree carries a depth, and stops at 512 — far beyond any real drive, and
+//! below the point where the query becomes expensive. `relative_path` then
+//! reports the truncated chain as "no path", which is exactly how it already
+//! reports an ancestor that has not arrived yet.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -249,7 +265,7 @@ impl Store {
                 "WITH RECURSIVE partial_tree(id) AS (
                      SELECT item_id FROM folder_population
                       WHERE account_id = ?1 AND populated = 0
-                     UNION ALL
+                     UNION
                      SELECT child.id
                        FROM items child
                        JOIN partial_tree parent ON child.parent_id = parent.id
@@ -487,7 +503,7 @@ impl Store {
             tx.execute(
                 "WITH RECURSIVE doomed(id) AS (
                      SELECT id FROM items WHERE id = ?1
-                     UNION ALL
+                     UNION
                      SELECT i.id FROM items i JOIN doomed d ON i.parent_id = d.id
                  )
                  DELETE FROM pending_ops WHERE item_id IN (SELECT id FROM doomed)",
@@ -496,7 +512,7 @@ impl Store {
             let n = tx.execute(
                 "WITH RECURSIVE doomed(id) AS (
                      SELECT id FROM items WHERE id = ?1
-                     UNION ALL
+                     UNION
                      SELECT i.id FROM items i JOIN doomed d ON i.parent_id = d.id
                  )
                  DELETE FROM items WHERE id IN (SELECT id FROM doomed)",
@@ -534,7 +550,7 @@ impl Store {
             tx.execute(
                 "WITH RECURSIVE doomed(id) AS (
                      SELECT id FROM items WHERE id = ?1
-                     UNION ALL
+                     UNION
                      SELECT i.id FROM items i JOIN doomed d ON i.parent_id = d.id
                  )
                  DELETE FROM pending_ops WHERE item_id IN (SELECT id FROM doomed)",
@@ -543,7 +559,7 @@ impl Store {
             tx.execute(
                 "WITH RECURSIVE doomed(id) AS (
                      SELECT id FROM items WHERE id = ?1
-                     UNION ALL
+                     UNION
                      SELECT i.id FROM items i JOIN doomed d ON i.parent_id = d.id
                  )
                  DELETE FROM items WHERE id IN (SELECT id FROM doomed)",
@@ -567,6 +583,7 @@ impl Store {
                      UNION ALL
                      SELECT i.id, i.parent_id, i.name, chain.depth + 1
                        FROM items i JOIN chain ON i.id = chain.parent_id
+                      WHERE chain.depth < 512
                  )
                  SELECT name, parent_id FROM chain ORDER BY depth DESC",
             )?;
@@ -610,6 +627,7 @@ impl Store {
                          UNION ALL
                          SELECT i.id, i.parent_id, i.pin_state, chain.depth + 1
                            FROM items i JOIN chain ON i.id = chain.parent_id
+                          WHERE chain.depth < 512
                      )
                      SELECT pin_state FROM chain
                       WHERE pin_state <> 'inherit'
@@ -639,6 +657,7 @@ impl Store {
                          UNION ALL
                          SELECT i.id, i.parent_id, i.pin_state, chain.depth + 1
                            FROM items i JOIN chain ON i.id = chain.parent_id
+                          WHERE chain.depth < 512
                      )
                      SELECT pin_state FROM chain
                       WHERE pin_state <> 'inherit'
@@ -661,6 +680,7 @@ impl Store {
                          UNION ALL
                          SELECT i.id, i.parent_id, i.pin_state, chain.depth + 1
                            FROM items i JOIN chain ON i.id = chain.parent_id
+                          WHERE chain.depth < 512
                      )
                      SELECT pin_state FROM chain
                       WHERE pin_state <> 'inherit' ORDER BY depth LIMIT 1",
@@ -679,7 +699,7 @@ impl Store {
             let mut stmt = conn.prepare(&format!(
                 "WITH RECURSIVE tree(id) AS (
                      SELECT id FROM items WHERE id = ?1
-                     UNION ALL
+                     UNION
                      SELECT i.id FROM items i JOIN tree t ON i.parent_id = t.id
                  )
                  {ITEM_COLUMNS_CTE} WHERE id IN (SELECT id FROM tree) AND is_folder = 0"
@@ -696,7 +716,7 @@ impl Store {
             Ok(conn.query_row(
                 "WITH RECURSIVE tree(id) AS (
                      SELECT id FROM items WHERE id = ?1
-                     UNION ALL
+                     UNION
                      SELECT i.id FROM items i JOIN tree t ON i.parent_id = t.id
                  )
                  SELECT COALESCE(SUM(size), 0), COUNT(*) FROM items
@@ -716,7 +736,7 @@ impl Store {
             Ok(conn.query_row(
                 "WITH RECURSIVE tree(id) AS (
                      SELECT id FROM items WHERE id = ?1
-                     UNION ALL
+                     UNION
                      SELECT i.id FROM items i JOIN tree t ON i.parent_id = t.id
                  )
                  SELECT COUNT(*) FROM tree",
@@ -921,7 +941,7 @@ impl Store {
                      UNION ALL
                      SELECT items.id, depth.level + 1
                        FROM items JOIN depth ON items.parent_id = depth.item_id
-                      WHERE items.account_id = ?1
+                      WHERE items.account_id = ?1 AND depth.level < 512
                  )
                  {ITEM_COLUMNS} LEFT JOIN depth ON depth.item_id = items.id
                  WHERE account_id = ?1 AND seen_gen < ?2 AND parent_id IS NOT NULL
@@ -948,7 +968,7 @@ impl Store {
             let removed = tx.execute(
                 "WITH RECURSIVE tree(id) AS (
                      SELECT id FROM items WHERE id = ?2
-                     UNION ALL
+                     UNION
                      SELECT i.id FROM items i JOIN tree t ON i.parent_id = t.id
                  )
                  DELETE FROM pending_ops
@@ -961,7 +981,7 @@ impl Store {
             tx.execute(
                 "WITH RECURSIVE tree(id) AS (
                      SELECT id FROM items WHERE id = ?2
-                     UNION ALL
+                     UNION
                      SELECT i.id FROM items i JOIN tree t ON i.parent_id = t.id
                  )
                  UPDATE items SET state = 'dehydrated'

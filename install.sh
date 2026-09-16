@@ -1,13 +1,36 @@
 #!/bin/bash
-# GOnedrive installer.
+# GOnedrive installer, for working from a source tree.
 #
 #   sudo ./install.sh          # binaries + privileged helper service
 #   ./install.sh --user        # per-user pieces (daemon unit, Nautilus, icons)
 #
 # Split on purpose: only the helper needs root, and mixing the two under sudo
 # would litter root-owned files through the user's home.
+#
+# Mutually exclusive with the .deb (see build-deb.sh). This script puts
+# binaries in /usr/local/bin, which precedes /usr/bin on the default PATH, and
+# unit and D-Bus service files under $HOME, which shadow the package's copies
+# in /usr/lib and /usr/share. Both together mean `apt upgrade gonedrive`
+# installs a new package that never runs: the old binaries keep starting, with
+# nothing on screen to say so.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# Refuse rather than shadow. GONEDRIVE_ALLOW_BESIDE_DEB=1 overrides, for the
+# case where you know you are testing a build against an installed package.
+if [ "${GONEDRIVE_ALLOW_BESIDE_DEB:-0}" != 1 ] \
+    && dpkg-query -W -f='${Status}' gonedrive 2>/dev/null | grep -q "^install ok installed$"; then
+    cat >&2 <<'MSG'
+The gonedrive .deb is installed on this system.
+
+Installing from source beside it shadows the packaged binaries and unit files,
+so later package upgrades appear to do nothing. Pick one:
+
+  sudo apt remove gonedrive      # then re-run this script, or
+  GONEDRIVE_ALLOW_BESIDE_DEB=1 ./install.sh   # I know, do it anyway
+MSG
+    exit 1
+fi
 
 if [ "${1:-}" = "--user" ]; then
     [ "$(id -u)" = 0 ] && { echo "run the --user half as yourself, not root"; exit 1; }

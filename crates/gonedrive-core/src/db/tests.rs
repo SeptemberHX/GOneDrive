@@ -926,3 +926,41 @@ fn deferring_an_operation_does_not_spend_its_retry_budget() {
     assert_eq!(op.attempts, 0, "deferring is not failing");
     assert_eq!(op.last_error.as_deref(), Some("not enough free disk space"));
 }
+
+#[test]
+fn a_parent_cycle_ends_every_tree_walk_instead_of_hanging() {
+    // Nothing in SQLite forbids `parent_id` describing a loop, and a corrupted
+    // row, a half-applied delta or a restored database can produce one. A
+    // recursive query that meets a loop never returns, and it runs on the sync
+    // thread: one bad row used to take the whole daemon with it, silently.
+    let (store, account) = store_with_account();
+    store.upsert_item(&folder("A", "ROOT", "a")).unwrap();
+    store.upsert_item(&folder("B", "A", "b")).unwrap();
+    store.upsert_item(&file("F", "B", "f.txt")).unwrap();
+    // Close the loop: A's parent becomes its own grandchild.
+    store
+        .with_conn(|conn| {
+            conn.execute("UPDATE items SET parent_id = 'B' WHERE id = 'A'", [])?;
+            Ok(())
+        })
+        .unwrap();
+
+    // Upward: no chain reaches the root, so no path is known — the same answer
+    // the store already gives for an ancestor that has not arrived yet.
+    assert_eq!(store.relative_path("F").unwrap(), None);
+    assert_eq!(store.local_path(&account, "F").unwrap(), None);
+    // Still answers, rather than climbing forever looking for an explicit pin.
+    assert_eq!(
+        store.effective_pin("F", PinState::Inherit).unwrap(),
+        PinState::Inherit
+    );
+    assert!(!store.explicitly_excluded("F").unwrap());
+    assert!(!store.explicitly_pinned("F").unwrap());
+
+    // Downward: the id set is finite, so the walk visits each row once.
+    assert_eq!(store.subtree_item_count("A").unwrap(), 3);
+    assert_eq!(store.files_in_subtree("A").unwrap().len(), 1);
+    let (_bytes, files) = store.subtree_size("A").unwrap();
+    assert_eq!(files, 1);
+    assert_eq!(store.delete_subtree("A").unwrap(), 3);
+}

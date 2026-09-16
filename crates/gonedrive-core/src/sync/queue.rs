@@ -239,7 +239,38 @@ impl Engine {
         }
     }
 
+    /// `Hydrating` is not a state a failure may leave behind.
+    ///
+    /// It means "the daemon owns this file right now", and the local scan
+    /// honours that by skipping the file entirely — the user's edits and
+    /// deletions to it included. A download that failed for any reason other
+    /// than success therefore has to hand ownership back, or those changes stay
+    /// invisible until the next start runs `repair_states`.
     async fn run_download(
+        &self,
+        account: &Account,
+        op: &PendingOp,
+        summary: &mut SyncSummary,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let outcome = self
+            .download_into_place(account, op, summary, deadline)
+            .await;
+        if outcome.is_err() {
+            if let Some(item_id) = op.item_id.as_deref() {
+                if self
+                    .store
+                    .item(item_id)
+                    .is_ok_and(|item| item.is_some_and(|item| item.state == ItemState::Hydrating))
+                {
+                    let _ = self.store.set_item_state(item_id, ItemState::DirtyRemote);
+                }
+            }
+        }
+        outcome
+    }
+
+    async fn download_into_place(
         &self,
         account: &Account,
         op: &PendingOp,
@@ -340,13 +371,10 @@ impl Engine {
         if let Some(file) = &syncing_file {
             let _ = Placeholder::set_syncing_file(file, false);
         }
-        let downloaded = match result {
-            Err(Error::Cancelled) if deadline.is_some() => {
-                self.store.set_item_state(item_id, ItemState::DirtyRemote)?;
-                return Err(Error::Cancelled);
-            }
-            result => result?,
-        };
+        // Every failure below, cancellation included, is undone by the
+        // wrapper: the row goes back to `DirtyRemote` so the next pass retries
+        // it and the local scan stops skipping the file meanwhile.
+        let downloaded = result?;
 
         // Publish placeholder metadata, then make sure nobody rewrote the new
         // inode before we declare it synced. xattrs change ctime, so compare

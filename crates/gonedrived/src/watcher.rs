@@ -146,7 +146,12 @@ impl OpenWrites {
         })
     }
 
-    pub fn is_idle(&self) -> bool {
+    /// Test-only. The coordinator asks [`OpenWrites::blocks`] about the exact
+    /// scopes it is about to reconcile; a global "is anything being written"
+    /// question has no honest use, because one open writer says nothing about
+    /// whether some unrelated directory is safe to scan.
+    #[cfg(test)]
+    fn is_idle(&self) -> bool {
         let mut open = self.paths.lock().unwrap_or_else(|e| e.into_inner());
         Self::expire(&mut open);
         open.is_empty()
