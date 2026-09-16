@@ -16,6 +16,7 @@ use gonedrive_ipc::reader_policy::{
 use crate::fanotify::PreContentEvent;
 use crate::marks::remove_mark_by_event_fd;
 use crate::server::send_to_session;
+use crate::shown;
 use crate::{ClientSession, FileIdentity, MarkKind, Pending, Reply, Shared, HYDRATE_TIMEOUT};
 
 /// Poll for events and hand each one to a worker.
@@ -115,6 +116,23 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
         return;
     }
 
+    // Past the daemon's own accesses, which answer immediately. Everything
+    // below can block this worker for the whole hydration timeout, so one uid
+    // may only hold its share of the pool.
+    let _slot = match shared.claim_worker(stat.st_uid as u32) {
+        Some(slot) => slot,
+        None => {
+            tracing::warn!(
+                uid = stat.st_uid,
+                "uid is already using its share of the worker pool"
+            );
+            if event.requires_response {
+                let _ = shared.fan.respond(fd, false);
+            }
+            return;
+        }
+    };
+
     let (uid, kind, registered_path, child_notification) = {
         let marks = shared.marks.lock().unwrap();
         match marks.get(&identity) {
@@ -127,7 +145,7 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
                     return;
                 };
                 let Some(parent) = marks.population_parent(stat.st_uid, path) else {
-                    tracing::debug!(path = %path.display(), "denying an unregistered open target");
+                    tracing::debug!(path = %shown(path), "denying an unregistered open target");
                     let _ = shared.fan.respond(fd, false);
                     return;
                 };
@@ -142,7 +160,7 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
                         let allow = match unregistered_population_file_is_safe(fd) {
                             Ok(allow) => allow,
                             Err(error) => {
-                                tracing::debug!(path = %path.display(), %error, "could not classify an unregistered population child");
+                                tracing::debug!(path = %shown(path), %error, "could not classify an unregistered population child");
                                 false
                             }
                         };
@@ -150,7 +168,7 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
                         return;
                     }
                     _ => {
-                        tracing::debug!(path = %path.display(), "denying a non-file population child");
+                        tracing::debug!(path = %shown(path), "denying a non-file population child");
                         let _ = shared.fan.respond(fd, false);
                         return;
                     }
@@ -365,12 +383,12 @@ fn handle_directory_open(
     let ok = match request_directory_population(shared, client, uid, path, reader, event.pid) {
         Ok(ok) => ok,
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "directory population failed");
+            tracing::warn!(path = %shown(path), %error, "directory population failed");
             false
         }
     };
     if let Err(error) = shared.fan.respond(event.fd.as_raw_fd(), ok) {
-        tracing::error!(path = %path.display(), %error, "could not answer directory open");
+        tracing::error!(path = %shown(path), %error, "could not answer directory open");
     }
 }
 
@@ -465,7 +483,7 @@ fn hydrate(
     if staged_len != expected {
         bail!(
             "staged content has {staged_len} bytes, expected {expected} for {}",
-            path.display()
+            shown(path)
         );
     }
 
@@ -476,7 +494,7 @@ fn hydrate(
     if written != expected {
         bail!(
             "filled {written} bytes, expected {expected} for {}",
-            path.display()
+            shown(path)
         );
     }
 
@@ -500,14 +518,14 @@ fn hydrate(
         if let Err(error) = mark_hydrated(event.fd.as_raw_fd()) {
             // The bytes are already complete, so an xattr failure must not turn
             // a successful download into an I/O error for the user's copy.
-            tracing::warn!(path = %path.display(), %error, "could not mark hydrated before releasing reader");
+            tracing::warn!(path = %shown(path), %error, "could not mark hydrated before releasing reader");
         }
-        tracing::info!(path = %path.display(), bytes = target_len, %reader, pid = event.pid, "hydrated");
+        tracing::info!(path = %shown(path), bytes = target_len, %reader, pid = event.pid, "hydrated");
     } else {
         // Only the requested window was filled; the watch stays, so a reader
         // that keeps going comes back for the rest.
         tracing::debug!(
-            path = %path.display(),
+            path = %shown(path),
             bytes = written,
             offset,
             %reader,
@@ -699,8 +717,8 @@ pub(super) fn hydration_reader(pid: i32, source: &Path) -> String {
     if is_file_manager_reader(&comm) {
         if let Some(destination) = writable_copy_destination(pid, source) {
             tracing::info!(
-                source = %source.display(),
-                destination = %destination.display(),
+                source = %shown(source),
+                destination = %shown(destination),
                 pid,
                 "file-manager copy detected"
             );

@@ -76,3 +76,10 @@
 - **根因**：`queue.rs::drain_queue` 的查询把下载排在批次前面。空间闸门把整批下载滤掉之后，`ops.is_empty()` 直接 `return`，本轮再也不取下一批。注释声称"上传和删除照常"，与实现不符。
 - **修复**：整批被扣下时改为 `continue` 取下一批（被推迟的行已经不再到期，循环必然收敛）。同时把"扣下"与"失败"分开：新增 `Store::defer_op` 只推后 `next_attempt_at` 而不增加 attempts——操作根本没跑过，计入重试预算会把退避迅速推到 256 秒上限，也会污染真实失败的计数。
 - **回归测试**：`crates/gonedrive-core/src/db/tests.rs::deferring_an_operation_does_not_spend_its_retry_budget`（空间闸门本身依赖真实 statvfs，未做端到端测试）。
+
+## SS-010 · 特权 helper 的 worker 池不按 uid 分配，且日志可被文件名伪造
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：两个独立问题。其一，64 个 worker 在所有已连接 uid 之间共享；一个被阻塞的读者最长占用 300 秒，因此同一台机器上的某个用户同时打开足够多的占位文件即可吃光整个池子，其他用户的正常回填全部排在后面。其二，路径来自对端的文件系统，可以包含换行与 ANSI 转义序列，而消息里一律用 `Display` 原样输出——精心构造的文件名可以在 journal 里伪造日志行，或在有人用终端查看时注入转义序列。
+- **修复**：worker 配额按 uid 计，上限为池子的四分之三——单用户几乎不受影响，同时始终为其他人留出下限；超额的事件直接拒绝（与队列已满时的行为一致，读者收到 I/O 错误而不是无限等待）。记账抽成独立的 `WorkerSlots`，不依赖需要 `CAP_SYS_ADMIN` 的 fanotify 组，因此可测。日志方面新增 `shown()`，用调试形式输出路径（带引号并转义控制字符），helper crate 内 36 处 `.display()` 全部改用它。
+- **回归测试**：`crates/gonedrive-hsm/src/tests.rs::one_uid_cannot_take_the_whole_worker_pool`、`::a_crafted_name_cannot_forge_a_log_line`。

@@ -12,6 +12,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::fanotify::descriptor_path;
 use crate::file_handle::{object_is_gone, ReopenableFile};
+use crate::shown;
 use crate::{FileIdentity, MarkEntry, MarkKind, Shared, SyncRoot};
 
 /// Both lookup directions live under one lock so registration, replacement,
@@ -130,13 +131,13 @@ pub(super) struct AuthorisedFile {
 
 fn validate_path(path: &Path) -> Result<()> {
     if !path.is_absolute() {
-        bail!("{} is not an absolute path", path.display());
+        bail!("{} is not an absolute path", shown(path));
     }
     if path
         .components()
         .any(|c| c == std::path::Component::ParentDir)
     {
-        bail!("{} contains a parent-directory component", path.display());
+        bail!("{} contains a parent-directory component", shown(path));
     }
     Ok(())
 }
@@ -213,24 +214,24 @@ pub(super) fn open_root(path: &Path, uid: u32) -> Result<SyncRoot> {
         libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
         libc::RESOLVE_NO_MAGICLINKS,
     )
-    .with_context(|| format!("cannot open {}", path.display()))?;
+    .with_context(|| format!("cannot open {}", shown(path)))?;
     let meta = dir
         .metadata()
-        .with_context(|| format!("cannot stat {}", path.display()))?;
+        .with_context(|| format!("cannot stat {}", shown(path)))?;
     if !meta.is_dir() {
-        bail!("{} is not a directory", path.display());
+        bail!("{} is not a directory", shown(path));
     }
     if meta.uid() != uid {
         bail!(
             "{} belongs to uid {}, not to the connecting uid {uid}",
-            path.display(),
+            shown(path),
             meta.uid()
         );
     }
     if let Some(name) = refused_filesystem(&dir)? {
         bail!(
             "{} is on a {name} filesystem, which the helper does not serve",
-            path.display()
+            shown(path)
         );
     }
     Ok(SyncRoot {
@@ -296,7 +297,7 @@ fn open_authorised_kind(
             .ok()
             .map(|relative| (root, relative))
     }) else {
-        bail!("{} is outside every registered sync root", path.display());
+        bail!("{} is outside every registered sync root", shown(path));
     };
     let relative = if relative.as_os_str().is_empty() {
         Path::new(".")
@@ -315,10 +316,10 @@ fn open_authorised_kind(
         flags |= libc::O_NONBLOCK | libc::O_NOCTTY;
     }
     let file = openat2(root.dir.as_raw_fd(), relative, flags, BENEATH_ROOT)
-        .with_context(|| format!("cannot open {}", path.display()))?;
+        .with_context(|| format!("cannot open {}", shown(path)))?;
     let meta = file
         .metadata()
-        .with_context(|| format!("cannot stat {}", path.display()))?;
+        .with_context(|| format!("cannot stat {}", shown(path)))?;
     let expected_type = match kind {
         MarkKind::Placeholder => meta.file_type().is_file(),
         MarkKind::PopulationDirectory => meta.file_type().is_dir(),
@@ -328,12 +329,12 @@ fn open_authorised_kind(
             MarkKind::Placeholder => "a regular file",
             MarkKind::PopulationDirectory => "a directory",
         };
-        bail!("{} is not {expected}", path.display());
+        bail!("{} is not {expected}", shown(path));
     }
     if meta.uid() != uid {
         bail!(
             "{} belongs to uid {}, not to the connecting uid {uid}",
-            path.display(),
+            shown(path),
             meta.uid()
         );
     }
@@ -342,7 +343,7 @@ fn open_authorised_kind(
     if let Some(name) = refused_filesystem(&file)? {
         bail!(
             "{} is on a {name} filesystem, which the helper does not serve",
-            path.display()
+            shown(path)
         );
     }
     Ok(AuthorisedFile {
@@ -395,7 +396,7 @@ fn install_typed_mark(
         retire_stale_marks(shared, stale);
         if kind == MarkKind::Placeholder {
             restore_locked_placeholder(&target.file)
-                .with_context(|| format!("could not unlock protected {}", path.display()))?;
+                .with_context(|| format!("could not unlock protected {}", shown(path)))?;
         }
         return Ok(target.identity);
     }
@@ -405,7 +406,7 @@ fn install_typed_mark(
     // registry entry exists. The descriptor remains bound to this exact inode.
     let locked = if kind == MarkKind::Placeholder {
         LockedPlaceholder::prepare(&target.file)
-            .with_context(|| format!("could not inspect safety lock on {}", path.display()))?
+            .with_context(|| format!("could not inspect safety lock on {}", shown(path)))?
     } else {
         None
     };
@@ -413,7 +414,7 @@ fn install_typed_mark(
         MarkKind::Placeholder => shared.fan.watch_fd(target.file.as_raw_fd()),
         MarkKind::PopulationDirectory => shared.fan.watch_directory_fd(target.file.as_raw_fd()),
     }
-    .with_context(|| format!("could not watch {}", path.display()))?;
+    .with_context(|| format!("could not watch {}", shown(path)))?;
     if let Some(locked) = locked {
         if let Err(error) = locked.restore() {
             let _ = match kind {
@@ -423,7 +424,7 @@ fn install_typed_mark(
                 }
             };
             return Err(error)
-                .with_context(|| format!("could not unlock protected {}", path.display()));
+                .with_context(|| format!("could not unlock protected {}", shown(path)));
         }
     }
     let (file, fallback_error) = ReopenableFile::capture(target.file, &shared.mounts);
@@ -431,7 +432,7 @@ fn install_typed_mark(
         let fallbacks = shared.descriptor_fallbacks.fetch_add(1, Ordering::Relaxed) + 1;
         if fallbacks == 1 {
             tracing::warn!(
-                path = %path.display(),
+                path = %shown(path),
                 %error,
                 "filesystem cannot reopen persistent file handles; retaining one descriptor per placeholder on this filesystem"
             );
@@ -464,7 +465,7 @@ fn install_typed_mark(
     // A concurrent registration may have won after fanotify_mark. Adding the
     // same inode mark is idempotent; dropping our duplicate handle is enough.
     retire_stale_marks(shared, stale);
-    tracing::debug!(path = %path.display(), uid, ?kind, "watching");
+    tracing::debug!(path = %shown(path), uid, ?kind, "watching");
     Ok(target.identity)
 }
 
@@ -552,7 +553,7 @@ fn restore_locked_placeholder(path_file: &File) -> std::io::Result<()> {
 fn retire_stale_marks(shared: &Arc<Shared>, stale: Vec<(FileIdentity, MarkEntry)>) {
     for (identity, entry) in stale {
         if let Err(error) = unwatch_entry(shared, &entry) {
-            tracing::warn!(path = %entry.path.display(), %error, "could not remove stale mark");
+            tracing::warn!(path = %shown(&entry.path), %error, "could not remove stale mark");
             shared.marks.lock().unwrap().insert(identity, entry);
         }
     }
@@ -574,7 +575,7 @@ pub(super) fn remove_marks_for_path(shared: &Arc<Shared>, path: &Path, uid: u32)
     } else {
         bail!(
             "could not unwatch {}: {}",
-            path.display(),
+            shown(path),
             failures
                 .into_iter()
                 .map(|error| error.to_string())

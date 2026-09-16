@@ -14,6 +14,7 @@ use crate::marks::{
     begin_mark_sweep, cancel_mark_sweep, commit_mark_sweep, install_directory_mark, install_mark,
     open_authorised, register_roots, remove_marks_for_path,
 };
+use crate::shown;
 use crate::worker::fail_pending_for_uid;
 use crate::{ClientSession, FileIdentity, Reply, Shared};
 
@@ -70,7 +71,7 @@ pub(super) fn bind_socket(path: &Path) -> Result<UnixListener> {
         {
             bail!(
                 "socket directory {} must be a real directory owned by the helper uid",
-                parent.display()
+                shown(parent)
             );
         }
         // The directory is the access control: only root may replace the
@@ -84,7 +85,7 @@ pub(super) fn bind_socket(path: &Path) -> Result<UnixListener> {
         Ok(metadata) => {
             use std::os::unix::fs::FileTypeExt;
             if !metadata.file_type().is_socket() {
-                bail!("refusing to replace non-socket {}", path.display());
+                bail!("refusing to replace non-socket {}", shown(path));
             }
             std::fs::remove_file(path)?;
         }

@@ -60,6 +60,15 @@ const HYDRATE_TIMEOUT: Duration = Duration::from_secs(300);
 /// turn each one into an unbounded root-owned thread.
 const WORKERS: usize = 64;
 const WORK_QUEUE: usize = 256;
+/// How many workers one uid may occupy at once.
+///
+/// A blocked reader holds its worker for up to [`HYDRATE_TIMEOUT`], so without
+/// a ceiling one user opening many placeholders at once takes the whole pool
+/// and every other user's reads wait behind them. Three quarters leaves a
+/// single user essentially unconstrained while keeping a floor for everyone
+/// else. Events over the ceiling are denied, which is how a full queue already
+/// behaves: the reader sees an I/O error rather than an unbounded wait.
+const MAX_WORKERS_PER_UID: usize = WORKERS * 3 / 4;
 
 #[cfg(debug_assertions)]
 const DEFAULT_LOG_FILTER: &str = "gonedrive_hsm=info";
@@ -142,6 +151,8 @@ struct Shared {
     sessions: Mutex<HashMap<u32, ClientSession>>,
     marks: Mutex<MarkRegistry>,
     sweeps: Mutex<HashMap<u32, u64>>,
+    /// Workers currently occupied per uid. See [`MAX_WORKERS_PER_UID`].
+    in_flight: Arc<WorkerSlots>,
     /// Declared sync roots per uid. Like marks, they outlive the session that
     /// declared them: a reconnecting daemon re-declares before its first watch.
     roots: Mutex<HashMap<u32, Arc<Vec<SyncRoot>>>>,
@@ -151,7 +162,69 @@ struct Shared {
     allowed_uid: Option<u32>,
 }
 
+/// A path as it may safely appear in a message.
+///
+/// Names come from the peer's filesystem and can hold newlines or terminal
+/// escape sequences. `Display` passes those straight through, which lets a
+/// crafted name forge journal lines or steer the terminal of whoever reads
+/// them; the debug form quotes and escapes instead.
+pub(crate) fn shown(path: impl AsRef<Path>) -> String {
+    format!("{:?}", path.as_ref())
+}
+
+/// How many workers each uid currently occupies.
+#[derive(Default)]
+struct WorkerSlots {
+    held: Mutex<HashMap<u32, usize>>,
+}
+
+impl WorkerSlots {
+    /// Take a slot for `uid`, or `None` when it already holds its share.
+    fn claim(self: &Arc<Self>, uid: u32, ceiling: usize) -> Option<WorkerSlot> {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = held.entry(uid).or_insert(0);
+        if *count >= ceiling {
+            return None;
+        }
+        *count += 1;
+        Some(WorkerSlot {
+            slots: self.clone(),
+            uid,
+        })
+    }
+}
+
+/// Occupies one of a uid's worker slots for as long as it is alive.
+struct WorkerSlot {
+    slots: Arc<WorkerSlots>,
+    uid: u32,
+}
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        let mut held = self
+            .slots
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = held.get_mut(&self.uid) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                held.remove(&self.uid);
+            }
+        }
+    }
+}
+
 impl Shared {
+    /// Take a worker slot for `uid`, or `None` when it already holds its share.
+    fn claim_worker(&self, uid: u32) -> Option<WorkerSlot> {
+        self.in_flight.claim(uid, MAX_WORKERS_PER_UID)
+    }
+
     /// The roots this uid's daemon declared; empty until it does, which
     /// refuses every path.
     fn roots_for(&self, uid: u32) -> Arc<Vec<SyncRoot>> {
@@ -228,6 +301,7 @@ fn main() -> Result<()> {
         sessions: Mutex::new(HashMap::new()),
         marks: Mutex::new(MarkRegistry::default()),
         sweeps: Mutex::new(HashMap::new()),
+        in_flight: Arc::new(WorkerSlots::default()),
         roots: Mutex::new(HashMap::new()),
         mounts: MountHandles::default(),
         descriptor_fallbacks: AtomicU64::new(0),
@@ -236,7 +310,7 @@ fn main() -> Result<()> {
     });
 
     let listener = bind_socket(&cli.socket)?;
-    tracing::info!(socket = %cli.socket.display(), "listening");
+    tracing::info!(socket = %shown(cli.socket), "listening");
 
     let (work_tx, work_rx) = mpsc::sync_channel(WORK_QUEUE);
     let work_rx = Arc::new(Mutex::new(work_rx));

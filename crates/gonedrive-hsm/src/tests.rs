@@ -536,3 +536,52 @@ fn a_reply_to_a_peer_that_stopped_reading_gives_up_and_ends_the_connection() {
         "the peer still sees what did get through"
     );
 }
+
+#[test]
+fn a_crafted_name_cannot_forge_a_log_line() {
+    // Names come from the peer's filesystem. Display passes a newline straight
+    // through, which lets one forge a journal entry, and an escape sequence
+    // through to whoever reads the log in a terminal.
+    let forged = Path::new("report.docx\n2026-09-15 ERROR forged entry\x1b[2J");
+    let rendered = shown(forged);
+
+    assert!(!rendered.contains('\n'), "no raw newline: {rendered}");
+    assert!(!rendered.contains('\x1b'), "no raw escape: {rendered}");
+    assert!(
+        rendered.contains("report.docx"),
+        "still readable: {rendered}"
+    );
+}
+
+#[test]
+fn one_uid_cannot_take_the_whole_worker_pool() {
+    // A blocked reader holds its worker for the whole hydration timeout, so
+    // without a ceiling one user opening many placeholders at once starves
+    // every other user's reads.
+    let slots = std::sync::Arc::new(WorkerSlots::default());
+    let ceiling = 4;
+    let mut held: Vec<_> = (0..ceiling)
+        .map(|_| {
+            slots
+                .claim(1000, ceiling)
+                .expect("a uid may use its whole share")
+        })
+        .collect();
+    assert!(
+        slots.claim(1000, ceiling).is_none(),
+        "past its share the uid is refused"
+    );
+    assert!(
+        slots.claim(1001, ceiling).is_some(),
+        "another uid still gets in"
+    );
+
+    held.pop();
+    assert!(
+        slots.claim(1000, ceiling).is_some(),
+        "a finished hydration returns the slot"
+    );
+    // The ceiling has to leave something for everyone else; a compile-time
+    // check, since both sides are constants.
+    const _: () = assert!(MAX_WORKERS_PER_UID < WORKERS);
+}
