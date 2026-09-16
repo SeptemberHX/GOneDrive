@@ -151,17 +151,25 @@ fn validate_path(path: &Path) -> Result<()> {
 const BENEATH_ROOT: u64 =
     libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
 
-/// Filesystem magic numbers on which the helper refuses to operate. A FUSE or
-/// network mount can block a root-owned worker for as long as its server
-/// likes — a lever any local user could pull against everyone else's
-/// placeholders — and a sync root belongs on a local disk anyway.
+/// Filesystem magic numbers on which the helper refuses to operate.
+///
+/// The lever these close is a local user mounting something whose server they
+/// control and then pointing the helper at it: every read then blocks for as
+/// long as that server likes, holding a root-owned worker against everyone
+/// else. FUSE is the obvious one — any user can mount it — and the network
+/// filesystems are the same shape with a remote peer.
+///
+/// overlayfs is deliberately **not** here, though an earlier revision listed
+/// it. Mounting an overlay needs privileges or a user namespace, and anyone
+/// with those can mount FUSE instead, which this list already refuses — so it
+/// bought almost nothing. What it cost was real: a container's `/tmp` and
+/// root filesystem are overlays, so the helper refused to serve a sync root in
+/// any container, and the test suite could not run in one either.
 const REFUSED_FILESYSTEMS: &[(u64, &str)] = &[
     (0x6573_5546, "fuse"),
-    // Reached through the same lever: an autofs mount point can block while it
-    // mounts on demand, and an overlay's lower layer may itself be slow or
-    // user-controlled. Both would hold a root worker for as long as they like.
+    // An autofs mount point blocks while it mounts on demand, and only root
+    // configures one, so refusing it costs an ordinary user nothing.
     (0x0187, "autofs"),
-    (0x794C_7630, "overlayfs"),
     (0x6969, "nfs"),
     (0x517B, "smb"),
     (0xFF53_4D42, "cifs"),
@@ -238,6 +246,12 @@ pub(super) fn open_root(path: &Path, uid: u32) -> Result<SyncRoot> {
         path: Arc::from(path),
         dir,
     })
+}
+
+/// Whether this filesystem magic is one the helper refuses.
+#[cfg(test)]
+pub(super) fn refused_magic(magic: u64) -> bool {
+    REFUSED_FILESYSTEMS.iter().any(|(known, _)| *known == magic)
 }
 
 fn refused_filesystem(dir: &File) -> Result<Option<&'static str>> {

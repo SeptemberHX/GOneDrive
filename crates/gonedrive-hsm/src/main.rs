@@ -39,7 +39,7 @@ use crate::fanotify::Fanotify;
 use crate::file_handle::{MountHandles, ReopenableFile};
 use crate::marks::MarkRegistry;
 #[cfg(test)]
-use crate::marks::{open_authorised, open_root};
+use crate::marks::{open_authorised, open_root, refused_magic};
 use crate::server::{bind_socket, send_to_session, send_to_stream, serve_daemon};
 #[cfg(test)]
 use crate::server::{parallel_map_ordered, read_frame, truncate_mark_error, MARK_ERROR_BYTES};

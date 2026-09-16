@@ -585,3 +585,38 @@ fn one_uid_cannot_take_the_whole_worker_pool() {
     // check, since both sides are constants.
     const _: () = assert!(MAX_WORKERS_PER_UID < WORKERS);
 }
+
+#[test]
+fn ordinary_local_filesystems_are_served() {
+    // A container's /tmp and root filesystem are overlays, and a sync root on
+    // one is a perfectly ordinary setup. Listing overlayfs here once made the
+    // helper refuse every path in a container — and made this suite unable to
+    // run in one. Mounting an overlay needs privileges that also allow FUSE,
+    // which is refused, so the entry bought nearly nothing.
+    const OVERLAYFS: u64 = 0x794C_7630;
+    const TMPFS: u64 = 0x0102_1994;
+    const EXT: u64 = 0xEF53;
+    const BTRFS: u64 = 0x9123_683E;
+
+    for (magic, name) in [
+        (OVERLAYFS, "overlayfs"),
+        (TMPFS, "tmpfs"),
+        (EXT, "ext4"),
+        (BTRFS, "btrfs"),
+    ] {
+        assert!(
+            !refused_magic(magic),
+            "{name} is where people keep files; it must be served"
+        );
+    }
+
+    // The ones the list exists for.
+    const FUSE: u64 = 0x6573_5546;
+    const NFS: u64 = 0x6969;
+    for (magic, name) in [(FUSE, "fuse"), (NFS, "nfs")] {
+        assert!(
+            refused_magic(magic),
+            "{name} lets its server hold a root worker indefinitely"
+        );
+    }
+}

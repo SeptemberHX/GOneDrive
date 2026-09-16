@@ -82,6 +82,7 @@
 - **首次发现**：2026-09-15（第三轮审计）
 - **现象**：两个独立问题。其一，64 个 worker 在所有已连接 uid 之间共享；一个被阻塞的读者最长占用 300 秒，因此同一台机器上的某个用户同时打开足够多的占位文件即可吃光整个池子，其他用户的正常回填全部排在后面。其二，路径来自对端的文件系统，可以包含换行与 ANSI 转义序列，而消息里一律用 `Display` 原样输出——精心构造的文件名可以在 journal 里伪造日志行，或在有人用终端查看时注入转义序列。
 - **修复**：worker 配额按 uid 计，上限为池子的四分之三——单用户几乎不受影响，同时始终为其他人留出下限；超额的事件直接拒绝（与队列已满时的行为一致，读者收到 I/O 错误而不是无限等待）。记账抽成独立的 `WorkerSlots`，不依赖需要 `CAP_SYS_ADMIN` 的 fanotify 组，因此可测。日志方面新增 `shown()`，用调试形式输出路径（带引号并转义控制字符），helper crate 内 36 处 `.display()` 全部改用它。
+- **更正（同日）**：拒绝清单里一并加入的 **overlayfs 是错的，已移除**。容器的 `/tmp` 与根文件系统都是 overlay，于是 helper 拒绝为容器里的任何路径服务，CI 的 11 个测试全部失败；把同步根放在 overlay 上的真实用户同样会被拒。安全收益也几乎没有：挂载 overlay 需要特权或用户命名空间，具备这些条件的人同样能挂 FUSE，而 FUSE 本就在清单里。autofs 保留——只有 root 能配置它，对普通用户零代价。`::ordinary_local_filesystems_are_served` 把这个判断钉住。
 - **回归测试**：`crates/gonedrive-hsm/src/tests.rs::one_uid_cannot_take_the_whole_worker_pool`、`::a_crafted_name_cannot_forge_a_log_line`。
 
 ## SS-011 · 登录的两条分裂脑：并发 StartLogin 与绕过守护进程的 CLI 登录
