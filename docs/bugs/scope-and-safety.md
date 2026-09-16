@@ -142,3 +142,11 @@
 - **CI 里 GTK 测试静默跳过**：无 `DISPLAY` 时 `gtk::init()` 失败即 return，CI 全绿而测试一行没跑。CI 改为 `xvfb-run`，测试在 `CI` 置位时拒绝跳过。
 - **Nautilus 扩展与守护进程不一致**：相对 `sync_root` 会按 Nautilus 自己的工作目录解析，而守护进程直接拒绝非绝对路径；配置还只在构造时读一次。现在相对值退回默认根，并按 config.toml 的 mtime/ino 变化重读。测试：`data/nautilus/tests/test_gonedrive.py::ConfiguredRootsTests`。
 - **打包细节**：`/etc/xdg/autostart` 的副本列入 `conffiles`（用户改过的不再被升级覆盖），该副本的 `StartupNotify` 关掉（`--background` 不映射窗口），`Depends` 补 `librsvg2-common` 与 `dbus-user-session`，`init-system-helpers` 加版本下限。
+
+## SS-017 · 唯一的 GTK 渲染测试断言了一个随 libadwaita 版本变化的 getter
+
+- **首次发现**：2026-09-16（CI 首次真正执行该测试时）
+- **现象**：把 CI 改成 `xvfb-run` 之后，`activity_rows_are_safe_to_refresh_in_realized_lists` 第一次真的跑起来，然后立刻失败：`assertion failed: !subtitle.contains(detail)`。本机全绿。
+- **根因**：测试通过 `ActionRow::subtitle()` 读回自己设进去的字符串来检查转义。libadwaita 1.9（本机）返回设进去的原始 markup，1.7（CI 的 ubuntu:25.04）返回的是 GtkLabel 解析之后的文本——`&lt;` 又变回 `<`，断言的含义整个反了过来。转义本身两边都是对的。
+- **修复**：把 markup 的拼装抽成纯函数 `subtitle_markup(path, event)`，转义这条性质改用不需要显示器的 `graph_supplied_text_is_escaped_before_the_row_renders_it_as_markup` 来测（已验证：去掉 `markup_escape_text` 即 RED）。原测试只保留它名字所说的那件事——行在被 realize、移除、再插入的过程中不产生 GTK critical。
+- **顺带**：CI 补 `dbus-x11` 并用 `dbus-run-session` 包一层。缺会话总线时 GTK 启动会打一条警告，而这个测试工作期间把警告提升为致命——现在是噪音，以后就是陷阱。

@@ -55,6 +55,26 @@ fn visual(kind: &str, detail: &str) -> Visual {
     }
 }
 
+/// The subtitle's Pango markup: a coloured path, then the event line.
+///
+/// Both halves carry text this process did not write — file names and Graph
+/// error bodies, which in practice contain whole HTML documents — and the row
+/// renders them as markup. So the markup is built out of literals here and
+/// every untrusted value is escaped on the way in.
+///
+/// Split out of [`row`] so this can be checked as what it is: a property of a
+/// string. Asserting it through `ActionRow::subtitle()` instead tied the test
+/// to that getter, which returns the markup as set on libadwaita 1.9 and the
+/// label's parsed text on 1.7 — where the escapes are undone again and the
+/// assertion reads exactly backwards.
+fn subtitle_markup(path: &str, event: &str) -> String {
+    format!(
+        "<span foreground=\"#4a90d9\" weight=\"semibold\">{}</span>\n{}",
+        glib::markup_escape_text(path),
+        glib::markup_escape_text(event)
+    )
+}
+
 pub(super) fn row(item: &Activity, root: &Path) -> adw::ActionRow {
     let visual = visual(&item.kind, &item.detail);
     let detail = if visual.consumes_detail {
@@ -73,13 +93,7 @@ pub(super) fn row(item: &Activity, root: &Path) -> adw::ActionRow {
         &item.path
     };
     let target = activity_target(root, &item.path);
-    let subtitle = format!(
-        "<span foreground=\"#4a90d9\" weight=\"semibold\">{}</span>\n{}",
-        glib::markup_escape_text(path),
-        glib::markup_escape_text(&event)
-    );
-    // Build without untrusted strings, then escape every value received from
-    // Graph before enabling markup for the highlighted path.
+    let subtitle = subtitle_markup(path, &event);
     let row = adw::ActionRow::builder()
         .title_lines(1)
         .subtitle_lines(2)
@@ -288,15 +302,45 @@ mod tests {
         }
         glib::log_set_always_fatal(previous_fatal);
 
+        // Reaching here without aborting is the whole point: the row survived
+        // being realized, removed and re-added with warnings and criticals
+        // promoted to fatal. What the subtitle *says* is a property of a
+        // string, checked without a display in the test below — reading it
+        // back through the getter here made this test fail on libadwaita 1.7
+        // and pass on 1.9, for no difference in behaviour.
         assert!(row.uses_markup());
         assert!(row.is_activatable());
         assert!(!row.is_subtitle_selectable());
         assert_eq!(row.title(), "remote-error.html");
-        let subtitle = row.subtitle().expect("activity subtitle");
-        assert!(subtitle.contains("OneDrive/Test/remote-error.html"));
-        assert!(!subtitle.contains(detail));
-        assert!(subtitle.contains("&lt;!DOCTYPE HTML&gt;"));
         window.close();
+    }
+
+    #[test]
+    fn graph_supplied_text_is_escaped_before_the_row_renders_it_as_markup() {
+        // A 411 from Graph arrives as a whole HTML document, and the row
+        // renders its subtitle as Pango markup. Unescaped, the page's own tags
+        // become markup: at best the label refuses to render and shows nothing,
+        // at worst a file name chooses the row's formatting.
+        let detail = "graph error 411: <!DOCTYPE HTML><HTML><HEAD><META></HEAD></HTML>";
+        let markup = subtitle_markup(
+            "OneDrive/Test/remote-error.html",
+            &format!("失败 · {detail}"),
+        );
+
+        assert!(markup.contains("OneDrive/Test/remote-error.html"));
+        assert!(
+            !markup.contains(detail),
+            "the raw document must not survive"
+        );
+        assert!(markup.contains("&lt;!DOCTYPE HTML&gt;"));
+        // The one span this function writes itself is still real markup.
+        assert!(markup.starts_with("<span foreground=\"#4a90d9\" weight=\"semibold\">"));
+        assert_eq!(markup.matches("<span").count(), 1);
+
+        // An ampersand in a file name is the everyday case, and it is the one
+        // that silently blanks a Pango label when it is left alone.
+        let ampersand = subtitle_markup("OneDrive/R&D/plan.md", "完成");
+        assert!(ampersand.contains("OneDrive/R&amp;D/plan.md"));
     }
 
     #[test]
