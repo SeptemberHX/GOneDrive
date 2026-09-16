@@ -415,3 +415,49 @@ async fn read_chunk_reads_the_requested_window() {
     let chunk = read_chunk(&mut file, 1000, 200).await.unwrap();
     assert_eq!(&chunk[..], &data[1000..1200]);
 }
+
+#[tokio::test]
+async fn a_scheduling_slice_ending_leaves_the_partial_resumable() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // The daemon downloads in five-second slices. Cancellation there says
+    // "your turn is over", not "this transfer is broken": discarding the
+    // prefix made every download too slow to finish inside one slice restart
+    // from zero for ever.
+    let server = MockServer::start().await;
+    let graph = GraphClient::new(
+        reqwest::Client::new(),
+        crate::TokenSource::Static("t".into()),
+    )
+    .with_base_url(server.uri());
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/F1/content"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(80))
+                .set_body_bytes(b"remote version"),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("big.bin");
+
+    // Refuse to continue the moment the first bytes are reported, the way an
+    // expired slice deadline does.
+    let result = download_to_file(&graph, "F1", &dest, None, None, |_, _| false).await;
+
+    assert!(
+        matches!(result, Err(Error::Cancelled)),
+        "unexpected download result: {result:?}"
+    );
+    assert!(
+        !dest.exists(),
+        "nothing is published for a partial transfer"
+    );
+    assert!(
+        partial_path(&dest).exists(),
+        "the bytes already fetched must survive the slice"
+    );
+}

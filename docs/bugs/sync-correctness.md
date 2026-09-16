@@ -105,3 +105,11 @@
 - **根因**：`remote.rs` 刷新占位符时改写磁盘 size/mtime 但不写 `local_*`；tombstone 路径不区分占位符，`local_is_modified` 因尺寸不等返回 true → `KeepLocalAndReupload`。从 Download 分支直接创建的占位符也从不记录 stat。
 - **修复**：tombstone 路径与 resync 扫尾对"自有且仍为 Dehydrated 的占位符"一律删除；刷新占位符时同步更新记录的本地 stat。
 - **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_refreshed_placeholder_is_removed_by_a_later_tombstone_not_kept_as_edited`（已验证：无修复时 RED）。
+
+## SC-014 · 上传期间的新内容被同一条队列行吞掉（SC-010 修复未对已跟踪文件生效）
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：SC-010 的修复对已跟踪的文件不起作用——上传过程中的再次保存不会被重新排队，新内容要等到下一次恰好覆盖该目录的扫描才被发现。
+- **根因**：`pending_ops.dedup_key` 为 `IFNULL(item_id, local_path)`。在 `run_upload` 内用同一 `item_id` 调 `enqueue_conditional` 命中唯一索引，`ON CONFLICT DO UPDATE` 改写的正是**当前正在执行的那一行**；`drain_queue` 随后按 `op.id` `complete_op` 把它删掉。
+- **修复**：重新排队前先 `complete_op(op.id)` 退休当前行，新行获得新 id，后续的 `complete_op` 成为无操作。
+- **回归测试**：待补（需要在队列层驱动一次"上传中编辑"，现有测试只覆盖 transfer 层）。

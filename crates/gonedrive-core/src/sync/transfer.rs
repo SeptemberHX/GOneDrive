@@ -396,7 +396,12 @@ async fn download_to_file_limited_inner(
         // Keep the partial so the next attempt resumes from here — but only for
         // a failure a retry can recover from. A permanent error discards it, so
         // a genuinely broken transfer leaves no mis-resumable litter.
-        if !e.is_transient() {
+        //
+        // Cancellation is not a verdict on the transfer: the scheduler's slice
+        // ended, or the user released the file. Discarding the prefix there
+        // made every download that outlasts one five-second slice restart from
+        // zero, for ever, which is exactly what resuming exists to prevent.
+        if !e.is_transient() && !matches!(e, Error::Cancelled) {
             remove_file(rooted, &partial).await;
         }
         return Err(e);

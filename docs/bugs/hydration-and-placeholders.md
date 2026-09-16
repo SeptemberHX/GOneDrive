@@ -38,3 +38,11 @@
 - **根因**：守护进程 `stage_for` 在 `begin_hydration` 之后出错只回复 `Hydrated{ok:false}`，指望 helper 的 `Filled` 事件触发 `fail_hydration`；但 helper（`worker.rs`）对任何 `Deny` 都回 `Filled{ok:false, full:false}`，守护进程把 `full:false` 当作"浏览拒绝，无需清理"。双方互相依赖，无人兜底。`set_hsm(None)` 清空进行中表时同样不回退 DB 状态。
 - **修复**：`stage_for` 出错时自行 `fail_hydration`（释放 InFlight 与路径锁，DB 回到 `Dehydrated`，发 `HydrationFinished{ok:false}`）；helper 丢失时对所有进行中的回填做同样处理。
 - **回归测试**：待补（需要可注入失败的引擎桩）。
+
+## HP-005 · 覆盖式下载中断后，重启把旧版本提交为新版本
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：云端更新了一个已下载的文件，下载进行到一半守护进程被杀；重启后该文件显示"已同步"，内容却仍是旧版本，且不会再被拉取，直到该项在云端再次变化。
+- **根因**：覆盖已 hydrate 文件的下载先把记录置为 `Hydrating`，新字节写在临时文件里，目标文件保持旧内容与旧 xattr（`state=hydrated`）。`policy.rs::repair_states` 见到 xattr 为 hydrated 就 `commit_hydration`，不比对文件的内容哈希与记录中的远端哈希，并顺带删除待处理的 download 行。用户在此期间的本地编辑同样会被记成"已同步"而永不上传。
+- **修复**：`repair_states` 比对记录的 quickXor 与文件 xattr 中的内容哈希；不一致说明磁盘上的是被取代的版本，改置 `DirtyRemote` 让下载重新排队，而不是提交。
+- **回归测试**：待补。

@@ -808,6 +808,27 @@ impl Engine {
                 Ok(file) if Placeholder::state_file(&file) == PlaceholderState::Hydrated => {
                     let local = LocalStat::from_metadata(&file.metadata()?);
                     let content_hash = Placeholder::content_hash_file(&file);
+                    // A download that replaces an already-hydrated file leaves
+                    // the old content in place while it writes its temporary
+                    // file. Interrupted there, the inode still says "hydrated"
+                    // — of the previous version. Committing it would mark the
+                    // superseded bytes as the new version and drop the queued
+                    // download, stranding the cloud change until the item
+                    // happens to change again.
+                    let stale_content = match (&record.quickxor, &content_hash) {
+                        (Some(expected), Some(actual)) => expected != actual,
+                        _ => false,
+                    };
+                    if stale_content {
+                        self.store
+                            .set_item_state(&record.id, ItemState::DirtyRemote)?;
+                        repaired += 1;
+                        tracing::info!(
+                            path = %path.display(),
+                            "kept a superseded hydrated file queued for download"
+                        );
+                        continue;
+                    }
                     self.store.commit_hydration(
                         &account.id,
                         &record.id,

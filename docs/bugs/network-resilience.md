@@ -52,3 +52,11 @@
 - **根因**：`crates/gonedrive-core/src/auth.rs::post_token` 把任何非 2xx 都映射为 `Error::AuthRequired`；`app.rs::core_error_status` 据此置 `signed_out`。
 - **修复**：新增 `Error::TokenEndpoint { status, message }`。只有结构化的 4xx（`invalid_grant` 等）才判定需登录；5xx/429/408 与无法解析的响应体为暂时性错误，UI 显示"离线"而非"已登出"。
 - **回归测试**：`crates/gonedrive-core/src/auth.rs::a_dead_grant_requires_a_new_login`、`::a_token_endpoint_outage_is_not_a_sign_out`、`error.rs::a_token_endpoint_outage_is_transient_but_a_dead_grant_is_not`。
+
+## NR-007 · 调度切片到期删除续传前缀 → 超过 5 秒的下载永远从零重来
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：队列下载（固定文件、全量同步模式）中，任何在一个传输切片内下载不完的文件反复从 0 开始，永不完成；弱网大文件表现为"一直在下载、进度反复归零"。
+- **根因**：`crates/gonedrive-core/src/sync/transfer.rs` 在失败时只对 `is_transient()` 的错误保留 `.gonedrive-partial`；`Error::Cancelled` 不是瞬时错误，于是被当作"永久失败"删除前缀。而守护进程的传输切片 `TRANSFER_SLICE = 5s` 到期时，进度回调返回 false，正是产生 `Cancelled` 的路径（`coordinator.rs`、`queue.rs::run_download`）。按需回填路径不设 deadline，因此不受影响。
+- **修复**：取消不是对传输的判决。`Cancelled` 与瞬时错误一样保留续传前缀。
+- **回归测试**：`crates/gonedrive-core/src/sync/transfer/tests.rs::a_scheduling_slice_ending_leaves_the_partial_resumable`（已验证：无修复时 RED）。

@@ -589,6 +589,11 @@ impl Engine {
         }
         if source_changed {
             tracing::info!(path = %path.display(), "file changed during upload; queuing the newer content");
+            // Retire this operation first. A pending row is keyed by
+            // (account, kind, item id), so enqueuing the follow-up while this
+            // row still exists updates *this* row — which the caller then
+            // deletes on success, silently dropping the newer content.
+            self.store.complete_op(op.id)?;
             self.store.enqueue_conditional(
                 &self.account_id,
                 OpKind::Upload,
