@@ -12,6 +12,14 @@ use crate::login::{open_in_browser, Login};
 use super::load_config;
 
 pub(crate) async fn login() -> Result<()> {
+    // Signing in beside a running daemon is the split brain this module warns
+    // about: two processes would hold credentials for one account and take
+    // turns rotating — and so invalidating — the same refresh token. The
+    // daemon opens the browser itself and reports the outcome as a signal.
+    if let Some(proxy) = super::running_daemon().await {
+        return login_via_daemon(&proxy).await;
+    }
+
     let config = load_config()?;
     gonedrive_core::config::ensure_dirs()?;
     let store = Store::open(&gonedrive_core::config::state_db_path())?;
@@ -100,6 +108,45 @@ pub(crate) fn status() -> Result<()> {
         gonedrive_core::config::config_file().display()
     );
     Ok(())
+}
+
+async fn login_via_daemon(proxy: &gonedrive_ipc::DaemonProxy<'static>) -> Result<()> {
+    use futures_util::StreamExt;
+
+    // Subscribed before the request, so a sign-in that completes quickly
+    // cannot finish in the gap between the method returning and the listener
+    // starting.
+    let mut completed = proxy.receive_login_completed().await?;
+    let mut failed = proxy.receive_login_failed().await?;
+
+    let url = proxy.start_login().await?;
+    println!("Opening your browser to sign in.");
+    println!("If nothing opens, visit this URL:\n\n  {url}\n");
+
+    tokio::select! {
+        signal = completed.next() => {
+            let account_id = signal
+                .ok_or_else(|| anyhow::anyhow!("the daemon closed the sign-in stream"))?
+                .args()?
+                .account_id
+                .to_string();
+            let store = Store::open(&gonedrive_core::config::state_db_path())?;
+            let who = store
+                .account(&account_id)?
+                .and_then(|account| account.address.or(account.display_name))
+                .unwrap_or(account_id);
+            println!("Signed in as {who}.");
+            Ok(())
+        }
+        signal = failed.next() => {
+            let message = signal
+                .ok_or_else(|| anyhow::anyhow!("the daemon closed the sign-in stream"))?
+                .args()?
+                .message
+                .to_string();
+            anyhow::bail!("the daemon reports: {message}")
+        }
+    }
 }
 
 pub(crate) async fn logout(account_id: Option<String>) -> Result<()> {

@@ -358,6 +358,11 @@ pub struct App {
     /// prune the tree and publish a configuration derived from a snapshot the
     /// other has already replaced.
     pub(crate) mode_switch: Mutex<()>,
+    /// Set while a sign-in is waiting for the browser. A second one finishes
+    /// against the same account, and attaching an account that is already
+    /// active is refused — so the user was shown a failure for a sign-in that
+    /// had in fact worked.
+    pub(crate) login_in_flight: Arc<AtomicBool>,
 
     /// The privileged helper, when files-on-demand is available. Without it a
     /// placeholder is just a file full of zeroes that nothing will ever fill.
@@ -430,6 +435,7 @@ impl App {
             hydration_locks: PathLocks::default(),
             download_gate: Arc::new(Mutex::new(())),
             mode_switch: Mutex::new(()),
+            login_in_flight: Arc::new(AtomicBool::new(false)),
             hsm: RwLock::new(None),
             pending_placeholder_reports: Mutex::new(PendingPlaceholderReports::default()),
             open_intents,

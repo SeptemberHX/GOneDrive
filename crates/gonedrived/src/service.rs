@@ -141,6 +141,19 @@ impl DaemonService {
     /// the caller is not blocked on a D-Bus method for however long someone
     /// takes to type a password. Completion arrives as a signal.
     async fn start_login(&self) -> zbus::fdo::Result<String> {
+        // One at a time. A second sign-in completes against the same account,
+        // and attaching an account that is already active is refused, so the
+        // user was shown a failure for a sign-in that had in fact worked.
+        if self
+            .app
+            .login_in_flight
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "a sign-in is already waiting for the browser".into(),
+            ));
+        }
+        let guard = LoginGuard(self.app.login_in_flight.clone());
         let login = Login::start(&self.app.config())
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -148,6 +161,8 @@ impl DaemonService {
 
         let app = self.app.clone();
         tokio::spawn(async move {
+            // Held until the flow ends, whichever way it ends.
+            let _guard = guard;
             let result = login
                 .complete(
                     app.http.clone(),
@@ -475,6 +490,15 @@ pub async fn serve(app: Arc<App>) -> Result<zbus::Connection> {
     });
 
     Ok(connection)
+}
+
+/// Clears the sign-in flag however the flow ends, including an early return.
+struct LoginGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for LoginGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[cfg(test)]

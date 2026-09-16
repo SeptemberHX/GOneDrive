@@ -83,3 +83,11 @@
 - **现象**：两个独立问题。其一，64 个 worker 在所有已连接 uid 之间共享；一个被阻塞的读者最长占用 300 秒，因此同一台机器上的某个用户同时打开足够多的占位文件即可吃光整个池子，其他用户的正常回填全部排在后面。其二，路径来自对端的文件系统，可以包含换行与 ANSI 转义序列，而消息里一律用 `Display` 原样输出——精心构造的文件名可以在 journal 里伪造日志行，或在有人用终端查看时注入转义序列。
 - **修复**：worker 配额按 uid 计，上限为池子的四分之三——单用户几乎不受影响，同时始终为其他人留出下限；超额的事件直接拒绝（与队列已满时的行为一致，读者收到 I/O 错误而不是无限等待）。记账抽成独立的 `WorkerSlots`，不依赖需要 `CAP_SYS_ADMIN` 的 fanotify 组，因此可测。日志方面新增 `shown()`，用调试形式输出路径（带引号并转义控制字符），helper crate 内 36 处 `.display()` 全部改用它。
 - **回归测试**：`crates/gonedrive-hsm/src/tests.rs::one_uid_cannot_take_the_whole_worker_pool`、`::a_crafted_name_cannot_forge_a_log_line`。
+
+## SS-011 · 登录的两条分裂脑：并发 StartLogin 与绕过守护进程的 CLI 登录
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：其一，连续点两次"登录"，第二次完成时界面收到 `LoginFailed`——而那次登录其实是成功的。其二，守护进程在跑的时候执行 `gonedrived login`，两个进程各自持有同一账户的凭据并轮流轮换 refresh token，微软每次刷新都会轮换，于是两边互相作废直到有一方被登出。
+- **根因**：`service.rs::start_login` 没有任何并发保护，第二次登录完成后 `attach_account` 以"账户已激活"失败，而这个错误被当作登录失败上报。`commands/account.rs::login` 则完全在进程内完成整个流程，与 `commands.rs` 顶部关于分裂脑的说明相矛盾（`logout` 已于 SS-008 改走 D-Bus，`login` 当时没有一起改）。
+- **修复**：新增 `App::login_in_flight` 标志，`start_login` 发现已有登录在等浏览器时直接拒绝；标志由 `LoginGuard` 在流程结束的任意路径上清除（包括 `Login::start` 自身失败的提前返回）。CLI `login` 在守护进程运行时改为调用 D-Bus `StartLogin` 并等待 `LoginCompleted`/`LoginFailed` 信号——订阅先于请求，避免快速完成的登录落在监听之前。
+- **回归测试**：无。两条都需要一个真实的 `App`（其构造会连接 Secret Service）和一条会话总线；与 HP-004 同因，见该条目的说明。
