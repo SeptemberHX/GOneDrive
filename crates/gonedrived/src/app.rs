@@ -703,6 +703,12 @@ impl App {
             let mut active_phases = 0u64;
             let mut cycle_failed = false;
             loop {
+                // Only the arm that reads the durable queue may publish a
+                // count for it. Every other event carries whatever it was
+                // holding from an earlier phase, which is how a StatusChanged
+                // signal came to disagree with the Status() the panel reads
+                // moments later.
+                let mut pending_is_fresh = false;
                 match rx.recv().await {
                     Ok(event) => {
                         match event {
@@ -929,6 +935,7 @@ impl App {
                                     current.pending = summary.still_queued;
                                     current.pending_items.clear();
                                 }
+                                pending_is_fresh = true;
                                 if active_phases == 0 {
                                     current.current_item.clear();
                                     current.transferred = 0;
@@ -950,6 +957,12 @@ impl App {
                                 if current.last_error.is_empty() {
                                     current.last_error.clone_from(&shared.last_error);
                                 }
+                            }
+                            if !pending_is_fresh {
+                                // Carry whoever last read the queue, rather
+                                // than replaying this task's older copy.
+                                current.pending = shared.pending;
+                                current.pending_items.clone_from(&shared.pending_items);
                             }
                             *shared = current.clone();
                         }
