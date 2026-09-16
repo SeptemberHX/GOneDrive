@@ -952,3 +952,51 @@ async fn a_same_batch_delete_and_recreate_under_one_name_is_not_a_conflict() {
         .collect();
     assert!(stray.is_empty(), "no conflict copy may appear: {stray:?}");
 }
+
+#[tokio::test]
+async fn a_same_batch_folder_delete_and_recreate_does_not_adopt_the_old_contents() {
+    // Deleting a folder and recreating one with the same name lands both in
+    // one batch. The old folder's tombstone must not jump ahead of its
+    // children's: applied early it finds the directory non-empty, detaches
+    // the subtree, and the new folder inherits the old files as unrecorded
+    // content that the next scan would upload.
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            folder("D1", ROOT, "docs"),
+            file("F1", "D1", "a.txt", "c1", 5, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"hello").await;
+    h.sync().await;
+    assert_eq!(h.read("docs/a.txt"), "hello");
+
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![
+            folder("D2", ROOT, "docs"),
+            file("F2", "D2", "b.txt", "c2", 5, "2026-08-21T10:00:00Z"),
+            tombstone("F1", "D1"),
+            tombstone("D1", ROOT),
+        ],
+        "v2",
+    )
+    .await;
+    h.mock_download("F2", b"world").await;
+    let summary = h.sync().await;
+
+    assert_eq!(summary.conflicts, 0);
+    assert!(!h.path("docs/a.txt").exists(), "the deleted file must not survive");
+    assert_eq!(h.read("docs/b.txt"), "world");
+    assert!(h.store.item("D1").unwrap().is_none());
+    assert!(h.store.item("F1").unwrap().is_none());
+    assert!(h.store.item("D2").unwrap().is_some());
+    assert!(
+        h.store.due_outbound_ops(ACCOUNT, 10).unwrap().is_empty(),
+        "nothing local changed, so nothing may be uploaded"
+    );
+}

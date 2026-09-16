@@ -495,6 +495,16 @@ impl Engine {
             let Some(known) = self.store.item(&item.id)? else {
                 continue;
             };
+            // Only files jump the queue. A folder's tombstone must follow its
+            // children's (deepest-first, below): applied early it finds the
+            // directory non-empty, detaches the whole subtree, and the new
+            // same-named folder inherits the old files as unrecorded content
+            // that the next scan uploads. For a folder the ordinary path is
+            // already right — the new folder's upsert hits the unique name
+            // index, is deferred, and replays once the old tree is gone.
+            if known.is_folder {
+                continue;
+            }
             let Some(parent) = known.parent_id.as_deref() else {
                 continue;
             };

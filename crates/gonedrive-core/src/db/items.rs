@@ -108,7 +108,10 @@ impl Store {
             Ok(conn
                 .query_row(
                     &format!(
-                        "{ITEM_COLUMNS} WHERE account_id = ?1 AND parent_id = ?2 AND name_folded = ?3"
+                        // Written against the expression the unique index is
+                        // built on, so a large directory is one index probe
+                        // rather than a scan of all its children.
+                        "{ITEM_COLUMNS} WHERE account_id = ?1 AND IFNULL(parent_id, '') = ?2 AND name_folded = ?3"
                     ),
                     params![account_id, parent_id, fold_case(name)],
                     row_to_item,
@@ -943,14 +946,21 @@ impl Store {
     }
 }
 
+/// Every write stamps the account's current resync generation. A full
+/// re-enumeration can take minutes; an item uploaded or created meanwhile is
+/// absent from the enumeration's snapshot, and without this stamp the sweep at
+/// the end would read it as "no longer on the remote" and remove the local
+/// file the user just added.
 fn upsert_item_on(conn: &Connection, item: &ItemRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO items
            (id, account_id, parent_id, name, name_folded, is_folder, child_count, size, etag, ctag,
             quickxor, sha1, remote_mtime, local_mtime, local_size, local_ino,
-            state, pin_state, updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+            state, pin_state, updated_at, seen_gen)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,
+                 COALESCE((SELECT resync_gen FROM accounts WHERE id = ?2), 0))
          ON CONFLICT(id) DO UPDATE SET
+           seen_gen = MAX(items.seen_gen, excluded.seen_gen),
            parent_id = excluded.parent_id,
            name = excluded.name,
            name_folded = excluded.name_folded,

@@ -810,3 +810,21 @@ fn a_resync_sweep_visits_children_before_their_parents() {
         .collect();
     assert_eq!(missed, ["f", "C", "B", "g", "A"]);
 }
+
+#[test]
+fn an_item_written_during_a_resync_is_not_swept_by_it() {
+    // The enumeration snapshot predates the upload; the record must still
+    // survive the sweep or the user's freshly uploaded file is deleted.
+    let (store, _account) = store_with_account();
+    store.upsert_item(&file("old", "ROOT", "old.txt")).unwrap();
+    let generation = store.begin_resync("acct").unwrap();
+    store.upsert_item(&file("new", "ROOT", "new.txt")).unwrap();
+
+    let missed: Vec<String> = store
+        .items_missed_by_resync("acct", generation)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    assert_eq!(missed, ["old"]);
+}

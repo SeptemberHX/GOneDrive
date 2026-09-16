@@ -125,7 +125,13 @@ impl Error {
             // A 429 that outlived the in-call retry budget is still just
             // throttling: the service asked for patience, not for the transfer
             // to be abandoned. 408 is the server giving up on a slow link.
-            Error::Graph { status, .. } => *status >= 500 || *status == 429 || *status == 408,
+            // 507 is a full quota and 501 an unsupported request: retrying
+            // neither can succeed, and backing off forever hides them.
+            Error::Graph { status, .. } => {
+                (*status >= 500 && *status != 501 && *status != 507)
+                    || *status == 429
+                    || *status == 408
+            }
             Error::TokenEndpoint { status, .. } => {
                 *status >= 500 || *status == 429 || *status == 408
             }
@@ -180,6 +186,18 @@ mod tests {
             message: "no".into(),
         };
         assert!(!refused.is_transient());
+        let quota_full = Error::Graph {
+            status: 507,
+            code: "insufficientStorage".into(),
+            message: "quota".into(),
+        };
+        assert!(!quota_full.is_transient());
+        let outage = Error::Graph {
+            status: 503,
+            code: "serviceNotAvailable".into(),
+            message: "later".into(),
+        };
+        assert!(outage.is_transient());
     }
 
     #[test]

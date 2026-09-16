@@ -417,12 +417,23 @@ impl Store {
         })
     }
 
-    /// Queued operations whose retry delay has elapsed. Zero with a non-zero
+    /// Queued operations the scheduler would run now. Zero with a non-zero
     /// [`Self::pending_count`] means everything left is waiting out a backoff.
+    ///
+    /// Uses the same rule as [`Self::due_outbound_ops`]: an outbound operation
+    /// whose item also has a download row is not runnable, whatever its own
+    /// timer says. Counting it would report work the scheduler never picks,
+    /// and an explicit sync waiting for that count to reach zero would hang.
     pub fn due_pending_count(&self, account_id: &str) -> Result<u64> {
         self.with_conn(|conn| {
             Ok(conn.query_row(
-                "SELECT COUNT(*) FROM pending_ops WHERE account_id = ?1 AND next_attempt_at <= ?2",
+                "SELECT COUNT(*) FROM pending_ops
+                  WHERE account_id = ?1 AND next_attempt_at <= ?2
+                    AND (kind = 'download' OR NOT EXISTS (
+                        SELECT 1 FROM pending_ops AS download
+                         WHERE download.account_id = pending_ops.account_id
+                           AND download.item_id = pending_ops.item_id
+                           AND download.kind = 'download'))",
                 params![account_id, now()],
                 |r| r.get::<_, i64>(0),
             )? as u64)
