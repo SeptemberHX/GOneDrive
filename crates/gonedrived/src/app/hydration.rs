@@ -263,7 +263,7 @@ impl App {
         }
     }
 
-    async fn remove_staged_file(&self, staged: &std::path::Path) {
+    pub(super) async fn remove_staged_file(&self, staged: &std::path::Path) {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         for engine in engines {
             match engine.remove_staging_file(staged) {

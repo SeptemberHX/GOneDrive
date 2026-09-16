@@ -88,9 +88,14 @@ impl App {
         };
         match mode {
             SyncMode::OnDemand => {
-                switch.conversion = Some(self.convert_to_lazy().await?);
+                // Publish first: pruning ends by registering the directory
+                // marks that make a partial folder repopulate, and the
+                // inventory behind that returns nothing while the live
+                // configuration still says files-on-demand is off.
                 config.on_demand = true;
                 config.download_new = DownloadPolicy::Never;
+                self.replace_config(config.clone());
+                switch.conversion = Some(self.convert_to_lazy().await?);
             }
             SyncMode::Full => {
                 config.on_demand = false;

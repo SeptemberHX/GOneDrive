@@ -95,9 +95,7 @@ cat > "$STAGE/DEBIAN/postinst" <<'POSTINST'
 set -e
 if [ "$1" = configure ]; then
     systemctl daemon-reload || true
-    # The privileged helper (system service); restart so an upgrade takes.
     systemctl enable gonedrive-hsm.service || true
-    systemctl restart gonedrive-hsm.service || true
 
     # A development build used to install a user-unit drop-in that pointed at
     # gonedrived-codex. Drop-ins override the packaged unit, so migrate only
@@ -143,8 +141,17 @@ if [ "$1" = configure ]; then
     systemctl --global enable gonedrived.service || true
     # Reload and restart every active user instance. A global enable alone does
     # not replace an already-running daemon during an upgrade.
+    #
+    # Deliberately before the helper: a new daemon talks to an old helper
+    # perfectly well (it simply runs unconfined), while an old daemon talks to
+    # a new one not at all — it never declares the sync root the new helper
+    # requires, so every placeholder mark is refused and the failure path locks
+    # the whole tree to mode 000 until the daemon catches up.
     deb-systemd-invoke --user daemon-reload || true
     deb-systemd-invoke --user restart gonedrived.service || true
+
+    # Now the helper. The daemon reconnects on its own and declares its root.
+    systemctl restart gonedrive-hsm.service || true
     gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
     update-desktop-database /usr/share/applications 2>/dev/null || true
 fi

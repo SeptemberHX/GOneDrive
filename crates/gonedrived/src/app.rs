@@ -42,6 +42,14 @@ const PARTIAL_HYDRATION_CEILING: u64 = 256 * 1024;
 /// slow network token refresh, short enough that a locked keyring waiting on an
 /// unanswered unlock prompt cannot hang the daemon.
 const CREDENTIAL_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the keyring alone may take before we call it locked.
+///
+/// Split from the budget above so the two failures stay distinguishable: a
+/// collection waiting on an unlock prompt nobody answers must be reported as
+/// locked, because only an explicit wake retries that. Reported as a transient
+/// instead, the ordinary poll timer would put the prompt back on screen every
+/// few minutes.
+const KEYRING_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const KEYRING_LOCKED_MESSAGE: &str =
     "系统钥匙环已锁定。请先解锁登录钥匙环，然后点击“立即同步”重试；已保存的登录凭据仍然保留。";
 
@@ -584,16 +592,11 @@ impl App {
             anyhow::bail!("account {other} is already active");
         }
         // Signing in again as the same account is a replacement, not a second
-        // engine. Inserting over the old one used to leave it running: two
-        // engines scanning one root, and two authenticators taking turns
-        // rotating — and so invalidating — the same refresh token.
-        if self.engines.read().await.contains_key(account_id) {
-            tracing::info!(
-                account_id,
-                "replacing the engine for a re-authenticated account"
-            );
-            self.detach_account(account_id).await;
-        }
+        // engine. The old one is retired below, once the replacement exists:
+        // retiring it first left the account with no engine at all whenever
+        // building the new one failed — a slow keyring or a flaky link then
+        // stopped syncing until the next poll rescued it.
+        let replacing = self.engines.read().await.contains_key(account_id);
 
         // Reading the refresh token can block on the Secret Service: a locked
         // keyring makes it wait on an unlock prompt that may never be answered.
@@ -603,6 +606,26 @@ impl App {
         // it as easily as a locked keyring; report it as the transient it is
         // (the account re-attaches on the ordinary remote timer) rather than
         // as a keyring lock, which only an explicit wake retries.
+        // Probe the keyring on its own budget first. Once it answers, the
+        // remaining time covers the network half, and a stall there is a
+        // transient the ordinary timer may retry.
+        match tokio::time::timeout(KEYRING_PROBE_TIMEOUT, self.tokens.load(account_id)).await {
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => {
+                return Err(Error::AuthRequired(format!(
+                    "no stored credentials for account {account_id}"
+                ))
+                .into())
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_elapsed) => {
+                return Err(Error::KeyringLocked(
+                    "the login keyring did not answer; unlock it and sync again".into(),
+                )
+                .into())
+            }
+        }
+
         let auth = match tokio::time::timeout(
             CREDENTIAL_LOAD_TIMEOUT,
             Authenticator::restore(
@@ -641,6 +664,13 @@ impl App {
             Err(e) => tracing::warn!(error = %e, "could not repair states"),
         }
 
+        if replacing {
+            tracing::info!(
+                account_id,
+                "replacing the engine for a re-authenticated account"
+            );
+            self.detach_account(account_id).await;
+        }
         self.spawn_event_forwarder(&engine);
         self.engines
             .write()
@@ -661,31 +691,48 @@ impl App {
     /// failure.
     pub async fn detach_account(&self, account_id: &str) {
         let engine = self.engines.write().await.remove(account_id);
+        // Unwind before stopping: putting the rows back to `Dehydrated` needs
+        // the engine, and a stopped one refuses every operation. Leaving them
+        // at `Hydrating` would make the local scan skip those files — their
+        // edits and deletions included — until the next restart.
+        self.forget_hydrations_for(account_id, engine.as_deref())
+            .await;
         if let Some(engine) = engine {
             engine.stop();
         }
-        // Nothing can arrive for it now; drop whatever it had in flight so a
-        // later account does not inherit its progress windows or staging.
-        self.forget_hydrations_for(account_id).await;
     }
 
     /// Drop in-flight hydration bookkeeping for a retired account.
-    async fn forget_hydrations_for(&self, account_id: &str) {
+    async fn forget_hydrations_for(&self, account_id: &str, engine: Option<&Engine>) {
         let Ok(Some(account)) = self.store.account(account_id) else {
             // The rows may already be gone; without a root we cannot tell which
             // entries were this account's, and the helper will unwind them.
             return;
         };
         let root = account.root_local_path;
-        let mut hydrations = self.hydrations.write().await;
-        let doomed: Vec<_> = hydrations
-            .keys()
-            .filter(|path| path.starts_with(&root))
-            .cloned()
-            .collect();
-        for path in doomed {
-            if let Some(entry) = hydrations.remove(&path) {
-                entry.cancel.store(true, Ordering::Relaxed);
+        let mut abandoned = Vec::new();
+        {
+            let mut hydrations = self.hydrations.write().await;
+            let doomed: Vec<_> = hydrations
+                .keys()
+                .filter(|path| path.starts_with(&root))
+                .cloned()
+                .collect();
+            for path in doomed {
+                if let Some(entry) = hydrations.remove(&path) {
+                    entry.cancel.store(true, Ordering::Relaxed);
+                    abandoned.push((path, entry.staged.clone()));
+                }
+            }
+        }
+        for (path, staged) in abandoned {
+            if let Some(staged) = staged {
+                self.remove_staged_file(&staged).await;
+            }
+            // No helper callback will arrive for these, so nothing else will
+            // put the row back.
+            if let Some(engine) = engine {
+                let _ = engine.fail_hydration(&path);
             }
         }
     }

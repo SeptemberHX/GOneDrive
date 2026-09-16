@@ -110,6 +110,10 @@ async fn sync_via_daemon(proxy: &gonedrive_ipc::DaemonProxy<'static>) -> Result<
     // in the gap between the method return and signal registration.
     let mut completions = proxy.receive_sync_request_completed().await?;
     let generation = proxy.request_sync().await?;
+    // Operations the daemon reported as still queued when it declared the pass
+    // complete: each is waiting out a retry timer, so an idle daemon holding
+    // exactly that backlog has nothing more to do now.
+    let deferred;
 
     loop {
         let Some(signal) = completions.next().await else {
@@ -126,6 +130,7 @@ async fn sync_via_daemon(proxy: &gonedrive_ipc::DaemonProxy<'static>) -> Result<
             "Remote changes checked ({} change(s), {} operation(s) queued).",
             args.result.changes, args.result.queued
         );
+        deferred = args.result.queued;
         break;
     }
 
@@ -145,6 +150,13 @@ async fn sync_via_daemon(proxy: &gonedrive_ipc::DaemonProxy<'static>) -> Result<
         match status.state.as_str() {
             "idle" if status.pending == 0 => {
                 println!("Done.");
+                return Ok(());
+            }
+            "idle" if deferred > 0 && status.pending <= deferred => {
+                println!(
+                    "Done. {} operation(s) are waiting for a retry timer (see `gonedrived status`).",
+                    status.pending
+                );
                 return Ok(());
             }
             "keyring_locked" | "signed_out" | "error" => {

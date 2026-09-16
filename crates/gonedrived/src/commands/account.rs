@@ -123,7 +123,19 @@ async fn login_via_daemon(proxy: &gonedrive_ipc::DaemonProxy<'static>) -> Result
     println!("Opening your browser to sign in.");
     println!("If nothing opens, visit this URL:\n\n  {url}\n");
 
+    // The browser round trip is bounded by the daemon's own login timeout;
+    // allow for it and a little more. Without this the command waits for ever
+    // if the daemon exits mid-sign-in — the signal stream belongs to our own
+    // bus connection and would never end.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(360);
+
     tokio::select! {
+        _ = tokio::time::sleep(WAIT) => {
+            anyhow::bail!(
+                "the daemon did not report the sign-in within {WAIT:?}; \
+                 check `gonedrived status`"
+            )
+        }
         signal = completed.next() => {
             let account_id = signal
                 .ok_or_else(|| anyhow::anyhow!("the daemon closed the sign-in stream"))?
