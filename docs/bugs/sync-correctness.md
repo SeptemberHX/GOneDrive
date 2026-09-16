@@ -56,8 +56,8 @@
 - **首次发现**：2026-08-28（探索发现）
 - **现象**：已知项上传用 `conflictBehavior=replace` 且不带 eTag，拉取 delta 与上传之间他端所做的改动被无声覆盖（丢失更新）。
 - **根因**：`graph.rs` 上传不带 `If-Match`。
-- **修复**：Phase 1.5——带 `If-Match: <etag>`，服务端 412 转冲突副本。（待做，跨"数据丢失"与"正确性"，主条目将并入 data-loss.md）
-- **回归测试**：待补（Phase 1.5）。
+- **修复**：已完成。主条目见 [`data-loss.md`](data-loss.md) 的 **DL-005**——`upload_simple`/`create_upload_session` 带 `If-Match: <etag>`，412 转冲突副本。此处仅作交叉索引。
+- **回归测试**：见 DL-005（`::an_upload_that_would_overwrite_a_newer_remote_becomes_a_conflict`）。
 
 ## SC-008 · resync 扫尾按错误顺序删除 → 远端已删的嵌套目录被"复活"
 
@@ -112,7 +112,7 @@
 - **现象**：SC-010 的修复对已跟踪的文件不起作用——上传过程中的再次保存不会被重新排队，新内容要等到下一次恰好覆盖该目录的扫描才被发现。
 - **根因**：`pending_ops.dedup_key` 为 `IFNULL(item_id, local_path)`。在 `run_upload` 内用同一 `item_id` 调 `enqueue_conditional` 命中唯一索引，`ON CONFLICT DO UPDATE` 改写的正是**当前正在执行的那一行**；`drain_queue` 随后按 `op.id` `complete_op` 把它删掉。
 - **修复**：重新排队前先 `complete_op(op.id)` 退休当前行，新行获得新 id，后续的 `complete_op` 成为无操作。
-- **回归测试**：待补（需要在队列层驱动一次"上传中编辑"，现有测试只覆盖 transfer 层）。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::an_edit_during_a_tracked_upload_is_queued_again`（在队列层驱动一次上传中编辑，用 body 匹配证明新字节确实送达；已验证：去掉 `complete_op` 后只上传一次）。
 
 ## SC-015 · 文件与目录同名互换：每轮扫描重复入队，操作永久失败
 

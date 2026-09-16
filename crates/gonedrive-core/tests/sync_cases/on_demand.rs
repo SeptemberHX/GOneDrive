@@ -986,3 +986,46 @@ async fn a_refreshed_placeholder_is_removed_by_a_later_tombstone_not_kept_as_edi
         "nothing to re-upload"
     );
 }
+
+#[tokio::test]
+async fn an_interrupted_overwrite_is_not_repaired_into_the_new_version() {
+    use gonedrive_core::db::{ItemState, OpKind};
+
+    // A download that replaces an already-hydrated file writes into a
+    // temporary file, so until it is published the inode still holds — and
+    // still claims — the previous version. Killed there, the restart repair
+    // used to read "hydrated" and commit it as the new one, dropping the
+    // queued download with it: the cloud change was then stranded until the
+    // item happened to change again.
+    let h = harness_with_a_downloaded_file(b"old version").await;
+    let path = h.path("Docs/big.bin");
+
+    // What a delta that saw the cloud edit leaves behind, plus the download it
+    // queued, plus the state the download sets before it starts fetching.
+    let mut record = h.store.item("F1").unwrap().unwrap();
+    record.ctag = Some("c2".into());
+    record.quickxor = Some(gonedrive_core::hash::quick_xor(b"new version"));
+    h.store.upsert_item(&record).unwrap();
+    h.store
+        .enqueue(ACCOUNT, OpKind::Download, Some("F1"), Some(&path), None)
+        .unwrap();
+    h.store.set_item_state("F1", ItemState::Hydrating).unwrap();
+
+    assert_eq!(h.engine.repair_states().unwrap(), 1);
+
+    assert_eq!(
+        h.store.item("F1").unwrap().unwrap().state,
+        ItemState::DirtyRemote,
+        "the superseded bytes must not be committed as the new version"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"old version",
+        "nothing on disk is touched by the repair"
+    );
+    assert_eq!(
+        h.store.pending_count(ACCOUNT).unwrap(),
+        1,
+        "the queued download must survive to fetch the new version"
+    );
+}

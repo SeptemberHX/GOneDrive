@@ -761,3 +761,87 @@ async fn a_chunked_upload_stops_rather_than_committing_two_versions_spliced() {
         "the upload stays queued and retries with the new content"
     );
 }
+
+#[tokio::test]
+async fn an_edit_during_a_tracked_upload_is_queued_again() {
+    // The follow-up upload shares its deduplication key with the operation
+    // that queues it — both are keyed by the item — so enqueuing it while that
+    // row still exists rewrote the row the caller then deleted on success. The
+    // newer bytes were silently dropped for every file the store already knew.
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "notes.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"first").await;
+    h.sync().await;
+
+    let target = h.path("notes.txt");
+    std::fs::write(&target, b"second").unwrap();
+    h.engine
+        .sync_local_paths(std::slice::from_ref(&h.root))
+        .unwrap();
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 1);
+
+    h.server.reset().await;
+    let uploaded = json!({
+        "id": "F1", "name": "notes.txt", "size": 6,
+        "cTag": "c2", "eTag": "e2",
+        "file": {"mimeType": "text/plain"},
+        "parentReference": {"driveId": "drive1", "id": ROOT},
+        "fileSystemInfo": {"lastModifiedDateTime": "2026-08-29T10:00:00Z"}
+    });
+    // Registered first so it wins the match: proof that the bytes written
+    // during the transfer reach the service, rather than being dropped.
+    Mock::given(method("PUT"))
+        .and(path("/me/drive/items/F1/content"))
+        .and(body_bytes(b"third and newest".to_vec()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(uploaded.clone()))
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/me/drive/items/F1/content"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(400))
+                .set_body_json(uploaded.clone()),
+        )
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/F1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(uploaded))
+        .mount(&h.server)
+        .await;
+
+    let edit = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::fs::write(&target, b"third and newest").unwrap();
+    };
+    let transfer = h.engine.transfer_slice(
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+        gonedrive_core::sync::engine::QueueScope::Outbound,
+    );
+    let (summary, ()) = tokio::join!(transfer, edit);
+
+    let summary = summary.unwrap();
+    // Two: the version the service took, then the one written during it. The
+    // slice drains what the first upload queued, so the count is what proves
+    // the follow-up survived — dropping it left exactly one.
+    assert_eq!(
+        summary.uploaded, 2,
+        "the bytes written during the upload must go up too"
+    );
+    assert_eq!(
+        h.store.pending_count(ACCOUNT).unwrap(),
+        0,
+        "and nothing is left behind"
+    );
+    assert_eq!(
+        h.store.item("F1").unwrap().unwrap().ctag.as_deref(),
+        Some("c2")
+    );
+}
