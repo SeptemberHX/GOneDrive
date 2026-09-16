@@ -4,11 +4,12 @@ use std::time::Duration;
 use gonedrive_core::sync::engine::QueueScope;
 use gonedrive_ipc::reader_policy::FILE_MANAGER_COPY_READER;
 
+use super::inflight::PathLocks;
 use super::{
     core_error_status, decide_stage, is_account_level_state, is_browsing_reader,
     missing_account_retry_due, outbound_scope, pending_snapshot, phase_completion_state,
     phase_state, remote_poll_ready, summary_has_reportable_activity, sync_barrier_ready,
-    update_pending_status, PathLocks, StagePlan, KEYRING_LOCKED_MESSAGE, PARTIAL_HYDRATION_CEILING,
+    update_pending_status, StagePlan, KEYRING_LOCKED_MESSAGE, PARTIAL_HYDRATION_CEILING,
 };
 
 #[test]

@@ -2,6 +2,7 @@
 
 mod coordinator;
 mod hydration;
+mod inflight;
 mod mode;
 mod placeholder_protector;
 
@@ -16,7 +17,7 @@ use coordinator::{
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -188,7 +189,7 @@ fn detailed_error(error: &(dyn std::error::Error + 'static)) -> String {
     }
     messages.join(": ")
 }
-use tokio::sync::{broadcast, Mutex, Notify, OwnedMutexGuard, RwLock};
+use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 
 /// Anything the front ends care about.
 #[derive(Debug, Clone)]
@@ -221,123 +222,6 @@ pub enum DaemonEvent {
     },
 }
 
-/// A placeholder currently being filled.
-struct InFlight {
-    /// The HSM request id that created this entry.  Completion messages carry
-    /// the same id so a late range callback cannot tear down a newer request
-    /// for the same path.
-    request_id: u64,
-    hydration: Hydration,
-    /// Only whole-file fills represent an operation the user is waiting for.
-    /// Range fills are quiet file-manager reads and must never appear in the
-    /// download monitor if it happens to connect while they are in flight.
-    visible: bool,
-    /// Set to abandon the transfer.
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-    staged: Option<std::path::PathBuf>,
-    /// Held from staging until the helper reports Filled, so no second reader
-    /// can truncate or consume the same sibling staging file.
-    _path_guard: OwnedMutexGuard<()>,
-    /// Only one helper completion may commit this request.  Fanotify can
-    /// legitimately report the final materialised range more than once.
-    finishing: bool,
-}
-
-#[derive(Default)]
-struct PathLocks {
-    locks: Mutex<HashMap<std::path::PathBuf, Weak<Mutex<()>>>>,
-    /// Paths currently being turned into placeholders.  Fanotify can deliver
-    /// a permission event after the release request has started but before a
-    /// worker has handed it to the daemon; the reference count keeps that
-    /// late event from starting a new hydration.  Counts (rather than a set)
-    /// are required because overlapping subtree releases are allowed to wait
-    /// on the same paths.
-    releasing: StdMutex<HashMap<std::path::PathBuf, usize>>,
-}
-
-/// A cancellation-safe lease on the paths covered by a space release. It is
-/// synchronous so a cancelled D-Bus future still clears its protection in
-/// `Drop` rather than leaving a path blocked until the daemon restarts.
-struct ReleaseBarrier<'a> {
-    state: &'a StdMutex<HashMap<std::path::PathBuf, usize>>,
-    paths: Vec<std::path::PathBuf>,
-}
-
-impl Drop for ReleaseBarrier<'_> {
-    fn drop(&mut self) {
-        let mut releasing = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        for path in &self.paths {
-            let remove = releasing.get_mut(path).is_some_and(|count| {
-                *count = count.saturating_sub(1);
-                *count == 0
-            });
-            if remove {
-                releasing.remove(path);
-            }
-        }
-    }
-}
-
-impl PathLocks {
-    async fn acquire(&self, path: &std::path::Path) -> OwnedMutexGuard<()> {
-        let path_lock = {
-            let mut locks = self.locks.lock().await;
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(path).and_then(Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(Mutex::new(()));
-                    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
-                    lock
-                }
-            }
-        };
-        path_lock.lock_owned().await
-    }
-
-    /// Acquire a stable, deadlock-free set of path locks.  Space release can
-    /// cover a whole subtree while hydration requests arrive concurrently; a
-    /// sorted/deduplicated order keeps two overlapping subtree operations from
-    /// waiting on each other forever.
-    async fn acquire_many(&self, paths: &[std::path::PathBuf]) -> Vec<OwnedMutexGuard<()>> {
-        let mut ordered = paths.to_vec();
-        ordered.sort();
-        ordered.dedup();
-        let mut guards = Vec::with_capacity(ordered.len());
-        for path in ordered {
-            guards.push(self.acquire(&path).await);
-        }
-        guards
-    }
-
-    fn begin_release(&self, paths: &[std::path::PathBuf]) -> ReleaseBarrier<'_> {
-        let paths = paths
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut releasing = self
-            .releasing
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        for path in &paths {
-            *releasing.entry(path.clone()).or_default() += 1;
-        }
-        ReleaseBarrier {
-            state: &self.releasing,
-            paths,
-        }
-    }
-
-    fn is_releasing(&self, path: &std::path::Path) -> bool {
-        self.releasing
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .contains_key(path)
-    }
-}
-
 pub struct App {
     /// Read through [`App::config`]. A mode switch replaces this in place, so
     /// nothing may cache a snapshot across an await that could switch modes.
@@ -355,8 +239,7 @@ pub struct App {
     next_sync_generation: AtomicU64,
     requested_sync_generation: AtomicU64,
     /// Placeholders being filled right now, keyed by absolute path.
-    hydrations: Arc<RwLock<HashMap<std::path::PathBuf, InFlight>>>,
-    hydration_locks: PathLocks,
+    hydrations: Arc<inflight::InFlightHydrations>,
     /// Serialises content downloads with space release.  A queued transfer can
     /// already have popped its durable row when the user asks to release a
     /// file; letting both write concurrently would materialise it again after
@@ -439,8 +322,7 @@ impl App {
             wake: Arc::new(Notify::new()),
             next_sync_generation: AtomicU64::new(1),
             requested_sync_generation: AtomicU64::new(0),
-            hydrations: Arc::new(RwLock::new(HashMap::new())),
-            hydration_locks: PathLocks::default(),
+            hydrations: Arc::new(inflight::InFlightHydrations::default()),
             download_gate: Arc::new(Mutex::new(())),
             mode_switch: Mutex::new(()),
             login_in_flight: Arc::new(AtomicBool::new(false)),
@@ -710,22 +592,7 @@ impl App {
             return;
         };
         let root = account.root_local_path;
-        let mut abandoned = Vec::new();
-        {
-            let mut hydrations = self.hydrations.write().await;
-            let doomed: Vec<_> = hydrations
-                .keys()
-                .filter(|path| path.starts_with(&root))
-                .cloned()
-                .collect();
-            for path in doomed {
-                if let Some(entry) = hydrations.remove(&path) {
-                    entry.cancel.store(true, Ordering::Relaxed);
-                    abandoned.push((path, entry.staged.clone()));
-                }
-            }
-        }
-        for (path, staged) in abandoned {
+        for (path, staged) in self.hydrations.abandon(Some(&root)).await {
             if let Some(staged) = staged {
                 self.remove_staged_file(&staged).await;
             }
@@ -881,9 +748,7 @@ impl App {
                                     transferred: 0,
                                     total: size,
                                 };
-                                if let Some(entry) = hydrations.write().await.get_mut(&path) {
-                                    entry.hydration = hydration.clone();
-                                }
+                                hydrations.set_progress(&path, hydration.clone()).await;
                                 let _ = sender.send(DaemonEvent::HydrationStarted(hydration));
                                 continue;
                             }
@@ -892,14 +757,11 @@ impl App {
                                 transferred,
                                 total,
                             } => {
-                                let mut guard = hydrations.write().await;
-                                let Some(entry) = guard.get_mut(&path) else {
+                                let Some(hydration) =
+                                    hydrations.advance(&path, transferred, total).await
+                                else {
                                     continue;
                                 };
-                                entry.hydration.transferred = transferred;
-                                entry.hydration.total = total;
-                                let hydration = entry.hydration.clone();
-                                drop(guard);
                                 let _ = sender.send(DaemonEvent::HydrationProgress(hydration));
                                 continue;
                             }
@@ -912,14 +774,7 @@ impl App {
                                 // through that work. The fallback removal is
                                 // only for an unexpected engine event with no
                                 // owner in the daemon map.
-                                let mut hydration_guard = hydrations.write().await;
-                                let owned = hydration_guard
-                                    .get(&path)
-                                    .is_some_and(|entry| entry.finishing);
-                                if !owned {
-                                    hydration_guard.remove(&path);
-                                }
-                                drop(hydration_guard);
+                                hydrations.remove_unclaimed(&path).await;
                                 // On-demand fetches belong in the activity list
                                 // just like scheduled downloads: to the user
                                 // both are "this file arrived".
@@ -1231,9 +1086,9 @@ impl App {
                     continue;
                 }
             };
-            let _release_barrier = self.hydration_locks.begin_release(&candidates);
+            let _release_barrier = self.hydrations.begin_release(&candidates);
             {
-                let _path_guards = self.hydration_locks.acquire_many(&candidates).await;
+                let _path_guards = self.hydrations.acquire_many(&candidates).await;
                 let mut protected = Vec::new();
                 let mut protection_failed = false;
                 for path in &candidates {

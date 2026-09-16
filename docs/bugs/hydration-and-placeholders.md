@@ -37,7 +37,8 @@
 - **现象**：离线或令牌过期时打开一个按需文件失败，之后该文件所有读取都要等 helper 300 秒超时，"立即获取"与释放空间挂死，进度窗永远显示，用户对该文件的编辑/删除被本地扫描忽略，直到重启守护进程。
 - **根因**：守护进程 `stage_for` 在 `begin_hydration` 之后出错只回复 `Hydrated{ok:false}`，指望 helper 的 `Filled` 事件触发 `fail_hydration`；但 helper（`worker.rs`）对任何 `Deny` 都回 `Filled{ok:false, full:false}`，守护进程把 `full:false` 当作"浏览拒绝，无需清理"。双方互相依赖，无人兜底。`set_hsm(None)` 清空进行中表时同样不回退 DB 状态。
 - **修复**：`stage_for` 出错时自行 `fail_hydration`（释放 InFlight 与路径锁，DB 回到 `Dehydrated`，发 `HydrationFinished{ok:false}`）；helper 丢失时对所有进行中的回填做同样处理。
-- **回归测试**：仍缺。这条完全落在守护进程的 `stage_for` 里，要驱动它需要一个 `App`，而 `App::new` 会连接 Secret Service；守护进程现有的测试都只覆盖纯函数。补它需要先把回填的编排与 `App` 解耦（例如抽出一个只依赖引擎与路径锁的 trait），属于结构性改动，未随本次修复一起做。
+- **回归测试**：部分补上。在途回填的账本（登记表 + 路径锁）已抽成 `crates/gonedrived/src/app/inflight.rs::InFlightHydrations`，可以脱离 `App` 独立构造，`::tests` 覆盖了这条缺陷真正造成伤害的那一半——放弃一次回填之后路径锁确实释放，下一个读者不再等满 helper 的五分钟超时；同时覆盖了请求 id 的归属、重复完成、按账户根划分的放弃与释放屏障。
+  仍缺的是"`stage_for` 出错时**会去调用**这套清理"这一半：那需要把内容获取（引擎）也抽成接口，本次未做。
 
 ## HP-005 · 覆盖式下载中断后，重启把旧版本提交为新版本
 
