@@ -241,6 +241,15 @@ mod tests {
     #[test]
     fn activity_rows_are_safe_to_refresh_in_realized_lists() {
         if gtk::init().is_err() {
+            // Locally this is an ordinary skip: a headless shell has no
+            // display and that is not a failure. On CI it is one. This test
+            // used to return early there too, so the job went green having
+            // never executed a single line of it.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "GTK could not open a display; run the suite under xvfb-run"
+            );
+            eprintln!("skipping: no display available");
             return;
         }
 

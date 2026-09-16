@@ -20,4 +20,4 @@
 | [`sync-correctness.md`](sync-correctness.md) | 同步正确性：重命名=移动、resync 清扫、大小写碰撞、cTag 抢先、hydrated 文件降级 |
 | [`network-resilience.md`](network-resilience.md) | 弱网韧性：中途掉线的分类与重试、read 超时、不过早放弃、下载断点续传 |
 
-运行全部回归测试：`cargo test --workspace`（当前 435 项）。
+运行全部回归测试：`cargo test --workspace`（当前 437 项）。

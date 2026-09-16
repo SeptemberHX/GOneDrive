@@ -127,3 +127,18 @@
 - **现象**：`apt upgrade gonedrive` 装上了新版本，跑的却还是旧二进制，界面上看不出任何异常。
 - **根因**：`install.sh` 把二进制装进 `/usr/local/bin`（默认 PATH 里排在 `/usr/bin` 之前），把 unit 与 D-Bus 服务文件装进 `$HOME`（遮蔽包内的 `/usr/lib`、`/usr/share` 副本）。包内的 `Exec=/usr/bin/env gonedrived run` 于是解析到源码装的那份。README 也完全没提 deb 这条路径。
 - **修复**：`install.sh` 检测到已安装的 `gonedrive` 包时直接拒绝执行，并说明两条路径互斥；`GONEDRIVE_ALLOW_BESIDE_DEB=1` 可覆盖。README 补上两条安装路径与它们的取舍。
+
+## SS-016 · 本轮已核实的次要项（第四批）
+
+2026-09-16 报告复核中一并处理的小项，都有明确根因，单独立条过细：
+
+- **`ListFolder` 不做路径限定**：D-Bus 上唯一一个不经 `confine_to_root` 的方法，拿到什么字符串就往下传。新增 `confine_listing`——根目录与相对名合法（面板就是这样导航的），越出根的一律拒绝。测试：`service.rs::a_folder_listing_accepts_the_root_and_relative_names_but_nothing_outside`。
+- **helper 的 roots 表永不回收**：每个曾连接过的 uid 在 helper 生命周期内永久占用一个目录描述符。会话断开时若该 uid 已无任何标记，就释放它的 roots；重连的守护进程本来就会在第一次 watch 之前重新声明。
+- **权限位恢复范围过宽**：`LockedPlaceholder::prepare` 允许从 xattr 恢复 setuid/setgid/sticky。目标文件属主就是发起者本人，不构成提权，但一个特权 helper 没有理由在自己没选的路径上写这些位——现在一律掩掉。
+- **关停不可中断**：主循环只在两处 select 观察 shutdown，而 30 秒的凭据加载与整轮 delta 都在循环体里直接 await。SIGTERM 因此要等到 systemd 90 秒后 SIGKILL。两处长 await 改为与 shutdown 竞速；delta 的分段提交本来就是为了中断后能续。
+- **无账户时 `gonedrived sync` 报成功**：走守护进程的那条分支不检查账户，空转一圈打印 Done。本地那条分支早就拒绝了，现在两边一致。
+- **托盘菜单吞下划线**：dbusmenu 把 `_` 当助记符，`quarterly_report.xlsx` 显示成 `quarterlyreport.xlsx`。账户名与当前文件名经 `menu_text` 转义。测试：`tray.rs::underscores_in_a_file_name_survive_the_tray_menu`。
+- **回填进度窗记账**：第 7 个及以后的传输不建行，而标题计数与"是否收窗"都取行数——被跟踪的 6 个先完成时窗口会隐藏，传输却还在进行。新增 `active` 集合作为真相，行只是它的视图。
+- **CI 里 GTK 测试静默跳过**：无 `DISPLAY` 时 `gtk::init()` 失败即 return，CI 全绿而测试一行没跑。CI 改为 `xvfb-run`，测试在 `CI` 置位时拒绝跳过。
+- **Nautilus 扩展与守护进程不一致**：相对 `sync_root` 会按 Nautilus 自己的工作目录解析，而守护进程直接拒绝非绝对路径；配置还只在构造时读一次。现在相对值退回默认根，并按 config.toml 的 mtime/ino 变化重读。测试：`data/nautilus/tests/test_gonedrive.py::ConfiguredRootsTests`。
+- **打包细节**：`/etc/xdg/autostart` 的副本列入 `conffiles`（用户改过的不再被升级覆盖），该副本的 `StartupNotify` 关掉（`--background` 不映射窗口），`Depends` 补 `librsvg2-common` 与 `dbus-user-session`，`init-system-helpers` 加版本下限。

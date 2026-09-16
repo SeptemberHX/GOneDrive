@@ -59,7 +59,33 @@ def configured_roots():
         root = default_root
     if not isinstance(root, str) or not root.strip():
         root = default_root
-    return (os.path.abspath(os.path.expanduser(root)),)
+    root = os.path.expanduser(root)
+    # The daemon refuses a relative sync_root outright.  Resolving one here
+    # against whatever directory Nautilus happened to start in would put cloud
+    # badges and context-menu actions on some unrelated tree; agree with the
+    # daemon and use the default instead.
+    if not os.path.isabs(root):
+        root = default_root
+    return (os.path.normpath(root),)
+
+
+def config_stamp():
+    """Identity of the config file, for noticing an edit without re-reading it.
+
+    The roots used to be read once when Nautilus loaded the provider, so
+    changing sync_root meant restarting the file manager — and nothing said so.
+    One stat per query is far cheaper than the xattr reads already happening on
+    the same path.
+    """
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if not config_home:
+        config_home = os.path.join(os.path.expanduser("~"), ".config")
+    config_path = os.path.join(config_home, "gonedrive", "config.toml")
+    try:
+        stat = os.stat(config_path)
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
 
 
 def is_in_sync_root(path, roots):
@@ -174,6 +200,15 @@ class GOnedriveExtension(
         super().__init__()
         self._bus = None
         self._roots = configured_roots()
+        self._roots_stamp = config_stamp()
+
+    def roots(self):
+        """The configured sync roots, re-read when the config file changes."""
+        stamp = config_stamp()
+        if stamp != self._roots_stamp:
+            self._roots = configured_roots()
+            self._roots_stamp = stamp
+        return self._roots
 
     # ---- status ---------------------------------------------------------
 
@@ -336,4 +371,4 @@ class GOnedriveExtension(
         path = Gio.File.new_for_uri(file.get_uri()).get_path()
         if not path or not os.path.lexists(path):
             return None
-        return path if is_in_sync_root(path, self._roots) else None
+        return path if is_in_sync_root(path, self.roots()) else None

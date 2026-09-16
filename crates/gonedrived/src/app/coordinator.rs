@@ -370,8 +370,24 @@ impl App {
                     let status = self.status.read().await;
                     missing_account_retry_due(explicit_wake, &status.state)
                 };
+                // Both awaits below are raced against shutdown. They are the
+                // long ones — a keyring that never answers holds the first for
+                // half a minute, a first full enumeration holds the second for
+                // minutes — and until now neither observed SIGTERM at all: the
+                // signal was noticed only at the two select points, so systemd
+                // ended up killing the daemon after its 90-second grace.
+                // Abandoning either is safe: delta application is staged and
+                // checkpointed precisely so an interrupted pass resumes.
                 if retry_missing {
-                    if let Err(error) = self.attach_missing_accounts().await {
+                    let attached = tokio::select! {
+                        biased;
+                        _ = &mut shutdown => {
+                            tracing::info!("shutting down");
+                            return;
+                        }
+                        attached = self.attach_missing_accounts() => attached,
+                    };
+                    if let Err(error) = attached {
                         tracing::warn!(error = ?error, "could not restore configured account");
                         failure = Some(self.report_anyhow_error(&error).await);
                     }
@@ -380,7 +396,15 @@ impl App {
                 let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
                 if failure.is_none() {
                     for engine in &engines {
-                        match engine.sync_remote().await {
+                        let outcome = tokio::select! {
+                            biased;
+                            _ = &mut shutdown => {
+                                tracing::info!("shutting down");
+                                return;
+                            }
+                            outcome = engine.sync_remote() => outcome,
+                        };
+                        match outcome {
                             Ok(summary) => {
                                 changes = changes.saturating_add(summary.enumerated);
                                 queued = queued.saturating_add(summary.still_queued);

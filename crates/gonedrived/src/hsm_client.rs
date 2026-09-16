@@ -113,6 +113,18 @@ impl HsmClient {
                         // Each hydration runs on its own task: a process is
                         // blocked on it, and a large file must not hold up the
                         // next reader.
+                        //
+                        // Deliberately without a semaphore of our own. The
+                        // count is already bounded by the only peer that can
+                        // send these: the helper holds one of its own workers
+                        // for every permission event it forwards, and refuses
+                        // to exceed `MAX_WORKERS_PER_UID` of them. The
+                        // remaining frame kinds — completions, errors, mark
+                        // replies — are short and, crucially, some of them are
+                        // what an already-running handler is waiting for. A
+                        // ceiling here would let those handlers hold every
+                        // permit while the reply that would release them
+                        // waited for one.
                         tokio::spawn(async move { handle(handler, frame).await });
                     }
                     Ok(Some(_)) => continue,

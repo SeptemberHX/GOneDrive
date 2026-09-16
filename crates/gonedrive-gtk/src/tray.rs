@@ -83,11 +83,11 @@ impl GonedriveTray {
             "syncing" | "enumerating" => "正在同步…".into(),
             "downloading" => match self.status.current_item.as_str() {
                 "" => "正在下载".into(),
-                name => format!("正在下载 {name}"),
+                name => format!("正在下载 {}", menu_text(name)),
             },
             "uploading" => match self.status.current_item.as_str() {
                 "" => "正在上传".into(),
-                name => format!("正在上传 {name}"),
+                name => format!("正在上传 {}", menu_text(name)),
             },
             "paused" => "已暂停".into(),
             "offline" => "离线，稍后重试".into(),
@@ -164,6 +164,7 @@ impl Tray for GonedriveTray {
                 }
             })
             .unwrap_or_else(|| "未登录".into());
+        let account = menu_text(&account);
 
         vec![
             // Inert: the menu's own header, showing who and what.
@@ -255,5 +256,26 @@ impl Tray for GonedriveTray {
             }
             .into(),
         ]
+    }
+}
+
+/// Escape text that came from the user's drive before it becomes a menu label.
+///
+/// The StatusNotifierItem menu is rendered through dbusmenu, which reads `_`
+/// as a mnemonic marker and eats it: a file called `quarterly_report.xlsx`
+/// showed up as "quarterlyreport.xlsx" with the r underlined. Doubling is the
+/// escape dbusmenu defines.
+fn menu_text(text: &str) -> String {
+    text.replace('_', "__")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::menu_text;
+
+    #[test]
+    fn underscores_in_a_file_name_survive_the_tray_menu() {
+        assert_eq!(menu_text("quarterly_report.xlsx"), "quarterly__report.xlsx");
+        assert_eq!(menu_text("plain.txt"), "plain.txt");
     }
 }

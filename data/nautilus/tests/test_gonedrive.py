@@ -198,3 +198,32 @@ class EmblemAssetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ConfiguredRootsTests(unittest.TestCase):
+    """The roots decide where cloud badges and menu items may appear."""
+
+    def _roots_with(self, body):
+        with tempfile.TemporaryDirectory() as home:
+            config_dir = os.path.join(home, "gonedrive")
+            os.makedirs(config_dir)
+            with open(os.path.join(config_dir, "config.toml"), "w") as handle:
+                handle.write(body)
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": home}):
+                return ext.configured_roots()
+
+    def test_a_relative_sync_root_is_refused_not_resolved_against_the_cwd(self):
+        # The daemon refuses a relative sync_root. Resolving one here against
+        # whatever directory Nautilus started in would badge an unrelated tree.
+        (root,) = self._roots_with('sync_root = "relative/OneDrive"\n')
+        self.assertEqual(root, os.path.join(os.path.expanduser("~"), "OneDrive"))
+
+    def test_an_absolute_sync_root_is_used_as_written(self):
+        (root,) = self._roots_with('sync_root = "/srv/cloud/OneDrive"\n')
+        self.assertEqual(root, "/srv/cloud/OneDrive")
+
+    def test_a_missing_or_broken_config_falls_back_to_the_default(self):
+        with tempfile.TemporaryDirectory() as home:
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": home}):
+                (root,) = ext.configured_roots()
+        self.assertEqual(root, os.path.join(os.path.expanduser("~"), "OneDrive"))

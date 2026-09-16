@@ -11,7 +11,7 @@
 //! explain the I/O error the waiting application just showed the user.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,11 @@ pub struct Monitor {
     pub window: adw::ApplicationWindow,
     list: gtk::Box,
     rows: RefCell<HashMap<String, Row>>,
+    /// Every transfer in flight, including the ones past [`MAX_ROWS`] that have
+    /// no row. The rows are a view; this is the truth. Counting rows instead
+    /// understated the header and, worse, hid the window as soon as the six
+    /// displayed transfers finished — while the rest were still running.
+    active: RefCell<HashSet<String>>,
     /// The header title: "下载中" for one file, "N 个文件下载中" for several.
     title: gtk::Label,
     /// Shown only on failure — the error explanation. Hidden otherwise.
@@ -137,6 +142,7 @@ impl Monitor {
             window,
             list,
             rows: RefCell::new(HashMap::new()),
+            active: RefCell::new(HashSet::new()),
             title,
             status,
             commands,
@@ -165,7 +171,10 @@ impl Monitor {
         let newly_shown = !self.window.is_visible();
         self.window.set_visible(true);
 
+        self.active.borrow_mut().insert(hydration.path.clone());
         let mut rows = self.rows.borrow_mut();
+        // A slot freed by a finished transfer is taken by the next tick of one
+        // that never got a row.
         if !rows.contains_key(&hydration.path) && rows.len() < MAX_ROWS {
             rows.insert(hydration.path.clone(), self.build_row(&hydration));
         }
@@ -214,8 +223,8 @@ impl Monitor {
             }
         }
 
-        let count = rows.len();
         drop(rows);
+        let count = self.active.borrow().len();
         self.title.set_text(&match count {
             0 | 1 => "OneDrive 下载中".to_string(),
             n => format!("OneDrive · {n} 个文件下载中"),
@@ -296,6 +305,7 @@ impl Monitor {
     }
 
     fn remove(self: &Rc<Self>, path: &str, ok: bool) {
+        self.active.borrow_mut().remove(path);
         let name = self
             .rows
             .borrow_mut()
@@ -306,8 +316,14 @@ impl Monitor {
             })
             .unwrap_or_default();
 
-        if self.rows.borrow().is_empty() {
+        let remaining = self.active.borrow().len();
+        if remaining == 0 {
             self.schedule_close(ok, &name);
+        } else {
+            self.title.set_text(&match remaining {
+                1 => "OneDrive 下载中".to_string(),
+                n => format!("OneDrive · {n} 个文件下载中"),
+            });
         }
     }
 
@@ -333,7 +349,7 @@ impl Monitor {
         let this = self.clone();
         let id = glib::timeout_add_local_once(linger, move || {
             this.closing.replace(None);
-            if this.rows.borrow().is_empty() {
+            if this.active.borrow().is_empty() {
                 this.window.close();
             }
         });

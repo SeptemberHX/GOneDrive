@@ -106,6 +106,13 @@ fn truncate(text: &str, max: usize) -> String {
 
 /// Ask the daemon for a pass and wait until it settles.
 async fn sync_via_daemon(proxy: &gonedrive_ipc::DaemonProxy<'static>) -> Result<()> {
+    // A daemon with nothing signed in settles instantly and reports success,
+    // which reads as "your drive is up to date" to someone who has in fact
+    // never signed in. The local path already refuses this; say the same thing
+    // here rather than printing Done.
+    if proxy.list_accounts().await?.is_empty() {
+        anyhow::bail!("no accounts are signed in; run `gonedrived login` first");
+    }
     // Subscribe before requesting so a very fast empty delta cannot complete
     // in the gap between the method return and signal registration.
     let mut completions = proxy.receive_sync_request_completed().await?;

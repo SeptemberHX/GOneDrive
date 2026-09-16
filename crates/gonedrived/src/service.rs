@@ -51,6 +51,33 @@ fn confine_to_root(
     Ok(relative.to_path_buf())
 }
 
+/// Where a listing request points, or `None` if it points outside the root.
+///
+/// Reading a directory is not a destructive action, so this differs from
+/// [`confine_to_root`] in two ways: the sync root itself is a valid target —
+/// browsing starts there — and a relative path is accepted, because the panel
+/// navigates by sending back the names this interface handed it. Everything
+/// else is confined exactly as the action methods confine it, which this path
+/// previously skipped altogether: it passed whatever string arrived straight
+/// through.
+fn confine_listing(root: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+    if path.is_empty() {
+        return Some(std::path::PathBuf::new());
+    }
+    match confine_to_root(root, path) {
+        Ok(relative) => Some(relative),
+        Err(ConfineError::WholeRoot) => Some(std::path::PathBuf::new()),
+        Err(ConfineError::Outside) => {
+            let candidate = std::path::Path::new(path);
+            (candidate.is_relative()
+                && candidate
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_))))
+            .then(|| candidate.to_path_buf())
+        }
+    }
+}
+
 /// One line the CLI prints and the settings dialog shows.
 pub(crate) fn describe_mode_switch(switch: &crate::app::ModeSwitch) -> String {
     let mut line = match switch.mode {
@@ -75,6 +102,21 @@ pub(crate) fn describe_mode_switch(switch: &crate::app::ModeSwitch) -> String {
 impl DaemonService {
     /// Turn an absolute path from a file manager into one relative to the sync
     /// root, refusing anything outside it.
+    async fn relative_for_listing(&self, path: &str) -> zbus::fdo::Result<std::path::PathBuf> {
+        let accounts = self
+            .app
+            .accounts()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let root = accounts
+            .first()
+            .map(|a| std::path::PathBuf::from(&a.root_path))
+            .ok_or_else(|| zbus::fdo::Error::Failed("no account is signed in".into()))?;
+        confine_listing(&root, path).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(format!("{path} is outside {}", root.display()))
+        })
+    }
+
     async fn relative(&self, path: &str) -> zbus::fdo::Result<std::path::PathBuf> {
         let accounts = self
             .app
@@ -269,8 +311,10 @@ impl DaemonService {
 
     async fn list_folder(&self, path: &str) -> zbus::fdo::Result<Vec<FolderEntry>> {
         // Unlike the action methods, an empty path is legal here: it names the
-        // sync root, which is exactly where the chooser starts.
-        let relative = std::path::PathBuf::from(path);
+        // sync root, which is exactly where the chooser starts. Everything else
+        // is confined the same way, which this method used to skip entirely —
+        // it took whatever string arrived and passed it through.
+        let relative = self.relative_for_listing(path).await?;
         self.app
             .list_folder(&relative)
             .await
@@ -503,7 +547,7 @@ impl Drop for LoginGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{confine_to_root, ConfineError};
+    use super::{confine_listing, confine_to_root, ConfineError};
     use std::path::{Path, PathBuf};
 
     const ROOT: &str = "/home/u/OneDrive";
@@ -549,5 +593,29 @@ mod tests {
             confine_to_root(Path::new(ROOT), "/home/u/OneDrive/"),
             Err(ConfineError::WholeRoot)
         );
+    }
+    #[test]
+    fn a_folder_listing_accepts_the_root_and_relative_names_but_nothing_outside() {
+        // The chooser starts at the root and then navigates by the names this
+        // interface gave it, so both forms have to work.
+        assert_eq!(confine_listing(Path::new(ROOT), ""), Some(PathBuf::new()));
+        assert_eq!(confine_listing(Path::new(ROOT), ROOT), Some(PathBuf::new()));
+        assert_eq!(
+            confine_listing(Path::new(ROOT), "/home/u/OneDrive/Docs"),
+            Some(PathBuf::from("Docs"))
+        );
+        assert_eq!(
+            confine_listing(Path::new(ROOT), "Docs/Sub"),
+            Some(PathBuf::from("Docs/Sub"))
+        );
+
+        // Everything that leaves the root is refused, in both forms.
+        assert_eq!(confine_listing(Path::new(ROOT), "/etc"), None);
+        assert_eq!(
+            confine_listing(Path::new(ROOT), "/home/u/OneDrive-evil"),
+            None
+        );
+        assert_eq!(confine_listing(Path::new(ROOT), "../../etc"), None);
+        assert_eq!(confine_listing(Path::new(ROOT), "Docs/../../etc"), None);
     }
 }

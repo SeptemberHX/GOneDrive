@@ -106,6 +106,16 @@ impl MarkRegistry {
         }
     }
 
+    /// Whether this uid still has anything armed.
+    ///
+    /// A uid with no marks has nothing the helper needs to keep serving, so
+    /// its declared roots — one open directory descriptor each — can go when
+    /// its session does. A reconnecting daemon re-declares before its first
+    /// watch, which is the same path a first connection takes.
+    pub(super) fn has_marks_for(&self, uid: u32) -> bool {
+        self.by_path.contains_key(&uid)
+    }
+
     fn identities_for_path(&self, uid: u32, path: &Path) -> Vec<FileIdentity> {
         self.by_path
             .get(&uid)
@@ -530,6 +540,18 @@ impl LockedPlaceholder {
                 "saved placeholder mode is outside the permission bits",
             ));
         }
+        // Never hand back setuid, setgid or the sticky bit, whatever the xattr
+        // says. A root process restoring them is not an escalation — the file
+        // belongs to the user who asked, and they could chmod it themselves —
+        // but a privileged helper that writes those bits on a path it did not
+        // choose has no reason to exist, and this keeps the audit answer short.
+        let mode = mode & 0o0777;
+        if mode == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "saved placeholder mode carried nothing but special bits",
+            ));
+        }
         Ok(Some(Self {
             path_file: path_file.try_clone()?,
             mode,
@@ -596,6 +618,32 @@ pub(super) fn remove_marks_for_path(shared: &Arc<Shared>, path: &Path, uid: u32)
                 .collect::<Vec<_>>()
                 .join("; ")
         )
+    }
+}
+
+/// Release a departed uid's sync roots, if nothing of its is still armed.
+///
+/// Roots deliberately outlive a session so a restarting daemon can resume, but
+/// nothing ever removed them: every uid that had ever connected held a
+/// directory descriptor for the rest of the helper's life. Bounded by the
+/// number of local users, and still worth not leaking.
+pub(super) fn release_roots_if_idle(shared: &Arc<Shared>, uid: u32) {
+    let armed = shared
+        .marks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .has_marks_for(uid);
+    if armed {
+        return;
+    }
+    let dropped = shared
+        .roots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&uid)
+        .is_some();
+    if dropped {
+        tracing::debug!(uid, "released the sync roots of a uid with nothing armed");
     }
 }
 

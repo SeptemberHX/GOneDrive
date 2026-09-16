@@ -42,6 +42,7 @@ jobs:
             build-essential pkg-config git curl ca-certificates \
             libgtk-4-dev libadwaita-1-dev \
             nodejs \
+            xvfb \
             dpkg-dev jq
 
       - name: Checkout
@@ -100,8 +101,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Under xvfb because the GTK tests need a display. Without one they
+      # returned early and the job went green having never run them — the
+      # tests now refuse to skip when CI is set, so a missing xvfb fails loudly
+      # instead of silently passing.
       - name: Test
-        run: cargo test --workspace
+        env:
+          CI: "true"
+        run: xvfb-run -a cargo test --workspace
 
       - name: Nautilus extension tests
         run: python3 -m unittest discover -s data/nautilus/tests -v

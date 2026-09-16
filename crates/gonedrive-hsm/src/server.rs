@@ -12,7 +12,7 @@ use gonedrive_ipc::hsm::{Event, Request, WatchOutcome, MAX_FRAME_SIZE, MAX_WATCH
 
 use crate::marks::{
     begin_mark_sweep, cancel_mark_sweep, commit_mark_sweep, install_directory_mark, install_mark,
-    open_authorised, register_roots, remove_marks_for_path,
+    open_authorised, register_roots, release_roots_if_idle, remove_marks_for_path,
 };
 use crate::shown;
 use crate::worker::fail_pending_for_uid;
@@ -146,6 +146,7 @@ impl Drop for SessionGuard {
         if disconnected {
             fail_pending_for_uid(&self.shared, self.uid);
             cancel_mark_sweep(&self.shared, self.uid);
+            release_roots_if_idle(&self.shared, self.uid);
             // Keep inode marks armed while the daemon restarts. With no
             // matching session, permission events are denied rather than
             // exposing sparse placeholder zeroes.
