@@ -62,9 +62,14 @@ jobs:
         uses: actions/cache@v4
         continue-on-error: true
         with:
+          # ~/.cargo/bin carries the cargo-audit binary between runs, and
+          # ~/.cargo/advisory-db its database clone, so the audit gate below
+          # costs one compile on a cold cache and a few seconds afterwards.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin
+            ~/.cargo/advisory-db
             target
           key: cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-
@@ -101,12 +106,33 @@ jobs:
       - name: Nautilus extension tests
         run: python3 -m unittest discover -s data/nautilus/tests -v
 
+      # This client holds the user's OAuth tokens and moves their documents
+      # over TLS, so a known advisory in the dependency tree is a release
+      # blocker rather than a note. RUSTSEC-2026-0285 (rustls) reached the
+      # tree unnoticed for want of this gate.
+      #
+      # It fails the build on vulnerabilities only. Unmaintained-crate
+      # warnings are reported but do not block, because an upstream crate
+      # going unmaintained is not a reason to stop shipping fixes.
+      - name: Install cargo-audit
+        run: |
+          set -euo pipefail
+          # A warm cache makes this a no-op; a cold one compiles it once.
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
+
+      - name: Audit dependencies
+        run: cargo audit
+
       # --- the actual deliverable ---------------------------------------
       - name: Build .deb
         run: ./build-deb.sh
 
+      # v4 needs Gitea 1.22 or newer for the artifact backend; v3 is dead
+      # upstream. If your instance is older, pin this back to @v3.
       - name: Upload .deb artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: gonedrive-deb
           path: gonedrive_*.deb
