@@ -24,7 +24,7 @@ mod items;
 mod pending;
 mod uploads;
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 const ACTIVITY_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS activity (
@@ -590,6 +590,26 @@ impl Store {
                     }
                 }
             }
+            if version < 15 {
+                // See the note beside the index in the base schema: every
+                // by-item deletion was a full queue scan. `IF NOT EXISTS`
+                // because a store created at the current version already has
+                // it from the base schema.
+                let has_pending_ops: bool = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                          WHERE type = 'table' AND name = 'pending_ops'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if has_pending_ops {
+                    tx.execute_batch(
+                        "CREATE INDEX IF NOT EXISTS pending_ops_by_item
+                             ON pending_ops(account_id, item_id);",
+                    )?;
+                }
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
             Ok(())
@@ -825,6 +845,11 @@ CREATE TABLE IF NOT EXISTS pending_ops (
 CREATE UNIQUE INDEX IF NOT EXISTS pending_ops_dedup
     ON pending_ops(account_id, kind, dedup_key);
 CREATE INDEX IF NOT EXISTS pending_ops_due ON pending_ops(account_id, next_attempt_at);
+-- Completing a hydration, releasing space, cancelling a queued delete and
+-- dropping a subtree all delete by item. Without this they scanned the whole
+-- queue each time, which on a whole-drive pin is one scan of n rows per one of
+-- n downloads.
+CREATE INDEX IF NOT EXISTS pending_ops_by_item ON pending_ops(account_id, item_id);
 
 CREATE TABLE IF NOT EXISTS upload_sessions (
     key              TEXT NOT NULL,

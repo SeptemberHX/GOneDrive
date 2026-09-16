@@ -828,3 +828,68 @@ fn an_item_written_during_a_resync_is_not_swept_by_it() {
         .collect();
     assert_eq!(missed, ["old"]);
 }
+
+#[test]
+fn by_item_queue_deletions_use_an_index() {
+    // Completing a hydration, releasing space and dropping a subtree all
+    // delete by item. Scanning the queue for each one turns a whole-drive pin
+    // into one scan per download.
+    let store = Store::open_in_memory().unwrap();
+    let plan: String = store
+        .with_conn(|conn| {
+            Ok(conn.query_row(
+                "EXPLAIN QUERY PLAN
+                 DELETE FROM pending_ops WHERE account_id = 'a' AND item_id = 'i'",
+                [],
+                |row| row.get::<_, String>(3),
+            )?)
+        })
+        .unwrap();
+    assert!(
+        plan.contains("pending_ops_by_item"),
+        "expected an index scan, got: {plan}"
+    );
+}
+
+#[test]
+fn an_existing_store_gains_the_by_item_queue_index() {
+    // A fresh store gets the index from the base schema; every store already
+    // on disk only gets it from the migration, and those are the ones with a
+    // queue large enough for the missing index to matter.
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            r#"CREATE TABLE accounts (id TEXT PRIMARY KEY);
+             CREATE TABLE pending_ops (
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                 account_id      TEXT NOT NULL,
+                 kind            TEXT NOT NULL,
+                 item_id         TEXT,
+                 local_path      TEXT,
+                 payload         TEXT,
+                 precondition    TEXT,
+                 attempts        INTEGER NOT NULL DEFAULT 0,
+                 next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                 last_error      TEXT
+             );
+             INSERT INTO accounts (id) VALUES ('acct');
+             PRAGMA user_version = 14;"#,
+        )
+        .unwrap();
+
+    let store = Store::from_connection(connection).unwrap();
+    let indexes: Vec<String> = store
+        .with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master
+                  WHERE type = 'index' AND tbl_name = 'pending_ops'",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+    assert!(
+        indexes.iter().any(|name| name == "pending_ops_by_item"),
+        "migration must add the index: {indexes:?}"
+    );
+}
