@@ -1000,3 +1000,45 @@ async fn a_same_batch_folder_delete_and_recreate_does_not_adopt_the_old_contents
         "nothing local changed, so nothing may be uploaded"
     );
 }
+
+#[tokio::test]
+async fn a_stopped_engine_neither_writes_nor_reaches_the_service() {
+    // Signing out removes the engine from the daemon's map, but the
+    // coordinator and the hydration path hold Arc clones across awaits. Work
+    // already under way kept running: writing rows for an account about to be
+    // deleted, and — through its authenticator — rotating a token whose
+    // keyring entry had just been removed, which silently re-created it.
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "a.txt", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
+
+    h.engine.stop();
+
+    // Cancelled, not a 404 from the mock server: the request never left.
+    let error = h.engine.sync_remote().await.unwrap_err();
+    assert!(
+        matches!(error, gonedrive_core::Error::Cancelled),
+        "unexpected error: {error:?}"
+    );
+    assert!(h.store.item("F1").unwrap().is_none(), "nothing was applied");
+
+    std::fs::write(h.path("mine.txt"), b"local").unwrap();
+    let error = h
+        .engine
+        .sync_local_paths(std::slice::from_ref(&h.root))
+        .unwrap_err();
+    assert!(
+        matches!(error, gonedrive_core::Error::Cancelled),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        h.store.pending_count(ACCOUNT).unwrap(),
+        0,
+        "no work may be queued for a retired account"
+    );
+    assert!(h.engine.is_stopped());
+}

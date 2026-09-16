@@ -60,3 +60,11 @@
 - **首次发现**：2026-09-15（第三轮审计）
 - **根因**：`marks.rs::REFUSED_FILESYSTEMS` 覆盖了 fuse、nfs、smb/cifs、9p、afs、ceph 等，但缺 autofs（`0x0187`）与 overlayfs（`0x794c7630`）。autofs 挂载点被访问时可能触发按需挂载而长时间阻塞，overlay 的下层也可能由用户控制且缓慢——两者都能把一个 root worker 按住任意久，正是该清单要堵的那类"一个本地用户拖垮所有人"的路径。与 SS-006 叠加时后果更重。
 - **修复**：补入两项。
+
+## SS-008 · 账户生命周期：移除账户后引擎继续运行，令牌被重新写回钥匙环
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：有传输在进行时退出登录，日志涌出"unknown account"与外键错误、状态变 `error`；更糟的是刚删掉的钥匙环条目会被重新创建，账户像是没退干净。重复登录同一账户则出现两个引擎扫描同一个根，两个 `Authenticator` 轮流轮换同一个 refresh token 而互相作废。
+- **根因**：`detach_account` 只把引擎从 map 里摘掉。协调器与回填路径持有 `Arc<Engine>` 克隆并跨 await 使用，被摘掉的引擎照常跑完当前的下载、扫描与 delta；其 `Authenticator` 在下一次 Graph 调用时刷新令牌，而刷新成功就会 `save`，重建刚被删除的条目。`attach_account` 只拒绝**不同** id，同 id 直接 `insert` 覆盖，旧引擎并不停止。CLI 的 `logout` 完全绕过守护进程，同样制造分裂脑。
+- **修复**：新增统一的停止原语。`Engine::stop()` 置位并连带停止 `GraphClient`；所有操作都经过 `Engine::account()`，在那里一处检查即可让在途工作在下一个检查点以 `Cancelled` 退出；网络侧在 `send()` 与分片上传循环各检查一次，令牌刷新因此不再发生（分片上传走预授权会话 URL，本就不刷新）。`detach_account` 先停再摘，并清掉该根下的在途回填登记。`attach_account` 对同 id 改为"先退休旧引擎再装新的"。`report_core_error` 对 `Cancelled` 不再置错误状态——那是我们自己要求的停止。CLI `logout` 在守护进程运行时改走 D-Bus。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_stopped_engine_neither_writes_nor_reaches_the_service`（断言得到的是 `Cancelled` 而非 mock 服务器的 404，证明请求根本没有发出）。

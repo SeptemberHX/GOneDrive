@@ -205,6 +205,11 @@ pub struct Engine {
     /// can run beside a background delta. Serialising the per-item read/decide/
     /// write section prevents both paths from observing an item as new and
     /// racing two no-replace placeholder publications.
+    /// Set when the account has been signed out or replaced. Every operation
+    /// funnels through [`Engine::account`], so one check there retires work
+    /// that is already under way instead of letting it write on behalf of an
+    /// account the store is about to delete.
+    pub(super) stopped: std::sync::atomic::AtomicBool,
     pub(super) remote_apply: std::sync::Mutex<()>,
     /// Orders directory snapshots before delta changes. Graph children pages are
     /// not snapshots of the whole drive; allowing a slow, older listing to land
@@ -287,6 +292,7 @@ impl Engine {
             reported_skips: std::sync::Mutex::new(std::collections::HashSet::new()),
             dir_stamps: std::sync::Mutex::new(std::collections::HashSet::new()),
             placeholder_marks: std::sync::Mutex::new(std::collections::HashSet::new()),
+            stopped: std::sync::atomic::AtomicBool::new(false),
             remote_apply: std::sync::Mutex::new(()),
             remote_commit: tokio::sync::Mutex::new(()),
             folder_population: tokio::sync::Mutex::new(()),
@@ -339,7 +345,25 @@ impl Engine {
         let _ = self.events.send(event);
     }
 
+    /// Retire this engine: in-flight work ends at its next checkpoint and
+    /// nothing new starts. Calling it twice is harmless.
+    ///
+    /// Work that stops this way reports [`Error::Cancelled`], which the daemon
+    /// treats as "we asked for this" rather than as a failure to show the user.
+    pub fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.graph.stop();
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(super) fn account(&self) -> Result<Account> {
+        if self.is_stopped() {
+            return Err(Error::Cancelled);
+        }
         self.store
             .account(&self.account_id)?
             .ok_or_else(|| Error::other(format!("unknown account {}", self.account_id)))

@@ -113,6 +113,16 @@ pub(crate) async fn logout(account_id: Option<String>) -> Result<()> {
         (None, _) => anyhow::bail!("several accounts are signed in; name the one to sign out"),
     };
 
+    // Signing out in-process while a daemon is running is the split brain this
+    // module warns about: the daemon's engine keeps transferring for an account
+    // whose rows we just deleted, and its authenticator rotates the token —
+    // re-creating the keyring entry this command removed.
+    if let Some(proxy) = super::running_daemon().await {
+        proxy.remove_account(&account_id).await?;
+        println!("Signed out of {account_id}. Local files were left in place.");
+        return Ok(());
+    }
+
     let tokens = gonedrive_core::TokenStore::open().await?;
     tokens.delete(&account_id).await?;
     store.remove_account(&account_id)?;

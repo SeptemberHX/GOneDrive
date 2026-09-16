@@ -577,6 +577,17 @@ impl App {
         {
             anyhow::bail!("account {other} is already active");
         }
+        // Signing in again as the same account is a replacement, not a second
+        // engine. Inserting over the old one used to leave it running: two
+        // engines scanning one root, and two authenticators taking turns
+        // rotating — and so invalidating — the same refresh token.
+        if self.engines.read().await.contains_key(account_id) {
+            tracing::info!(
+                account_id,
+                "replacing the engine for a re-authenticated account"
+            );
+            self.detach_account(account_id).await;
+        }
 
         // Reading the refresh token can block on the Secret Service: a locked
         // keyring makes it wait on an unlock prompt that may never be answered.
@@ -632,8 +643,45 @@ impl App {
         Ok(())
     }
 
+    /// Retire an account's engine.
+    ///
+    /// Removing it from the map is not enough: the coordinator and the
+    /// hydration path take `Arc` clones and hold them across awaits, so a
+    /// transfer, scan or delta already under way would keep running — writing
+    /// on behalf of an account whose rows are about to be deleted, and
+    /// refreshing a token whose keyring entry has just been removed, which
+    /// silently re-creates it. Stopping first makes that work end at its next
+    /// checkpoint with `Cancelled`, which the daemon does not report as a
+    /// failure.
     pub async fn detach_account(&self, account_id: &str) {
-        self.engines.write().await.remove(account_id);
+        let engine = self.engines.write().await.remove(account_id);
+        if let Some(engine) = engine {
+            engine.stop();
+        }
+        // Nothing can arrive for it now; drop whatever it had in flight so a
+        // later account does not inherit its progress windows or staging.
+        self.forget_hydrations_for(account_id).await;
+    }
+
+    /// Drop in-flight hydration bookkeeping for a retired account.
+    async fn forget_hydrations_for(&self, account_id: &str) {
+        let Ok(Some(account)) = self.store.account(account_id) else {
+            // The rows may already be gone; without a root we cannot tell which
+            // entries were this account's, and the helper will unwind them.
+            return;
+        };
+        let root = account.root_local_path;
+        let mut hydrations = self.hydrations.write().await;
+        let doomed: Vec<_> = hydrations
+            .keys()
+            .filter(|path| path.starts_with(&root))
+            .cloned()
+            .collect();
+        for path in doomed {
+            if let Some(entry) = hydrations.remove(&path) {
+                entry.cancel.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Translate engine events into daemon status and front-end signals.
@@ -968,7 +1016,20 @@ impl App {
         self.emit(DaemonEvent::Status(snapshot));
     }
 
+    /// Report a failure as daemon status, unless we caused it.
+    ///
+    /// `Cancelled` means a deadline expired or an account was retired: the
+    /// work stopping is the intended outcome, so it must not leave the user
+    /// looking at an error state for something they asked for.
     async fn report_core_error(&self, error: &Error) -> String {
+        if matches!(error, Error::Cancelled) {
+            tracing::debug!("work stopped on request");
+            return error.to_string();
+        }
+        self.report_core_error_inner(error).await
+    }
+
+    async fn report_core_error_inner(&self, error: &Error) -> String {
         let (state, message) = core_error_status(error);
         self.set_state(state, Some(message.clone())).await;
         message

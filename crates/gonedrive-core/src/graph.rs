@@ -48,6 +48,11 @@ pub struct GraphClient {
     auth: TokenSource,
     /// Overridable so the engine can be tested against a local fake.
     base: String,
+    /// Set when the account this client belongs to has been retired. Requests
+    /// already in flight finish; no new one starts. This is what stops a
+    /// signed-out account from refreshing its token — and so re-creating the
+    /// keyring entry that signing out just deleted.
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 /// What happened to one chunk of a resumable upload.
@@ -72,7 +77,22 @@ impl GraphClient {
             http,
             auth: auth.into(),
             base: GRAPH_ENDPOINT.to_string(),
+            stopped: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Refuse every further request. Used when an account is signed out or
+    /// replaced while work is still in flight.
+    pub fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn ensure_running(&self) -> Result<()> {
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
+        Ok(())
     }
 
     /// Point the client at a different Graph endpoint.
@@ -445,6 +465,10 @@ impl GraphClient {
         let end = upload_range_end(offset, total_size, chunk_len)?;
         let mut attempt = 0;
         loop {
+            // A session URL carries its own authorisation and never refreshes
+            // the token, but a retired account's bytes still must not keep
+            // flowing.
+            self.ensure_running()?;
             attempt += 1;
             let response = self
                 .http
@@ -718,6 +742,10 @@ impl GraphClient {
         let mut reauthenticated = false;
 
         loop {
+            // Checked per attempt, not once: a retry must not outlive the
+            // account either, and `access_token` below is what would rotate
+            // the credential of an account that no longer exists.
+            self.ensure_running()?;
             attempt += 1;
             let token = self.auth.access_token().await?;
             let result = build(&self.http).bearer_auth(&token).send().await;
