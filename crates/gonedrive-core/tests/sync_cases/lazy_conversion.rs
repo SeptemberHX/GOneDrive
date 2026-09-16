@@ -139,3 +139,68 @@ async fn converting_a_full_tree_to_lazy_keeps_content_and_prunes_the_rest() {
     );
     assert!(h.store.item("G-FILE").unwrap().is_some());
 }
+
+#[tokio::test]
+async fn a_placeholder_filled_during_the_conversion_survives_it() {
+    // The conversion decides what to prune in one pass and unlinks in another.
+    // On a large tree minutes separate them, and in between the helper can
+    // fill a placeholder a user just opened, and the user can edit it. Those
+    // bytes have never been uploaded, so unlinking them is data loss.
+    use gonedrive_core::hydrate::{Placeholder, PlaceholderState, XATTR_STATE};
+
+    let h = Harness::with_config(Config {
+        client_id: "test".into(),
+        download_new: DownloadPolicy::Never,
+        on_demand: false,
+        ..Config::default()
+    })
+    .await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("X", ROOT, "X"),
+            file("X-FILE", "X", "x.txt", "c1", 10, "2026-08-20T10:00:00Z"),
+            folder("Y", "X", "Y"),
+            file("Y-FILE", "Y", "y.txt", "c1", 20, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    assert_eq!(h.sync().await.failed, 0);
+    h.engine.materialize_all(|_, _| true).unwrap();
+    h.engine.enable_on_demand();
+    assert_eq!(
+        Placeholder::state(&h.path("X/x.txt")),
+        PlaceholderState::Dehydrated
+    );
+
+    // Pruning runs deepest first, so Y is unlinked before X is examined. Fill
+    // X's placeholder in the gap between them, exactly as a foreground read
+    // would.
+    let filled = h.path("X/x.txt");
+    let outcome = h
+        .engine
+        .convert_to_lazy(|done, _| {
+            if done == 1 {
+                std::fs::write(&filled, b"opened while converting").unwrap();
+                xattr::set(&filled, XATTR_STATE, b"hydrated").unwrap();
+            }
+            true
+        })
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(h.path("X/x.txt")).unwrap(),
+        b"opened while converting",
+        "the bytes fetched during the conversion must survive it"
+    );
+    assert!(
+        h.store.item("X-FILE").unwrap().is_some(),
+        "dropping the row would orphan the file: no id, no state, nothing to sync it back"
+    );
+    assert!(
+        outcome.placeholders_removed >= 1,
+        "the untouched placeholder under Y is still pruned"
+    );
+}

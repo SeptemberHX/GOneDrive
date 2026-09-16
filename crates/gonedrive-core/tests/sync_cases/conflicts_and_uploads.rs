@@ -698,3 +698,66 @@ async fn an_ambiguous_completion_after_restart_never_resends_file_bytes() {
     assert!(h.store.item("NEW").unwrap().is_some());
     assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 0);
 }
+
+#[tokio::test]
+async fn a_chunked_upload_stops_rather_than_committing_two_versions_spliced() {
+    // Fragments are read from the live inode. A save landing between them used
+    // to splice the head of one version onto the tail of another and let the
+    // service commit that; the attempt then failed, and the retry's stale
+    // If-Match met our own upload, turning the user's newest save into a
+    // conflict copy of a file nobody else had touched.
+    let h = chunked_upload_harness().await;
+    let upload_url = format!("{}/session-torn", h.server.uri());
+    Mock::given(method("POST"))
+        .and(path_regex(r"createUploadSession$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"uploadUrl": upload_url.clone(), "expirationDateTime": "2030-01-01T00:00:00Z"}),
+        ))
+        .mount(&h.server)
+        .await;
+    // Held open long enough for the edit below to land while it is in flight.
+    Mock::given(method("PUT"))
+        .and(path("/session-torn"))
+        .and(header("Content-Range", "bytes 0-327679/400000"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .set_delay(std::time::Duration::from_millis(800))
+                .set_body_json(json!({"nextExpectedRanges": ["327680-399999"]})),
+        )
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    // The tail belongs to a different version of the file. It must never be
+    // sent: the service would commit the splice.
+    Mock::given(method("PUT"))
+        .and(path("/session-torn"))
+        .and(header("Content-Range", "bytes 327680-399999/400000"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(uploaded_big_item()))
+        .expect(0)
+        .mount(&h.server)
+        .await;
+
+    let edit = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::fs::write(h.path("big.bin"), vec![9u8; 400_000]).unwrap();
+    };
+    let (summary, ()) = tokio::join!(h.sync(), edit);
+
+    assert_eq!(summary.uploaded, 0, "nothing was committed");
+    assert!(
+        h.store.item("NEW").unwrap().is_none(),
+        "no spliced version may be recorded"
+    );
+    let strays: Vec<_> = std::fs::read_dir(&h.root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "big.bin" && !name.starts_with('.'))
+        .collect();
+    assert!(strays.is_empty(), "no conflict copy may appear: {strays:?}");
+    assert_eq!(
+        h.store.pending_count(ACCOUNT).unwrap(),
+        1,
+        "the upload stays queued and retries with the new content"
+    );
+}

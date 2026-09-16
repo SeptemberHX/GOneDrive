@@ -74,3 +74,19 @@
 ## 小结：size+mtime 启发式的三处破坏面已全部加哈希门禁
 
 `Engine::local_content_unsynced`（内容哈希 vs `user.gonedrive.quickxor` xattr，稀疏文件短路）现同时守护：**dehydrate 打洞**（DL-004）、**下载覆盖**（DL-004b）、**materialize 空洞重建**（DL-003）。加上 **DL-001 批量删除/挂载护栏**、**SC-002 resync 清扫护栏**、**DL-005 If-Match**、**DL-007 冲突副本防碰撞**，Phase 1 数据丢失面已系统性堵住。
+
+## DL-008 · 分片上传期间编辑 → 服务端提交前后拼接的内容 → 伪冲突副本
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：≥ 4 MiB 的文件在上传过程中被再次保存，结果是本地多出一份"冲突副本"，而原文件名回落到一个既非旧版也非新版的内容——云端并没有其他人改过它。
+- **根因**：两处。其一，分片是从活文件逐块读的（`transfer/upload.rs::read_chunk`），保存落在两片之间时服务端收到"前半旧、后半新"的拼接内容并提交。其二，`finish_upload` 在提交**之后**才比较版本并返回错误，于是 `run_upload` 在 `upsert_item_after_mutation` 之前退出，库里仍是旧 etag；重试带旧 `If-Match` 撞上我们自己刚提交的版本，Graph 返回 412，走冲突副本分支。SC-010 的修复只覆盖了 &lt; 4 MiB 的简单上传路径。
+- **修复**：分片循环在发送每一片前复验源版本，一旦变化立即以瞬时错误中止——此时尚未提交，item 的 etag 没有推进，重试的 `If-Match` 仍然匹配，而指纹变化会让 `resume_or_create` 基于新内容重建会话。提交之后才发现的变化不再是错误：那些字节是服务端确实持有的版本，由调用方记录并为新内容排队（与简单上传路径一致）。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_chunked_upload_stops_rather_than_committing_two_versions_spliced`（已验证：无修复时 RED，第二片被发出）。
+
+## DL-009 · 切换按需模式时，转换过程中被填充的文件被删除
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：切到按需模式期间打开并编辑了某个文件，转换结束后该文件连同它的记录一起消失。
+- **根因**：`sync/hydration/lazy.rs` 的转换分两遍——先决策再删除。大树上两遍之间可达数分钟，helper 完全可能在此期间填充某个占位符、用户随后编辑它，而第二遍 `prune_folder` 无条件 `remove_file`，随后 `delete_subtree` 连记录一并删掉。这些字节从未上传过。
+- **修复**：删除前逐个复验 inode 仍是"自有且 Dehydrated"的占位符；已经有内容的保留文件，并把它的 id 排除在随后的行删除之外（否则会留下一个没有 id、没有状态、无法同步回去的孤儿文件）。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_placeholder_filled_during_the_conversion_survives_it`（用进度回调在两个文件夹之间制造确定性竞争；已验证：无修复时 RED，文件不存在）。

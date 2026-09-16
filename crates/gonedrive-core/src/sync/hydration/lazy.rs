@@ -39,7 +39,10 @@ struct Prune {
     /// The folder's own directory, when it exists on disk.
     path: Option<PathBuf>,
     /// Verified dehydrated placeholders directly inside it.
-    placeholders: Vec<PathBuf>,
+    /// Each placeholder to unlink, with the item id it must still carry at
+    /// that moment. The decision pass runs to completion before the first
+    /// unlink, and a large tree takes minutes.
+    placeholders: Vec<(PathBuf, String)>,
 }
 
 impl Engine {
@@ -209,7 +212,7 @@ impl Engine {
                         // published: content this device owns.
                         return Ok(None);
                     }
-                    placeholders.push(child_path);
+                    placeholders.push((child_path, child.id.clone()));
                 }
                 // Anything the index cannot account for — a file the user
                 // created, a symlink, a foreign directory — is kept, and so
@@ -252,7 +255,29 @@ impl Engine {
             Placeholder::set_directory_population_file(&dir, DirectoryPopulation::Partial)?;
         }
 
-        for placeholder in placeholders {
+        // Re-check every inode at the moment of the unlink. The scan that
+        // chose these ran earlier — minutes earlier on a large tree — and the
+        // helper can fill a placeholder, and the user edit it, in between.
+        // Unlinking then would destroy bytes that were never uploaded.
+        let mut kept_ids: HashSet<String> = HashSet::new();
+        for (placeholder, item_id) in placeholders {
+            match rooted.open_read(&placeholder) {
+                Ok(file) => {
+                    let online_only = Placeholder::state_file(&file)
+                        == PlaceholderState::Dehydrated
+                        && Placeholder::item_id_file(&file).as_deref() == Some(item_id.as_str());
+                    if !online_only {
+                        tracing::info!(
+                            path = %placeholder.display(),
+                            "keeping a placeholder that gained content since the scan"
+                        );
+                        kept_ids.insert(item_id);
+                        continue;
+                    }
+                }
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            }
             match rooted.remove_file(&placeholder) {
                 Ok(()) => outcome.placeholders_removed += 1,
                 Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -261,6 +286,11 @@ impl Engine {
         }
 
         for child in self.store.children(&self.account_id, &folder.id)? {
+            // Its bytes are still on disk. Dropping the row would orphan the
+            // file: no id, no state, and nothing to sync it back.
+            if kept_ids.contains(&child.id) {
+                continue;
+            }
             if child.is_folder {
                 if let Some(child_path) = self.store.local_path(account, &child.id)? {
                     match rooted.remove_dir(&child_path) {

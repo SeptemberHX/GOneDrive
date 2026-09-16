@@ -219,9 +219,7 @@ async fn upload_resumable(
     let commit = UploadCommit {
         store,
         target: &target,
-        source,
         source_version,
-        rooted,
         size,
     };
     let (mut session, resumed) =
@@ -310,6 +308,17 @@ async fn upload_resumable(
                 on_progress,
             )
             .await;
+        }
+
+        // Fragments are read from the live inode, so a save landing between
+        // them would otherwise hand the service the head of one version and
+        // the tail of another — and that mixture is what gets committed. Stop
+        // before sending more bytes: nothing is committed yet, so the item's
+        // eTag has not moved and a retry's If-Match still matches, while the
+        // changed fingerprint makes `resume_or_create` start a fresh session
+        // from the new content rather than resuming into the old one.
+        if !capture(rooted, source)?.same_content_as(commit.source_version) {
+            return Err(file_changed_error(source, "uploading"));
         }
 
         let len = config.upload_chunk_size.min(size - offset);
@@ -436,9 +445,9 @@ async fn resume_or_create(
 struct UploadCommit<'a, 'target> {
     store: &'a Store,
     target: &'a UploadTarget<'target>,
-    source: &'a Path,
+    /// The version whose bytes this session is sending. The fragment loop
+    /// compares against it to stop before mixing two versions together.
     source_version: FileVersion,
-    rooted: Option<&'a RootedFs>,
     size: u64,
 }
 
@@ -502,10 +511,14 @@ fn finish_upload(
         .delete_upload_session(commit.target.account_id, commit.target.session_key)?;
     // The service has committed the file. Finalise bookkeeping even if the
     // scheduling slice expired during the last request.
+    //
+    // A source that moved on during the final fragment is deliberately *not*
+    // an error here. These bytes are a real version the service now holds, and
+    // the caller records it and queues the newer content. Failing instead left
+    // the store on the previous eTag, so the retry's If-Match met our own
+    // upload, Graph answered 412, and the user's newest save became a conflict
+    // copy of a file nobody else had touched.
     let _ = on_progress(commit.size, commit.size);
-    if capture(commit.rooted, commit.source)? != commit.source_version {
-        return Err(file_changed_error(commit.source, "uploading"));
-    }
     Ok(item)
 }
 
