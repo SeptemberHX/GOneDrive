@@ -5,10 +5,10 @@ use gonedrive_core::sync::engine::QueueScope;
 use gonedrive_ipc::reader_policy::FILE_MANAGER_COPY_READER;
 
 use super::{
-    core_error_status, decide_stage, is_browsing_reader, missing_account_retry_due, outbound_scope,
-    pending_snapshot, phase_completion_state, phase_state, remote_poll_ready,
-    summary_has_reportable_activity, sync_barrier_ready, update_pending_status, PathLocks,
-    StagePlan, KEYRING_LOCKED_MESSAGE, PARTIAL_HYDRATION_CEILING,
+    core_error_status, decide_stage, is_account_level_state, is_browsing_reader,
+    missing_account_retry_due, outbound_scope, pending_snapshot, phase_completion_state,
+    phase_state, remote_poll_ready, summary_has_reportable_activity, sync_barrier_ready,
+    update_pending_status, PathLocks, StagePlan, KEYRING_LOCKED_MESSAGE, PARTIAL_HYDRATION_CEILING,
 };
 
 #[test]
@@ -508,5 +508,24 @@ fn file_managers_browse_and_applications_consume() {
     }
     for consumer in ["cat", "gedit", "cp", "libreoffice", "md5sum", ""] {
         assert!(!is_browsing_reader(consumer), "{consumer:?}");
+    }
+}
+
+#[test]
+fn a_finished_transfer_may_not_declare_idle_over_an_unreachable_account() {
+    // The event forwarder keeps its own view of the sync phase and used to
+    // write it over everything, including the coordinator's verdict on the
+    // account. The tray then read "idle" while the daemon was offline.
+    for state in ["offline", "keyring_locked", "signed_out"] {
+        assert!(
+            is_account_level_state(state),
+            "{state} belongs to the account"
+        );
+    }
+    // Raised by the forwarder itself for a failed cycle, so it must stay
+    // clearable by the next clean one.
+    assert!(!is_account_level_state("error"));
+    for state in ["idle", "syncing", "enumerating", "downloading", "paused"] {
+        assert!(!is_account_level_state(state), "{state} describes work");
     }
 }

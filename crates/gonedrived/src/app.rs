@@ -145,6 +145,16 @@ fn decide_stage(
     }
 }
 
+/// States that describe the account rather than a transfer.
+///
+/// Only the coordinator sets them, and only it can tell when they are over: a
+/// transfer completing says nothing about whether the account is reachable.
+/// `error` is deliberately absent — the event forwarder raises that one itself
+/// for a failed cycle, so it must also be able to clear it on a clean one.
+pub(super) fn is_account_level_state(state: &str) -> bool {
+    matches!(state, "offline" | "keyring_locked" | "signed_out")
+}
+
 fn core_error_status(error: &Error) -> (&'static str, String) {
     match error {
         Error::AuthRequired(message) => ("signed_out", message.clone()),
@@ -878,7 +888,23 @@ impl App {
                                 }
                             }
                         }
-                        *shared.write().await = current.clone();
+                        {
+                            let mut shared = shared.write().await;
+                            // A finished transfer knows nothing about the
+                            // account being unreachable. Declaring "idle" over
+                            // that says "nothing to do, all is well", which is
+                            // exactly what is false — the tray then showed
+                            // idle while the daemon was offline. The
+                            // coordinator sets these states and clears them
+                            // when the account works again; leave them alone.
+                            if current.state == "idle" && is_account_level_state(&shared.state) {
+                                current.state.clone_from(&shared.state);
+                                if current.last_error.is_empty() {
+                                    current.last_error.clone_from(&shared.last_error);
+                                }
+                            }
+                            *shared = current.clone();
+                        }
                         let _ = sender.send(DaemonEvent::Status(current.clone()));
                     }
                     // Lagged: the UI missed some events, which is harmless —

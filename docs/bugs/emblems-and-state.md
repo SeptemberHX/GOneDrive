@@ -20,3 +20,12 @@
 - **根因**：占位符状态双权威（xattr 权威用于恢复，DB 用于决策），无内容级交叉校验。
 - **修复（已完成，随 DL-004）**：dehydrate 护栏改为内容哈希驱动的 `Engine::local_content_unsynced`——**不再信任 DB 的 Dehydrated 状态**：满分配文件必须哈希匹配已录内容才放行，故 xattr/DB 失同步（DB 说 Dehydrated 但磁盘满内容且未上传）不再能绕过护栏打真实字节。主条目见 [data-loss.md](data-loss.md) DL-004。
 - **回归测试**：`freeing_space_refuses_an_in_place_edit_that_kept_size_and_mtime`（同一门禁覆盖失同步机制）。
+
+## ES-002 · 传输完成会把"离线"覆盖成"空闲"
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：远端轮询失败、守护进程已置为离线，但托盘和面板显示"空闲"，`last_error` 也被清空；用户以为一切正常，实际什么都没在同步。
+- **根因**：`crates/gonedrived/src/app.rs` 的事件转发任务维护一份私有 `SyncStatus`，每收到一个引擎事件就整体覆盖共享状态（`*shared.write().await = current.clone()`）。它不知道协调器刚刚设置了 `offline`/`keyring_locked`/`signed_out`，于是一个仍在运行的传输切片发出 `Finished` 就把账户级判断抹掉了。
+- **修复**：转发器仍可报告任何活动状态，但不得在账户级故障之上宣布 `idle`——"空闲"的含义是"没有待办且一切正常"，而此时后半句为假。`error` 刻意不在此列：那一条是转发器自己为失败的周期设置的，必须能被下一个干净周期清除。
+- **限制**：这是止损。正确的结构是让转发器成为状态的唯一写者、`set_state` 改为投递事件（见审查报告第 8 节），本次未做。
+- **回归测试**：`crates/gonedrived/src/app/tests.rs::a_finished_transfer_may_not_declare_idle_over_an_unreachable_account`（覆盖判定规则；转发任务本身需要引擎实例，尚无集成测试）。
