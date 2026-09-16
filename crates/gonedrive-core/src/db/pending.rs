@@ -383,25 +383,32 @@ impl Store {
     /// directory costs the same when nothing is queued, which is the usual
     /// case.
     pub fn cancel_pending_deletes(&self, account_id: &str, item_ids: &[&str]) -> Result<usize> {
-        if item_ids.is_empty() {
-            return Ok(0);
+        // SQLite refuses more than SQLITE_MAX_VARIABLE_NUMBER bindings — 32766
+        // in the bundled build — and a directory with that many indexed
+        // children is not hypothetical. Exceeding it would fail the statement
+        // and, with it, the whole scan.
+        const PER_STATEMENT: usize = 500;
+
+        let mut removed = 0;
+        for chunk in item_ids.chunks(PER_STATEMENT) {
+            removed += self.with_conn(|conn| {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "DELETE FROM pending_ops
+                      WHERE account_id = ?1 AND kind = 'delete_remote'
+                        AND item_id IN ({placeholders})"
+                );
+                let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+                values.push(&account_id);
+                for id in chunk {
+                    values.push(id);
+                }
+                Ok(conn.execute(&sql, values.as_slice())?)
+            })?;
         }
-        self.with_conn(|conn| {
-            let placeholders = std::iter::repeat_n("?", item_ids.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "DELETE FROM pending_ops
-                  WHERE account_id = ?1 AND kind = 'delete_remote'
-                    AND item_id IN ({placeholders})"
-            );
-            let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(item_ids.len() + 1);
-            values.push(&account_id);
-            for id in item_ids {
-                values.push(id);
-            }
-            Ok(conn.execute(&sql, values.as_slice())?)
-        })
+        Ok(removed)
     }
 
     /// Postpone an operation without holding it against its retry budget.

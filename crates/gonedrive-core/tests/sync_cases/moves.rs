@@ -492,3 +492,93 @@ fn assert_no_strays(h: &Harness, expected: &[&str]) {
         .collect();
     assert!(strays.is_empty(), "unexpected leftovers: {strays:?}");
 }
+
+#[tokio::test]
+async fn a_file_parked_for_a_rearrangement_is_not_mistaken_for_a_deletion() {
+    // Parking renames the inode and its record together. If a local scan runs
+    // before the batch moves it on — the daemon restarted, the batch deferred
+    // — the two must still agree: the record is not "missing from disk" (which
+    // would delete the real file in the cloud) and the file is not "new"
+    // (which would upload a duplicate).
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![file("X", ROOT, "x.txt", "c1", 3, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
+    h.mock_download("X", b"xxx").await;
+    h.sync().await;
+
+    // Exactly what park_rearranged_occupant leaves behind.
+    let parked_name = ".gonedrive-moving-X";
+    std::fs::rename(h.path("x.txt"), h.path(parked_name)).unwrap();
+    h.store.rename_item_local("X", parked_name).unwrap();
+
+    let summary = h
+        .engine
+        .sync_local_paths(std::slice::from_ref(&h.root))
+        .unwrap();
+
+    assert_eq!(summary.failed, 0);
+    let queued = h.store.pending_ops(ACCOUNT, 10).unwrap();
+    assert!(
+        queued.is_empty(),
+        "a parked file is neither a deletion nor an addition: {queued:?}"
+    );
+    assert_eq!(h.read(parked_name), "xxx", "its bytes are untouched");
+    assert_eq!(
+        h.store.item("X").unwrap().unwrap().name,
+        parked_name,
+        "the record still follows the inode"
+    );
+}
+
+#[tokio::test]
+async fn a_folder_renamed_onto_a_deleted_folders_name_does_not_collide_with_it() {
+    // The pass that promotes displaced tombstones only promotes files, so the
+    // doomed folder is still in place when the renamed one arrives. Treating
+    // it as a conflict filed a copy of a directory the user never touched and
+    // then let the tombstone remove whichever directory ended up at the name.
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            folder("Y", ROOT, "docs"),
+            file("YF", "Y", "old.txt", "c1", 3, "2026-08-20T10:00:00Z"),
+            folder("X", ROOT, "archive"),
+            file("XF", "X", "keep.txt", "c2", 4, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("YF", b"old").await;
+    h.mock_download("XF", b"keep").await;
+    h.sync().await;
+    assert_eq!(h.read("docs/old.txt"), "old");
+    assert_eq!(h.read("archive/keep.txt"), "keep");
+
+    h.server.reset().await;
+    h.mock_delta(
+        Some(("token", "v1")),
+        vec![
+            folder("X", ROOT, "docs"),
+            tombstone("YF", "Y"),
+            tombstone("Y", ROOT),
+        ],
+        "v2",
+    )
+    .await;
+    let summary = h.sync().await;
+
+    assert_eq!(summary.conflicts, 0, "a rearrangement is not a conflict");
+    assert_eq!(
+        h.read("docs/keep.txt"),
+        "keep",
+        "the renamed folder keeps its own contents under the freed name"
+    );
+    assert!(!h.path("archive").exists(), "its old name is gone");
+    assert!(h.store.item("Y").unwrap().is_none());
+    assert!(h.store.item("YF").unwrap().is_none());
+    assert!(h.store.due_outbound_ops(ACCOUNT, 10).unwrap().is_empty());
+}

@@ -116,23 +116,6 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
         return;
     }
 
-    // Past the daemon's own accesses, which answer immediately. Everything
-    // below can block this worker for the whole hydration timeout, so one uid
-    // may only hold its share of the pool.
-    let _slot = match shared.claim_worker(stat.st_uid as u32) {
-        Some(slot) => slot,
-        None => {
-            tracing::warn!(
-                uid = stat.st_uid,
-                "uid is already using its share of the worker pool"
-            );
-            if event.requires_response {
-                let _ = shared.fan.respond(fd, false);
-            }
-            return;
-        }
-    };
-
     let (uid, kind, registered_path, child_notification) = {
         let marks = shared.marks.lock().unwrap();
         match marks.get(&identity) {
@@ -312,6 +295,22 @@ pub(super) fn handle_event(shared: Arc<Shared>, event: PreContentEvent) {
         }
         tracing::info!(reader = %comm, path = ?event.path, "copier open; hydrating whole file");
     }
+
+    // Only now, immediately before the round trip that can hold this worker
+    // for the whole hydration timeout. Claiming earlier would have refused
+    // the cheap answers above — an already-materialised range, an ordinary
+    // open — turning a wait into an EPERM for a user simply opening a folder
+    // with more placeholders than the ceiling.
+    let _slot = match shared.claim_worker(uid) {
+        Some(slot) => slot,
+        None => {
+            tracing::warn!(uid, "uid is already using its share of the worker pool");
+            if event.requires_response {
+                let _ = shared.fan.respond(fd, false);
+            }
+            return;
+        }
+    };
 
     // Keep the request id on the fanotify worker's stack until the final
     // `Filled` event is sent.  The daemon uses it to reject a late completion

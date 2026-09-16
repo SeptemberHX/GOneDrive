@@ -149,7 +149,12 @@ impl Engine {
                 };
                 match self.run_op(&op, summary, deadline).await {
                     Ok(()) => self.store.complete_op(op.id)?,
-                    Err(Error::Cancelled) if deadline.is_some() => return Ok(()),
+                    // Unconditional: a slice deadline is not the only source
+                    // of cancellation any more — retiring an account stops its
+                    // engine the same way. Falling through to `record_failure`
+                    // would call this a permanent failure and delete the row,
+                    // losing work that was never attempted.
+                    Err(Error::Cancelled) => return Ok(()),
                     // Credentials are shared account state, not a bad file.
                     // Leave the operation untouched and let the coordinator
                     // expose the actionable account status to the user.

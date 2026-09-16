@@ -272,12 +272,15 @@ impl Engine {
             // An untouched placeholder is not an edit, whatever its stale
             // recorded stat says (see the tombstone path in `apply_remote`).
             if !stale.is_folder {
-                let untouched_placeholder = crate::sync::local::owned_placeholder_state(
-                    &self.rooted(account)?,
-                    &path,
-                    &stale.id,
-                ) == Some(crate::hydrate::PlaceholderState::Dehydrated);
                 if let Some(local) = stat_of(&path) {
+                    // Proven, not guessed: an unreadable mode-000 file is
+                    // taken for a placeholder when deciding whether to upload,
+                    // and that bias is wrong when deciding whether to delete.
+                    let untouched_placeholder = crate::sync::local::confirmed_online_only(
+                        &self.rooted(account)?,
+                        &path,
+                        &stale.id,
+                    );
                     if crate::sync::plan::local_is_modified(&stale, &local)
                         && !untouched_placeholder
                     {

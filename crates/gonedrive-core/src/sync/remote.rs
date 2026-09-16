@@ -583,8 +583,7 @@ impl Engine {
         // download branch never recorded a stat at all. Keeping it as a
         // "local edit" left an orphan the user could see but never open.
         let untouched_placeholder = !known.is_folder
-            && super::local::owned_placeholder_state(&self.rooted(account)?, &path, &known.id)
-                == Some(PlaceholderState::Dehydrated);
+            && super::local::confirmed_online_only(&self.rooted(account)?, &path, &known.id);
         match decide_remote(remote, Some(&known), local.as_ref()) {
             RemoteAction::KeepLocalAndReupload if !untouched_placeholder => {
                 // Detach it from the remote item that no longer exists and
@@ -710,7 +709,7 @@ impl Engine {
         };
         if !self
             .store
-            .staged_upsert_is_unapplied(&self.account_id, &occupant.id)?
+            .staged_delta_is_unapplied(&self.account_id, &occupant.id)?
         {
             // It is staying. Whatever is here is content this device owns.
             return Ok(None);
@@ -722,7 +721,28 @@ impl Engine {
         let parked_name = format!(".gonedrive-moving-{}", sanitise_id(&occupant.id));
         let parked = path.with_file_name(&parked_name);
         rooted.rename_noreplace(path, &parked)?;
-        self.store.rename_item_local(&occupant.id, &parked_name)?;
+
+        // Both the record and any queued work have to follow the inode. A
+        // download already queued for this item still names the old path; left
+        // there it would write these bytes over whatever moves into that name
+        // next, and the scan would then read the result as an edit of the
+        // wrong file.
+        let bookkeeping = self
+            .store
+            .rename_item_local(&occupant.id, &parked_name)
+            .and_then(|()| {
+                self.store
+                    .rebase_pending_paths(&self.account_id, path, &parked)
+            });
+        if let Err(error) = bookkeeping {
+            // The rename is the only half already on disk. Undo it so the two
+            // cannot disagree about where this item lives: a record pointing
+            // at a name that no longer exists reads to the next scan as a
+            // deletion of a file the user never touched.
+            let _ = self.store.rename_item_local(&occupant.id, &occupant.name);
+            let _ = rooted.rename_noreplace(&parked, path);
+            return Err(error);
+        }
         Ok(Some(parked))
     }
 

@@ -351,12 +351,14 @@ impl Engine {
             // The pin every file here inherits unless it carries one of its
             // own. Resolving it per file walked the ancestor chain in SQL once
             // per file for an answer that cannot differ between siblings.
-            let inherited_pin = match &parent_id {
-                Some(parent_id) => self
-                    .store
-                    .effective_pin(parent_id, self.config.download_new.default_pin())?,
-                None => self.config.download_new.default_pin(),
-            };
+            // Degrade rather than abort: this only decides a file manager's
+            // emblem, and failing the whole scan would drop every deletion and
+            // upload it had already found.
+            let default_pin = self.config.download_new.default_pin();
+            let inherited_pin = parent_id
+                .as_ref()
+                .and_then(|parent_id| self.store.effective_pin(parent_id, default_pin).ok())
+                .unwrap_or(default_pin);
 
             // One statement for the directory rather than one per file. A
             // queued deletion is withdrawn the moment its file turns up again,
@@ -994,6 +996,23 @@ fn inspect_file(rooted: &RootedFs, path: &Path) -> Option<Inspected> {
         file,
         item_id,
         state,
+    })
+}
+
+/// Whether this path is, provably, a placeholder of `item_id` holding nothing.
+///
+/// Stricter than [`owned_placeholder_state`] on purpose: that one treats any
+/// unreadable mode-000 file as a placeholder, which is the safe guess when
+/// deciding whether to *upload*. Deciding whether to *delete* needs the
+/// opposite bias, so this answers false unless the marks were actually read.
+pub(super) fn confirmed_online_only(
+    rooted: &super::rooted_fs::RootedFs,
+    path: &Path,
+    expected_item_id: &str,
+) -> bool {
+    rooted.open_read(path).is_ok_and(|file| {
+        Placeholder::item_id_file(&file).as_deref() == Some(expected_item_id)
+            && Placeholder::state_file(&file) == PlaceholderState::Dehydrated
     })
 }
 
