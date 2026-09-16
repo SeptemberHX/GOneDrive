@@ -120,6 +120,10 @@ pub struct Authenticator {
     account_id: String,
     store: Arc<TokenStore>,
     tokens: Mutex<TokenSet>,
+    /// The refresh token held in memory is newer than the one in the keyring.
+    /// Set when a save failed — a locked collection, a dismissed prompt — so a
+    /// later call retries the save instead of leaving the stored copy behind.
+    persist_pending: std::sync::atomic::AtomicBool,
 }
 
 impl Authenticator {
@@ -132,6 +136,9 @@ impl Authenticator {
         store: Arc<TokenStore>,
         tokens: TokenSet,
     ) -> Result<Self> {
+        // A sign-in that cannot be stored has not really happened: the user is
+        // present and can unlock the keyring, so fail here rather than carry a
+        // session that disappears at the next start.
         store.save(&account_id, &tokens.refresh_token).await?;
         Ok(Self {
             http,
@@ -139,6 +146,7 @@ impl Authenticator {
             account_id,
             store,
             tokens: Mutex::new(tokens),
+            persist_pending: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -157,13 +165,28 @@ impl Authenticator {
             Error::AuthRequired(format!("no stored credentials for account {account_id}"))
         })?;
         let tokens = auth::refresh(&http, &client_id, &refresh_token).await?;
-        store.save(&account_id, &tokens.refresh_token).await?;
+        // The service has already rotated the token, so the copy on disk may
+        // now be dead. Failing here used to throw away the live token and
+        // force a fresh sign-in over what was only a locked keyring.
+        let rotated = tokens.refresh_token != refresh_token;
+        let persist_pending = rotated
+            && match store.save(&account_id, &tokens.refresh_token).await {
+                Ok(()) => false,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "could not store the rotated refresh token; keeping it in memory"
+                    );
+                    true
+                }
+            };
         Ok(Self {
             http,
             client_id,
             account_id,
             store,
             tokens: Mutex::new(tokens),
+            persist_pending: std::sync::atomic::AtomicBool::new(persist_pending),
         })
     }
 
@@ -173,19 +196,41 @@ impl Authenticator {
 
     /// A token guaranteed to be valid for at least the refresh skew.
     pub async fn access_token(&self) -> Result<String> {
+        use std::sync::atomic::Ordering;
+
         let mut tokens = self.tokens.lock().await;
         if tokens.needs_refresh() {
             let refreshed =
                 auth::refresh(&self.http, &self.client_id, &tokens.refresh_token).await?;
             // Persist before publishing: if we crash between the two, the next
             // start reads a token that is at worst one rotation stale, rather
-            // than one we already burned.
+            // than one we already burned. A save that *fails*, though, must
+            // not discard the rotation — the service has committed it — so
+            // publish regardless and retry the save on a later call.
             if refreshed.refresh_token != tokens.refresh_token {
-                self.store
+                if let Err(error) = self
+                    .store
                     .save(&self.account_id, &refreshed.refresh_token)
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(%error, "could not store the rotated refresh token; will retry");
+                    self.persist_pending.store(true, Ordering::Relaxed);
+                }
             }
             *tokens = refreshed;
+        }
+        if self.persist_pending.load(Ordering::Relaxed) {
+            match self
+                .store
+                .save(&self.account_id, &tokens.refresh_token)
+                .await
+            {
+                Ok(()) => {
+                    self.persist_pending.store(false, Ordering::Relaxed);
+                    tracing::info!("stored the refresh token that an earlier attempt could not");
+                }
+                Err(error) => tracing::debug!(%error, "refresh token still not stored"),
+            }
         }
         Ok(tokens.access_token.clone())
     }

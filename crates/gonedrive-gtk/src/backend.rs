@@ -508,9 +508,8 @@ async fn handle(
                 }
             }
         },
-        Command::RemoveAccount(id) => {
-            let ok = proxy.remove_account(&id).await.is_ok();
-            if ok {
+        Command::RemoveAccount(id) => match proxy.remove_account(&id).await {
+            Ok(()) => {
                 if let (Ok(accounts), Ok(status)) =
                     (proxy.list_accounts().await, proxy.status().await)
                 {
@@ -521,9 +520,13 @@ async fn handle(
                         refresh_sync_mode(proxy, ui).await;
                     }
                 }
+                true
             }
-            ok
-        }
+            // A daemon that refused the removal is still there. Tearing the
+            // connection down would drop the panel to its offline page over
+            // an ordinary "no".
+            Err(e) => !is_disconnected(&e),
+        },
         Command::Refresh => match (proxy.list_accounts().await, proxy.status().await) {
             (Ok(accounts), Ok(status)) => {
                 let has_account = !accounts.is_empty();
@@ -534,7 +537,7 @@ async fn handle(
                 }
                 true
             }
-            _ => false,
+            (Err(e), _) | (_, Err(e)) => !is_disconnected(&e),
         },
     }
 }

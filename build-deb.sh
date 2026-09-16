@@ -103,7 +103,7 @@ if [ "$1" = configure ]; then
     # gonedrived-codex. Drop-ins override the packaged unit, so migrate only
     # that known legacy file and retain a disabled copy for recovery. The
     # daemon is restarted below when the user's bus is available.
-    getent passwd | while IFS=: read -r _ _ uid _ _ home _; do
+    getent passwd | while IFS=: read -r name _ uid _ _ home _; do
         case "$uid:$home" in
             [0-9]*:/home/*|[0-9]*:/root) ;;
             *) continue ;;
@@ -117,18 +117,22 @@ if [ "$1" = configure ]; then
         if [ -e "$disabled" ]; then
             disabled="${override}.disabled.$(date +%s).$$"
         fi
-        mv "$override" "$disabled"
+        # A read-only or unreachable home must not fail the whole configure
+        # step for every other user on the machine.
+        mv "$override" "$disabled" || continue
         echo "  disabled legacy daemon override for $home -> $disabled"
 
         # A package upgrade can happen while the user is logged in. Refresh
         # that user's manager now; failures are harmless and the next login
         # will load the canonical unit as well.
+        # runuser takes a user name; the "#uid" form is not understood and
+        # made both calls fail silently.
         if [ -S "/run/user/$uid/bus" ] && command -v runuser >/dev/null 2>&1; then
-            runuser -u "#$uid" -- env \
+            runuser -u "$name" -- env \
                 XDG_RUNTIME_DIR="/run/user/$uid" \
                 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
                 systemctl --user daemon-reload || true
-            runuser -u "#$uid" -- env \
+            runuser -u "$name" -- env \
                 XDG_RUNTIME_DIR="/run/user/$uid" \
                 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
                 systemctl --user restart gonedrived.service || true

@@ -35,6 +35,10 @@ pub(super) struct HelperFeatures {
 /// Leave room for JSON escaping and for the helper's result frame.
 const WATCH_BATCH_TARGET_BYTES: usize = 48 * 1024;
 const FEATURE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long the sync-root declaration waits for the helper's feature answer.
+/// Long enough to match the handshake itself: missing the answer would skip
+/// the declaration, and a root-enforcing helper then refuses every mark.
+const FEATURES_HANDSHAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl HsmClient {
     pub(crate) async fn watched_count(&self) -> usize {
@@ -154,9 +158,13 @@ impl HsmClient {
     }
 
     async fn negotiated_features(&self) -> HelperFeatures {
+        self.features_within(FEATURE_WAIT).await
+    }
+
+    async fn features_within(&self, wait: std::time::Duration) -> HelperFeatures {
         let mut features = self.features.clone();
         if !features.borrow().received {
-            let _ = tokio::time::timeout(FEATURE_WAIT, async {
+            let _ = tokio::time::timeout(wait, async {
                 while features.changed().await.is_ok() {
                     if features.borrow().received {
                         break;
@@ -180,7 +188,16 @@ impl HsmClient {
     /// Returns whether the helper understood the declaration; an older helper
     /// is served unconfined, as before.
     pub(super) async fn register_sync_roots(&self, root: &Path) -> Result<bool> {
-        if !self.negotiated_features().await.sync_roots {
+        // Wait as long as the handshake may take, not the short grace used for
+        // optional batching. Treating a late answer as "unsupported" would
+        // skip the declaration; a helper that does enforce roots then refuses
+        // every mark, and the failure path safety-locks every placeholder on
+        // disk until the next reconnect.
+        if !self
+            .features_within(FEATURES_HANDSHAKE_WAIT)
+            .await
+            .sync_roots
+        {
             return Ok(false);
         }
         self.request_control(|id| Request::RegisterRoots {
