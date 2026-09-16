@@ -820,10 +820,34 @@ impl Engine {
         // the old path before believing this is the same item. Preserve an I/O
         // failure instead of treating it as absence and issuing a remote move.
         match old.try_exists() {
-            Ok(false) => Ok(Some((known, old))),
-            Ok(true) => Ok(None),
-            Err(error) => Err(error.into()),
+            Ok(false) => {}
+            Ok(true) => return Ok(None),
+            Err(error) => return Err(error.into()),
         }
+
+        // `rm -rf A && mkdir B` can hand B the inode A just released, and to
+        // everything above this point that is indistinguishable from a move:
+        // same inode, same device, nothing left at the old path. Believing it
+        // hands A's remote identity — its sharing links and version history —
+        // to B's contents, and for a directory renames the whole subtree.
+        //
+        // The one thing that does distinguish them is when the inode came into
+        // existence. A move leaves birth time alone, so it predates the last
+        // time we wrote the record; a recycled inode was born after it.
+        let birth = self
+            .rooted(account)
+            .ok()
+            .and_then(|rooted| rooted.open_read(new_path).ok())
+            .and_then(|file| birth_time(&file));
+        if inode_was_recycled(birth, self.store.item_recorded_at(&known.id)?) {
+            tracing::debug!(
+                path = %new_path.display(),
+                ino = stat.ino,
+                "the inode was recycled since the record was written; not a move"
+            );
+            return Ok(None);
+        }
+        Ok(Some((known, old)))
     }
 
     /// Turn a completed copy of one of our placeholders into an ordinary new
@@ -1012,6 +1036,49 @@ impl Engine {
     }
 }
 
+/// Whether an inode matching a record's was created after that record was last
+/// written — so it is a different file that inherited a recycled inode number,
+/// not the recorded one moved.
+///
+/// A rename leaves birth time alone, so a genuine move (even one followed by an
+/// edit) predates the record. Without a birth time, or without a recorded time,
+/// this falls back to trusting the inode number, which is what every version
+/// before this did.
+fn inode_was_recycled(birth: Option<i64>, recorded_at: Option<i64>) -> bool {
+    match (birth, recorded_at) {
+        (Some(birth), Some(recorded_at)) => birth > recorded_at,
+        _ => false,
+    }
+}
+
+/// When this inode came into existence, in seconds, or `None` where the
+/// filesystem does not record it.
+///
+/// ext4, btrfs and xfs all keep a birth time; tmpfs and some network
+/// filesystems do not, and there the caller falls back to trusting the inode
+/// number alone, which is what every version before this did.
+fn birth_time(file: &std::fs::File) -> Option<i64> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: zeroed is a valid initial `statx`, and the call only writes into
+    // it. The empty path with AT_EMPTY_PATH addresses the descriptor itself.
+    let mut out: libc::statx = unsafe { std::mem::zeroed() };
+    let empty = c"";
+    let rc = unsafe {
+        libc::statx(
+            file.as_raw_fd(),
+            empty.as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_BTIME,
+            &mut out,
+        )
+    };
+    if rc != 0 || out.stx_mask & libc::STATX_BTIME == 0 {
+        return None;
+    }
+    Some(out.stx_btime.tv_sec)
+}
+
 /// A directory entry's name as a `String`, or `None` for a name that is not
 /// valid UTF-8. OneDrive names are Unicode, so such an entry could never
 /// round-trip; worse, a lossy conversion yields a path that does not exist on
@@ -1051,4 +1118,37 @@ fn read_dir_readonly(dir: &Path) -> std::io::Result<Vec<(String, LocalStat)>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod recycled_inode_tests {
+    use super::inode_was_recycled;
+
+    #[test]
+    fn an_inode_born_after_the_record_was_written_is_a_different_file() {
+        // `rm -rf A && mkdir B` can hand B the inode A just released. Every
+        // other signal — same inode, same device, nothing at the old path —
+        // reads as a move, and believing it hands A's remote identity, its
+        // sharing links and its version history to B's contents.
+        assert!(inode_was_recycled(Some(200), Some(100)));
+    }
+
+    #[test]
+    fn a_move_keeps_the_inodes_original_birth_time() {
+        // Renaming does not change birth time, so it still predates the record
+        // — including when the file was edited after being moved.
+        assert!(!inode_was_recycled(Some(100), Some(200)));
+        // Written and recorded within the same second is the ordinary case for
+        // a file we just downloaded.
+        assert!(!inode_was_recycled(Some(100), Some(100)));
+    }
+
+    #[test]
+    fn without_a_birth_time_the_inode_number_is_still_trusted() {
+        // tmpfs and some network filesystems do not record one. Refusing every
+        // move there would turn each one into a delete and a fresh upload.
+        assert!(!inode_was_recycled(None, Some(100)));
+        assert!(!inode_was_recycled(Some(100), None));
+        assert!(!inode_was_recycled(None, None));
+    }
 }

@@ -817,6 +817,22 @@ impl Store {
         Ok(Some(current))
     }
 
+    /// When this record was last written, in seconds.
+    ///
+    /// Compared against an inode's birth time to tell a moved file from a new
+    /// one that happens to have inherited a recycled inode number.
+    pub fn item_recorded_at(&self, item_id: &str) -> Result<Option<i64>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT updated_at FROM items WHERE id = ?1",
+                    params![item_id],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+    }
+
     /// Rename a record in place, without touching anything else about it.
     ///
     /// Used when an item has to be parked under a reserved name so another

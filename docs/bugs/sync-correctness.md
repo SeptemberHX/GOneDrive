@@ -130,3 +130,11 @@
 - **根因**：`remote.rs::apply_remote_locked` 在写库之前先搬盘，`move_local_for_remote` 遇 `AlreadyExists` 就无条件把占位者做成冲突副本并入队上传——它不区分"占位者是用户自己的文件"与"占位者正是本批次要搬走的另一项"。
 - **修复**：`rename_noreplace` 失败时先判断占位者是不是本账户的已知项且在本批次仍未应用（新增 `staged_upsert_is_unapplied`）。是的话把它停到保留名 `.gonedrive-moving-<id>` 下，并用 `rename_item_local` 同步更新记录的名字——记录必须跟着 inode 走，否则下一次本地扫描会把停放的文件读成新增、把原名读成删除。占位者随后应用自己的条目时，`local_path` 解析到停放路径并搬到目的地。名字带 item id 保证同目录内不会相撞，点前缀让它在文件管理器里不显眼。占位者若不是本批次要动的，仍走原来的冲突副本逻辑。
 - **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_rename_chain_in_one_batch_lands_every_file_under_its_own_name`、`::two_files_swapping_names_in_one_batch_keep_their_own_contents`（均已验证：无修复时 RED，产生冲突副本）。
+
+## SC-017 · 复用的 inode 被判为移动 → 远端身份被过继给无关内容
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：`rm -rf A && mkdir B`（或 `rm a.txt; echo x > b.txt`）之后，B 继承了 A 刚释放的 inode，同步把它当成"A 被改名为 B"：A 的远端身份、共享链接与版本历史被过继给 B 的内容；对目录而言整棵子树在云端被改名，下一次全量扫描又发现旧子项集体消失，可能撞上批量删除安全阀。
+- **根因**：`local.rs::moved_candidate` 的判据是"同设备 + 同 inode + 旧路径已不存在"。inode 被内核激进复用，这三条对"移动"和"删除后新建"完全一样。
+- **修复**：用 inode 的**出生时间**作区分。改名不会改变出生时间，所以真正的移动（哪怕移动后又被编辑）其出生时间早于我们最后一次写入该记录的时间；复用的 inode 则晚于它。新增 `Store::item_recorded_at` 读取 `updated_at`，用 `statx(STATX_BTIME)` 取出生时间，判据抽成具名函数 `inode_was_recycled`。ext4、btrfs、xfs 都记录出生时间；tmpfs 与部分网络文件系统不记录，那里退回到只信 inode 号，与此前行为一致。
+- **回归测试**：`crates/gonedrive-core/src/sync/local.rs::recycled_inode_tests`（规则的三种情形）。比较方向由既有的 `a_cross_directory_rename_is_one_move_not_delete_plus_upload` 守住——把 `>` 写成 `>=` 会让它立刻失败（已验证）。
