@@ -893,3 +893,36 @@ fn an_existing_store_gains_the_by_item_queue_index() {
         "migration must add the index: {indexes:?}"
     );
 }
+
+#[test]
+fn deferring_an_operation_does_not_spend_its_retry_budget() {
+    // Something else was in the way — no disk space — so the operation never
+    // ran. Counting it as an attempt drives the backoff to its ceiling for a
+    // transfer that was never tried, and muddles what a real failure reports.
+    let (store, _) = store_with_account();
+    store.upsert_item(&file("F1", "ROOT", "a.txt")).unwrap();
+    let id = store
+        .enqueue("acct", OpKind::Download, Some("F1"), None, None)
+        .unwrap();
+
+    store
+        .defer_op(
+            id,
+            "not enough free disk space",
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
+
+    assert!(
+        store.due_ops("acct", 10).unwrap().is_empty(),
+        "a deferred operation is not due"
+    );
+    let op = store
+        .pending_ops("acct", 10)
+        .unwrap()
+        .into_iter()
+        .find(|op| op.id == id)
+        .expect("the row stays queued");
+    assert_eq!(op.attempts, 0, "deferring is not failing");
+    assert_eq!(op.last_error.as_deref(), Some("not enough free disk space"));
+}

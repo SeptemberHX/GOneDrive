@@ -382,6 +382,22 @@ impl Store {
     }
 
     /// Record a failure and schedule the retry.
+    /// Postpone an operation without holding it against its retry budget.
+    ///
+    /// Used when something other than the operation itself is in the way — no
+    /// disk space, for instance. It never ran, so it has not failed.
+    pub fn defer_op(&self, id: i64, reason: &str, retry_in: std::time::Duration) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE pending_ops
+                    SET next_attempt_at = ?2, last_error = ?3
+                  WHERE id = ?1",
+                params![id, now().saturating_add(retry_in.as_secs() as i64), reason],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn fail_op(
         &self,
         id: i64,
@@ -414,6 +430,27 @@ impl Store {
                 params![account_id],
                 |r| r.get::<_, i64>(0),
             )? as u64)
+        })
+    }
+
+    /// Destination paths of every queued download.
+    ///
+    /// The local scan turns these into staging names to tell an abandoned
+    /// partial file from the resumable prefix of a download that is merely
+    /// waiting out a backoff. Read only when a stale partial actually turns
+    /// up, which is rare.
+    pub fn download_op_paths(&self, account_id: &str) -> Result<Vec<PathBuf>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT local_path FROM pending_ops
+                  WHERE account_id = ?1 AND kind = 'download' AND local_path IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![account_id], |row| row.get::<_, String>(0))?;
+            Ok(rows
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(PathBuf::from)
+                .collect())
         })
     }
 

@@ -1061,3 +1061,51 @@ async fn harness_with_a_downloaded_file(content: &'static [u8]) -> Harness {
     h.sync().await;
     h
 }
+
+#[tokio::test]
+async fn a_queued_downloads_partial_file_survives_the_janitor() {
+    // A download that failed while connecting leaves its prefix untouched, so
+    // the file's timestamp stops moving while it waits out a backoff. Sweeping
+    // it as an orphan makes the retry start again from zero.
+    use gonedrive_core::db::OpKind;
+
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "big.bin", "c1", 400, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
+    h.sync().await;
+
+    let destination = h.path("big.bin");
+    let partial = gonedrive_core::sync::transfer::staging_sibling(&destination);
+    std::fs::write(&partial, vec![1u8; 128]).unwrap();
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&partial)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(long_ago))
+        .unwrap();
+
+    // The download is queued, merely not due yet.
+    h.store
+        .enqueue(ACCOUNT, OpKind::Download, Some("F1"), Some(&destination), None)
+        .unwrap();
+
+    h.engine
+        .sync_local_paths(std::slice::from_ref(&h.root))
+        .unwrap();
+    assert!(
+        partial.exists(),
+        "the resumable prefix of a queued download must survive"
+    );
+
+    // With nothing queued for it, the same file is an orphan and goes.
+    h.store.cancel_ops_in_subtree(ACCOUNT, "F1", OpKind::Download).unwrap();
+    h.engine
+        .sync_local_paths(std::slice::from_ref(&h.root))
+        .unwrap();
+    assert!(!partial.exists(), "an abandoned staging file is swept");
+}

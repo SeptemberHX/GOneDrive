@@ -60,3 +60,11 @@
 - **根因**：`crates/gonedrive-core/src/sync/transfer.rs` 在失败时只对 `is_transient()` 的错误保留 `.gonedrive-partial`；`Error::Cancelled` 不是瞬时错误，于是被当作"永久失败"删除前缀。而守护进程的传输切片 `TRANSFER_SLICE = 5s` 到期时，进度回调返回 false，正是产生 `Cancelled` 的路径（`coordinator.rs`、`queue.rs::run_download`）。按需回填路径不设 deadline，因此不受影响。
 - **修复**：取消不是对传输的判决。`Cancelled` 与瞬时错误一样保留续传前缀。
 - **回归测试**：`crates/gonedrive-core/src/sync/transfer/tests.rs::a_scheduling_slice_ending_leaves_the_partial_resumable`（已验证：无修复时 RED）。
+
+## NR-008 · 十五分钟清扫删掉正在退避的下载的续传前缀
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：弱网下大文件反复从零重下。与 NR-007 症状相同但路径不同。
+- **根因**：`local.rs` 的扫描顺带清理超过 15 分钟没动过的 `.gonedrive-partial`。判据只有年龄：一个在建连阶段就失败的下载并不会写入任何字节，它的 partial 时间戳因此停住，而该操作只是在退避队列里等待重试——清扫把它当孤儿删掉。
+- **修复**：删除前反查该暂存文件是否属于某个仍在队列里的下载。暂存名由目标名派生（过长时取哈希），无法反推，所以改为正向计算：取出所有排队中的下载目标，逐个算出它们会用的暂存名再比对。只有真的遇到陈旧 partial 时才查询，正常扫描零开销；查询失败时保留文件（续传前缀比那点空间值钱）。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_queued_downloads_partial_file_survives_the_janitor`（同时断言无人认领的暂存文件仍会被清掉；已验证：无修复时 RED）。

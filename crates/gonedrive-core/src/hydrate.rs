@@ -269,12 +269,34 @@ impl Placeholder {
         ctag: Option<&str>,
     ) -> Result<u64> {
         let before = Occupancy::read_file(file)?;
+        let version_before = writable_version(file)?;
         // Publish the fail-closed state before discarding bytes. If the process
         // dies between the two truncates, a later scan must see a placeholder
         // and fetch the remote copy, never upload the temporary zero length.
         Self::write_marks_file(file, PlaceholderState::Dehydrated, item_id, ctag)?;
         file.sync_all()?;
-        reset_to_sparse_size(file, before.apparent_size)?;
+
+        // The caller proved these bytes are safely on the server, but that was
+        // before the mark and its fsync — and an fsync is long enough for an
+        // application holding this file open to save into it. Re-read the
+        // inode: releasing space must never discard a write nobody has seen.
+        let discarded = if writable_version(file)? == version_before {
+            reset_to_sparse_size(file, before.apparent_size)
+        } else {
+            Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "the file was written while space was being released",
+            )))
+        };
+        if let Err(error) = discarded {
+            // Put the marks back to describe what the bytes actually are.
+            // Leaving the file claiming "dehydrated" while it is still full
+            // makes the scanner read later edits as a placeholder's and never
+            // upload them.
+            Self::mark_hydrated_file(file, item_id, ctag)?;
+            let _ = file.sync_all();
+            return Err(error);
+        }
         file.sync_all()?;
         let after = Occupancy::read_file(file)?;
         Ok(before.allocated.saturating_sub(after.allocated))
@@ -522,6 +544,15 @@ impl Placeholder {
         }
         Ok(())
     }
+}
+
+/// Size and modification time of an open file, as the identity of its current
+/// contents. Cheap enough to re-read either side of an fsync.
+fn writable_version(file: &std::fs::File) -> Result<(u64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = file.metadata()?;
+    Ok((meta.len(), meta.mtime(), meta.mtime_nsec()))
 }
 
 fn managed_xattrs() -> [&'static str; 8] {
@@ -904,6 +935,42 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&path).unwrap().mtime(),
             when.unix_timestamp()
+        );
+    }
+}
+
+#[cfg(test)]
+mod dehydrate_guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_truncation_leaves_the_marks_describing_the_bytes() {
+        // The fail-closed order writes "dehydrated" before discarding content,
+        // so a *failed* discard has to put the marks back. Left claiming to be
+        // a placeholder while still full, the scanner reads later edits as a
+        // placeholder's and never uploads them.
+        //
+        // A read-only descriptor gives a deterministic failure: setting the
+        // xattrs needs write permission on the file, which we have, while
+        // ftruncate on an O_RDONLY descriptor cannot succeed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.bin");
+        std::fs::write(&path, vec![7u8; 4096]).unwrap();
+
+        let readonly = std::fs::File::open(&path).unwrap();
+        let error = Placeholder::dehydrate_file(&readonly, "F1", Some("c1")).unwrap_err();
+        drop(readonly);
+
+        assert!(matches!(error, Error::Io(_)), "unexpected error: {error:?}");
+        assert_eq!(
+            Placeholder::state(&path),
+            PlaceholderState::Hydrated,
+            "the marks must describe the bytes that are still there"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap().len(),
+            4096,
+            "nothing was discarded"
         );
     }
 }

@@ -114,15 +114,27 @@ impl Engine {
             let (ops, held): (Vec<_>, Vec<_>) = ops
                 .into_iter()
                 .partition(|op| downloads_allowed || op.kind != OpKind::Download);
+            let held_any = !held.is_empty();
             for op in held {
                 // Push the retry out rather than leaving the row perpetually
                 // due. A due-but-unrunnable download otherwise never lets an
                 // explicit sync report completion, and the recorded reason
                 // tells the user what is holding the transfer.
+                //
+                // Deferring is not failing: counting an attempt would drive the
+                // backoff to its ceiling for a transfer that never ran, and
+                // muddle the attempt count a genuine failure reports.
                 self.store
-                    .fail_op(op.id, "not enough free disk space", LOW_SPACE_RETRY)?;
+                    .defer_op(op.id, "not enough free disk space", LOW_SPACE_RETRY)?;
             }
             if ops.is_empty() {
+                if held_any {
+                    // Downloads sort before everything else, so a full batch of
+                    // held ones used to end the pass — and uploads and deletes,
+                    // which need no disk space at all, never ran. Take the next
+                    // batch instead; the deferred rows are no longer due.
+                    continue;
+                }
                 return Ok(());
             }
             for listed in ops {

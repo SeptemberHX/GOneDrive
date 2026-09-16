@@ -331,7 +331,7 @@ impl Engine {
         let mut moved_ids = std::collections::HashSet::new();
 
         while let Some((parent_id, dir)) = stack.pop() {
-            let entries = match read_dir(&dir, &rooted) {
+            let entries = match read_dir(&dir, &rooted, &|path| self.staging_is_claimed(path)) {
                 Ok(entries) => entries,
                 Err(e) => {
                     tracing::warn!(path = %dir.display(), error = %e, "cannot read directory");
@@ -953,6 +953,7 @@ pub(super) fn owned_placeholder_state(
 fn read_dir(
     dir: &Path,
     rooted: &super::rooted_fs::RootedFs,
+    staging_is_claimed: &dyn Fn(&Path) -> bool,
 ) -> std::io::Result<Vec<(String, LocalStat)>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -971,7 +972,11 @@ fn read_dir(
                     .and_then(|m| m.modified())
                     .map(|t| t.elapsed().unwrap_or_default() > std::time::Duration::from_secs(900))
                     .unwrap_or(false);
-                if stale {
+                // Age alone does not make a partial an orphan. A download
+                // that failed while connecting leaves its prefix untouched,
+                // so its timestamp stops moving while it waits out a backoff
+                // — and deleting it makes the retry start from zero.
+                if stale && !staging_is_claimed(&entry.path()) {
                     let _ = rooted.remove_file(&entry.path());
                 }
             }
@@ -987,6 +992,24 @@ fn read_dir(
         out.push((name, LocalStat::from_metadata(&meta)));
     }
     Ok(out)
+}
+
+impl Engine {
+    /// Whether a staging file belongs to a download that is still queued.
+    ///
+    /// Staging names are derived from the destination — and hashed when the
+    /// destination's name is too long — so this asks the question forwards,
+    /// from each queued download to the name it would use.
+    fn staging_is_claimed(&self, staging: &Path) -> bool {
+        let Ok(queued) = self.store.download_op_paths(&self.account_id) else {
+            // Unable to tell, so keep the file: a resumable prefix is worth
+            // more than the space an orphan occupies until the next pass.
+            return true;
+        };
+        queued
+            .iter()
+            .any(|destination| super::transfer::staging_sibling(destination) == staging)
+    }
 }
 
 /// A directory entry's name as a `String`, or `None` for a name that is not

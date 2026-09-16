@@ -90,3 +90,11 @@
 - **根因**：`sync/hydration/lazy.rs` 的转换分两遍——先决策再删除。大树上两遍之间可达数分钟，helper 完全可能在此期间填充某个占位符、用户随后编辑它，而第二遍 `prune_folder` 无条件 `remove_file`，随后 `delete_subtree` 连记录一并删掉。这些字节从未上传过。
 - **修复**：删除前逐个复验 inode 仍是"自有且 Dehydrated"的占位符；已经有内容的保留文件，并把它的 id 排除在随后的行删除之外（否则会留下一个没有 id、没有状态、无法同步回去的孤儿文件）。
 - **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_placeholder_filled_during_the_conversion_survives_it`（用进度回调在两个文件夹之间制造确定性竞争；已验证：无修复时 RED，文件不存在）。
+
+## DL-010 · 释放空间时的窗口与失败后不回滚标记
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：两个相邻问题。其一，`free_space` 用内容哈希确认字节已安全上云之后、真正打洞之前还有一个窗口——中间隔着一次 xattr 写入和一次 `fsync`，足够一个持有该文件的应用写进去，那次写入随即被丢弃。其二，打洞失败时文件仍标着"已脱水"却满是内容，扫描器此后把它当占位符，用户对它的编辑永远不会被上传。
+- **根因**：`hydrate.rs::dehydrate_file` 在写标记与截断之间不复验 inode；截断返回错误时也不回滚标记。标记先于截断写入是**刻意**的 fail-closed 设计（崩溃时宁可让下次扫描重新下载，也不能上传一个临时的零长度文件），所以顺序不能调换，只能补复验与回滚。
+- **修复**：进入时记下大小与 mtime，在 `fsync` 之后、截断之前重新读取 inode 比对；不一致就不截断。无论是内容变了还是截断本身失败，都把标记改回 `Hydrated`（与磁盘上的字节相符）再返回错误。
+- **回归测试**：`crates/gonedrive-core/src/hydrate.rs::dehydrate_guard_tests::a_failed_truncation_leaves_the_marks_describing_the_bytes`（用只读描述符确定性触发截断失败；已验证：无回滚时标记停在 Dehydrated）。

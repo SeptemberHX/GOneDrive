@@ -68,3 +68,11 @@
 - **根因**：`detach_account` 只把引擎从 map 里摘掉。协调器与回填路径持有 `Arc<Engine>` 克隆并跨 await 使用，被摘掉的引擎照常跑完当前的下载、扫描与 delta；其 `Authenticator` 在下一次 Graph 调用时刷新令牌，而刷新成功就会 `save`，重建刚被删除的条目。`attach_account` 只拒绝**不同** id，同 id 直接 `insert` 覆盖，旧引擎并不停止。CLI 的 `logout` 完全绕过守护进程，同样制造分裂脑。
 - **修复**：新增统一的停止原语。`Engine::stop()` 置位并连带停止 `GraphClient`；所有操作都经过 `Engine::account()`，在那里一处检查即可让在途工作在下一个检查点以 `Cancelled` 退出；网络侧在 `send()` 与分片上传循环各检查一次，令牌刷新因此不再发生（分片上传走预授权会话 URL，本就不刷新）。`detach_account` 先停再摘，并清掉该根下的在途回填登记。`attach_account` 对同 id 改为"先退休旧引擎再装新的"。`report_core_error` 对 `Cancelled` 不再置错误状态——那是我们自己要求的停止。CLI `logout` 在守护进程运行时改走 D-Bus。
 - **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_stopped_engine_neither_writes_nor_reaches_the_service`（断言得到的是 `Cancelled` 而非 mock 服务器的 404，证明请求根本没有发出）。
+
+## SS-009 · 磁盘不足时上传与删除被一并饿死
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：可用空间低于下限时，不仅下载停了，上传和删除也停了——而后两者根本不需要磁盘空间。
+- **根因**：`queue.rs::drain_queue` 的查询把下载排在批次前面。空间闸门把整批下载滤掉之后，`ops.is_empty()` 直接 `return`，本轮再也不取下一批。注释声称"上传和删除照常"，与实现不符。
+- **修复**：整批被扣下时改为 `continue` 取下一批（被推迟的行已经不再到期，循环必然收敛）。同时把"扣下"与"失败"分开：新增 `Store::defer_op` 只推后 `next_attempt_at` 而不增加 attempts——操作根本没跑过，计入重试预算会把退避迅速推到 256 秒上限，也会污染真实失败的计数。
+- **回归测试**：`crates/gonedrive-core/src/db/tests.rs::deferring_an_operation_does_not_spend_its_retry_budget`（空间闸门本身依赖真实 statvfs，未做端到端测试）。
