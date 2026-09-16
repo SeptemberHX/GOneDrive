@@ -5,6 +5,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 use gonedrive_ipc::hsm::{Event, Request, WatchOutcome, MAX_FRAME_SIZE, MAX_WATCH_BATCH};
@@ -25,6 +26,15 @@ pub(super) fn send_to_session(session: &ClientSession, event: &Event) -> Result<
     send_to_stream(&session.stream, event)
 }
 
+/// How long a reply may take to reach the daemon.
+///
+/// Replies are one short line and the daemon reads continuously, so this only
+/// ever expires on a daemon that has stopped reading — hung, stopped, or gone
+/// without closing. Without it `write_all` blocks for ever, and because that
+/// happens *before* the hydration timeout starts, a handful of such peers
+/// permanently exhausted the worker pool.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(super) fn send_to_stream(stream: &Arc<Mutex<UnixStream>>, event: &Event) -> Result<()> {
     let mut line = serde_json::to_string(event)?;
     if line.len() > MAX_FRAME_SIZE {
@@ -32,8 +42,17 @@ pub(super) fn send_to_stream(stream: &Arc<Mutex<UnixStream>>, event: &Event) -> 
     }
     line.push('\n');
     let mut stream = stream.lock().unwrap();
-    stream.write_all(line.as_bytes())?;
-    stream.flush()?;
+    if let Err(error) = stream
+        .write_all(line.as_bytes())
+        .and_then(|()| stream.flush())
+    {
+        // A timeout can leave half a line on the wire. The peer would read a
+        // truncated frame and lose sync with every reply after it, so end the
+        // connection and let it reconnect; pending events are denied by the
+        // session guard, which fails closed.
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -135,7 +154,11 @@ impl Drop for SessionGuard {
 
 pub(super) fn serve_daemon(shared: &Arc<Shared>, stream: UnixStream) -> Result<()> {
     let (uid, pid) = peer_creds(&stream)?;
-    let writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let writer = stream.try_clone()?;
+    // The option is on the socket, so this covers every reply written through
+    // this handle. See SEND_TIMEOUT.
+    writer.set_write_timeout(Some(SEND_TIMEOUT))?;
+    let writer = Arc::new(Mutex::new(writer));
     if shared.allowed_uid.is_some_and(|expected| expected != uid) {
         bail!("refusing a connection from uid {uid}");
     }

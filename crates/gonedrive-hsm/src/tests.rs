@@ -495,3 +495,44 @@ fn partial_hydration_is_confined_to_the_target() {
     assert_eq!(expected_fill_len(false, 10, 50, 32).unwrap(), 22);
     assert!(expected_fill_len(false, 33, 1, 32).is_err());
 }
+
+#[test]
+fn a_reply_to_a_peer_that_stopped_reading_gives_up_and_ends_the_connection() {
+    // The write happens before the hydration timeout starts, so an unbounded
+    // one let a few stuck peers exhaust the whole worker pool permanently.
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    ours.set_write_timeout(Some(std::time::Duration::from_millis(150)))
+        .unwrap();
+    let ours = std::sync::Arc::new(std::sync::Mutex::new(ours));
+
+    // Fill the socket buffer: the peer never reads.
+    let event = Event::Error {
+        message: "x".repeat(4096),
+    };
+    let mut sends = 0;
+    let error = loop {
+        match send_to_stream(&ours, &event) {
+            Ok(()) => {
+                sends += 1;
+                assert!(sends < 10_000, "the buffer should fill long before this");
+            }
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        error.to_string().contains("timed out") || error.to_string().contains("Resource"),
+        "unexpected error: {error}"
+    );
+
+    // The connection was shut down rather than left carrying half a frame.
+    let mut drained = Vec::new();
+    let mut theirs = theirs;
+    theirs.read_to_end(&mut drained).unwrap();
+    assert!(
+        !drained.is_empty(),
+        "the peer still sees what did get through"
+    );
+}

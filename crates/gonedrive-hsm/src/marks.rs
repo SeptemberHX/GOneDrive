@@ -156,6 +156,11 @@ const BENEATH_ROOT: u64 =
 /// placeholders — and a sync root belongs on a local disk anyway.
 const REFUSED_FILESYSTEMS: &[(u64, &str)] = &[
     (0x6573_5546, "fuse"),
+    // Reached through the same lever: an autofs mount point can block while it
+    // mounts on demand, and an overlay's lower layer may itself be slow or
+    // user-controlled. Both would hold a root worker for as long as they like.
+    (0x0187, "autofs"),
+    (0x794C_7630, "overlayfs"),
     (0x6969, "nfs"),
     (0x517B, "smb"),
     (0xFF53_4D42, "cifs"),

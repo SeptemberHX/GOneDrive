@@ -46,3 +46,17 @@
 - **现象**：浏览器登录窗口期间切换了同步模式，登录一完成，磁盘上的模式被还原成登录开始前的值；下次重启回到旧模式。
 - **根因**：`service.rs::start_login` 在 spawn 前取得 `app.config()` 快照并持有最长 300 秒，`login.rs::complete` 结束时把这个快照 `save()` 回磁盘。
 - **修复**：`complete` 不再写配置；调用方在登录完成后用**当时的**实时配置保存。
+
+## SS-006 · 向守护进程写回复没有超时 → 少数挂起的对端可永久耗尽 root worker 池
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：守护进程被挂起、暂停或异常退出而未关闭连接时，特权 helper 的处理能力逐渐归零，占位符读取全部超时，只能重启 helper 恢复。
+- **根因**：`crates/gonedrive-hsm/src/server.rs::send_to_stream` 的 `write_all` 未设 `SO_SNDTIMEO`，而它发生在 `recv_timeout(HYDRATE_TIMEOUT)` **之前**，那个 300 秒超时完全保护不到它。worker 池只有 64 个固定线程。
+- **修复**：accept 后给 socket 设 30 秒写超时（回复只有一行，健康的守护进程永远不会触发）。写失败时主动关闭连接——超时可能已经写出半行 JSON，对端继续读会与之后所有回复失去同步；关闭后由会话守卫把待处理事件全部拒绝（fail-closed），守护进程重连。
+- **回归测试**：`crates/gonedrive-hsm/src/tests.rs::a_reply_to_a_peer_that_stopped_reading_gives_up_and_ends_the_connection`。
+
+## SS-007 · 拒绝文件系统清单遗漏 autofs 与 overlayfs
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **根因**：`marks.rs::REFUSED_FILESYSTEMS` 覆盖了 fuse、nfs、smb/cifs、9p、afs、ceph 等，但缺 autofs（`0x0187`）与 overlayfs（`0x794c7630`）。autofs 挂载点被访问时可能触发按需挂载而长时间阻塞，overlay 的下层也可能由用户控制且缓慢——两者都能把一个 root worker 按住任意久，正是该清单要堵的那类"一个本地用户拖垮所有人"的路径。与 SS-006 叠加时后果更重。
+- **修复**：补入两项。
