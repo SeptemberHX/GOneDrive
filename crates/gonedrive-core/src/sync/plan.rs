@@ -49,6 +49,11 @@ pub enum SkipReason {
     MissingParent,
     /// A symlink, socket, fifo or device — nothing OneDrive can represent.
     NotARegularFile,
+    /// A file now occupies a folder's name, or the reverse. The recorded
+    /// identity describes the other kind of thing, so nothing that uses it —
+    /// an upload, a folder creation, a descent that treats it as the parent —
+    /// can succeed. Reported and left alone rather than retried for ever.
+    TypeChanged,
 }
 
 /// What to do about a change the service reported.
@@ -246,6 +251,12 @@ pub fn decide_local(
         // because the caller has already confirmed the parent directory still
         // exists — otherwise an unmounted drive would delete the whole account.
         (Some(_), None) => LocalAction::DeleteRemote,
+        (Some(known), Some(local)) if known.is_folder != local.is_dir => {
+            // Uploading to a folder's id, or creating children under a file's,
+            // is refused by the service on every attempt; the scan used to
+            // re-queue both on every pass.
+            LocalAction::Skip(SkipReason::TypeChanged)
+        }
         (Some(known), Some(local)) => {
             if local.is_dir {
                 LocalAction::Nothing

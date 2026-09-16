@@ -849,3 +849,40 @@ async fn a_failed_sync_phase_still_emits_its_terminal_event() {
         gonedrive_core::sync::engine::SyncEvent::Finished(_)
     ));
 }
+
+#[tokio::test]
+async fn a_file_replaced_by_a_directory_is_reported_not_retried_for_ever() {
+    // The recorded identity is a file's. Uploading to it, or hanging the new
+    // directory's children under it, is refused by the service on every
+    // attempt — and the scan re-queued both on every pass.
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![file("F1", ROOT, "swap", "c1", 5, "2026-08-20T10:00:00Z")],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"hello").await;
+    h.sync().await;
+    assert_eq!(h.read("swap"), "hello");
+
+    std::fs::remove_file(h.path("swap")).unwrap();
+    std::fs::create_dir(h.path("swap")).unwrap();
+    std::fs::write(h.path("swap/inside.txt"), b"new").unwrap();
+
+    let summary = h
+        .engine
+        .sync_local_paths(std::slice::from_ref(&h.root))
+        .unwrap();
+
+    assert!(summary.skipped >= 1, "the swap must be reported");
+    let ops = h.store.pending_ops(ACCOUNT, 100).unwrap();
+    assert!(
+        ops.is_empty(),
+        "nothing may be queued against a mismatched identity: {ops:?}"
+    );
+    assert!(
+        h.store.item("F1").unwrap().is_some(),
+        "the remote file is untouched; only the local swap is refused"
+    );
+}

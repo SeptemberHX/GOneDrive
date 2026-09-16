@@ -113,3 +113,12 @@
 - **根因**：`pending_ops.dedup_key` 为 `IFNULL(item_id, local_path)`。在 `run_upload` 内用同一 `item_id` 调 `enqueue_conditional` 命中唯一索引，`ON CONFLICT DO UPDATE` 改写的正是**当前正在执行的那一行**；`drain_queue` 随后按 `op.id` `complete_op` 把它删掉。
 - **修复**：重新排队前先 `complete_op(op.id)` 退休当前行，新行获得新 id，后续的 `complete_op` 成为无操作。
 - **回归测试**：待补（需要在队列层驱动一次"上传中编辑"，现有测试只覆盖 transfer 层）。
+
+## SC-015 · 文件与目录同名互换：每轮扫描重复入队，操作永久失败
+
+- **首次发现**：2026-09-15（第三轮审计）
+- **现象**：把一个已同步的文件换成同名目录（或反之）之后，同步进入永久错误循环：日志里反复出现同一批失败的操作，用户看不出哪里出了问题。
+- **根因**：`plan.rs::decide_local` 在 `(Some(known), Some(local))` 分支只看本地是不是目录，不比对 `known.is_folder`。文件变目录时它返回"无事可做"，而 `local.rs` 的全量扫描仍把**文件记录的 id** 压栈作为该目录的父 id，于是目录里的每个子项都以文件 id 为父入队 `CreateRemoteFolder`/`Upload`，Graph 一律 4xx 拒绝。目录变文件时记录的 `local_size` 为 None，`local_is_modified` 恒为真，于是对目录 id 发起 `PUT content`，同样永久失败。两种情形每次扫描都重新入队。
+- **修复**：新增 `SkipReason::TypeChanged`。记录类型与磁盘类型不符时判为跳过并上报（带去重，不刷屏）；扫描只在记录确实是目录时才按它下钻，只在记录确实是文件时才刷新它的角标。远端项保持不变——被拒绝的只是本地这次互换。
+- **限制**：这是止损，不是完整语义。把互换真正同步过去（删除旧身份 + 作为新项重建）尚未实现，用户需要自行改名或删除后重建。
+- **回归测试**：`crates/gonedrive-core/tests/sync_integration.rs::a_file_replaced_by_a_directory_is_reported_not_retried_for_ever`（已验证：无修复时 RED）。

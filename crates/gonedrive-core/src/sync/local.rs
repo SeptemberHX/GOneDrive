@@ -522,13 +522,18 @@ impl Engine {
                     // The scan already stats every file, so keeping the file
                     // manager's marks in step costs one `getxattr` and a write
                     // only when they actually drifted.
-                    if let Some(record) = record {
+                    // Only when the record describes a file; a folder record
+                    // under a file's name is the type swap reported above.
+                    if let Some(record) = record.filter(|record| !record.is_folder) {
                         self.refresh_marks(record, &dir.join(name));
                     }
                 }
 
                 if stat.is_dir {
-                    if let Some(record) = record {
+                    // A file record under a directory's name would make every
+                    // child inherit a file's id as its parent, and every
+                    // resulting operation fail against the service for ever.
+                    if let Some(record) = record.filter(|record| record.is_folder) {
                         // This walk has already paid for the `stat`, so noticing
                         // a directory whose timestamp drifted — from an earlier
                         // version, or an edit we did not make — is free here.
