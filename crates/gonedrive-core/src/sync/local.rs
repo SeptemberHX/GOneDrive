@@ -348,12 +348,33 @@ impl Engine {
                 None => HashMap::new(),
             };
 
+            // The pin every file here inherits unless it carries one of its
+            // own. Resolving it per file walked the ancestor chain in SQL once
+            // per file for an answer that cannot differ between siblings.
+            let inherited_pin = match &parent_id {
+                Some(parent_id) => self
+                    .store
+                    .effective_pin(parent_id, self.config.download_new.default_pin())?,
+                None => self.config.download_new.default_pin(),
+            };
+
+            // One statement for the directory rather than one per file. A
+            // queued deletion is withdrawn the moment its file turns up again,
+            // and the usual case — nothing queued — now costs one statement
+            // instead of one write transaction per entry.
+            let present: Vec<&str> = entries
+                .iter()
+                .filter_map(|(name, _)| {
+                    known
+                        .get(&crate::names::fold_case(name))
+                        .map(|record| record.id.as_str())
+                })
+                .collect();
+            self.store
+                .cancel_pending_deletes(&self.account_id, &present)?;
+
             for (name, stat) in &entries {
                 let record = known.get(&crate::names::fold_case(name));
-                if let Some(record) = record {
-                    self.store
-                        .cancel_pending_delete(&self.account_id, &record.id)?;
-                }
                 if record.is_some_and(|record| deferred_remote.contains(&record.id)) {
                     continue;
                 }
@@ -391,24 +412,36 @@ impl Engine {
                 // the real file in the cloud. Nothing about them is ours to
                 // upload, so they only recurse (below) and refresh marks.
                 let path = entry_path;
+                let mut inspected = inspect_file(&rooted, &path);
                 if !stat.is_dir {
                     let expected_id = record.map(|record| record.id.as_str());
-                    if placeholder_claim(&rooted, &path)
-                        .is_some_and(|(claimed_id, _)| Some(claimed_id.as_str()) != expected_id)
-                        && record.is_some()
-                        && !self.prepare_copied_placeholder(
+                    let foreign_claim = inspected
+                        .as_ref()
+                        .and_then(|seen| seen.item_id.as_deref())
+                        .is_some_and(|claimed| Some(claimed) != expected_id);
+                    if foreign_claim && record.is_some() {
+                        if !self.prepare_copied_placeholder(
                             &rooted,
                             &path,
                             stat,
                             expected_id,
                             completed_writes.is_some_and(|paths| paths.contains(&path)),
-                        )?
-                    {
-                        continue;
+                        )? {
+                            continue;
+                        }
+                        // It rewrote the inode's marks, so what we read above
+                        // no longer describes the file.
+                        inspected = inspect_file(&rooted, &path);
                     }
                 }
-                let placeholder_state =
-                    record.and_then(|record| owned_placeholder_state(&rooted, &path, &record.id));
+                let placeholder_state = record.and_then(|record| match &inspected {
+                    Some(seen) => {
+                        (seen.item_id.as_deref() == Some(record.id.as_str())).then_some(seen.state)
+                    }
+                    // Unreadable. A placeholder left at mode 000 until the
+                    // helper protects it is identified by shape instead.
+                    None => owned_placeholder_state(&rooted, &path, &record.id),
+                });
                 let content_is_ours =
                     stat.is_dir || placeholder_state != Some(PlaceholderState::Dehydrated);
                 if !content_is_ours {
@@ -524,8 +557,11 @@ impl Engine {
                     // only when they actually drifted.
                     // Only when the record describes a file; a folder record
                     // under a file's name is the type swap reported above.
-                    if let Some(record) = record.filter(|record| !record.is_folder) {
-                        self.refresh_marks(record, &dir.join(name));
+                    if let (Some(record), Some(seen)) = (
+                        record.filter(|record| !record.is_folder),
+                        inspected.as_ref(),
+                    ) {
+                        self.refresh_marks_file(record, seen, inherited_pin);
                     }
                 }
 
@@ -938,10 +974,27 @@ impl Engine {
     }
 }
 
-fn placeholder_claim(rooted: &RootedFs, path: &Path) -> Option<(String, PlaceholderState)> {
+/// What one inode says about itself, read once.
+///
+/// The scan used to open every file three times — to see whose placeholder it
+/// is, to read that placeholder's state, and again to refresh its marks —
+/// reading the same two attributes each time. On a drive of a hundred thousand
+/// files that is the bulk of a full scan's syscalls.
+pub(super) struct Inspected {
+    pub(super) file: std::fs::File,
+    pub(super) item_id: Option<String>,
+    pub(super) state: PlaceholderState,
+}
+
+fn inspect_file(rooted: &RootedFs, path: &Path) -> Option<Inspected> {
     let file = rooted.open_read(path).ok()?;
-    let item_id = Placeholder::item_id_file(&file)?;
-    Some((item_id, Placeholder::state_file(&file)))
+    let item_id = Placeholder::item_id_file(&file);
+    let state = Placeholder::state_file(&file);
+    Some(Inspected {
+        file,
+        item_id,
+        state,
+    })
 }
 
 pub(super) fn owned_placeholder_state(

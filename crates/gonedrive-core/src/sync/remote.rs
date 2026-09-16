@@ -457,20 +457,24 @@ impl Engine {
     /// The file manager reads these directly rather than asking the daemon, so
     /// they are what the user actually sees; letting them drift means wrong
     /// emblems on correct files.
-    pub(super) fn refresh_marks(&self, record: &ItemRecord, path: &Path) {
+    /// `inherited` is the pin this file's directory passes down; the scan
+    /// resolves it once per directory, because it cannot differ between
+    /// siblings. An explicit pin on the item itself still wins, which is the
+    /// same rule [`Engine::wants_content`] applies.
+    pub(super) fn refresh_marks_file(
+        &self,
+        record: &ItemRecord,
+        seen: &crate::sync::local::Inspected,
+        inherited: PinState,
+    ) {
         if record.is_folder {
             return;
         }
-        let Ok(account) = self.account() else {
-            return;
-        };
-        let Ok(file) = self
-            .rooted(&account)
-            .and_then(|rooted| rooted.open_read(path))
-        else {
-            return;
-        };
-        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        if !seen
+            .file
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file())
+        {
             return;
         }
         // Application atomic-save APIs replace the inode and intentionally do
@@ -478,18 +482,16 @@ impl Engine {
         // GFileMonitor attribute-change event after every successful upload,
         // which editors report as an external modification. Only maintain
         // marks on an inode that already proves it belongs to this item.
-        if Placeholder::item_id_file(&file).as_deref() != Some(record.id.as_str()) {
+        if seen.item_id.as_deref() != Some(record.id.as_str()) {
             return;
         }
-        let Ok(pin) = self
-            .store
-            .effective_pin(&record.id, self.config.download_new.default_pin())
-        else {
-            return;
+        let pin = match record.pin_state {
+            PinState::Inherit => inherited,
+            explicit => explicit,
         };
         let wanted = pin.as_str();
-        if Placeholder::pin_file(&file).as_deref() != Some(wanted) {
-            let _ = Placeholder::set_pin_file(&file, wanted);
+        if Placeholder::pin_file(&seen.file).as_deref() != Some(wanted) {
+            let _ = Placeholder::set_pin_file(&seen.file, wanted);
         }
     }
 

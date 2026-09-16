@@ -886,3 +886,43 @@ async fn a_file_replaced_by_a_directory_is_reported_not_retried_for_ever() {
         "the remote file is untouched; only the local swap is refused"
     );
 }
+
+#[tokio::test]
+#[ignore = "timing benchmark: cargo test -p gonedrive-core --test sync_integration -- --ignored --nocapture bench_full_scan"]
+async fn bench_full_scan_of_a_synced_tree() {
+    use std::os::unix::fs::MetadataExt;
+
+    const FILES: usize = 4000;
+    let h = Harness::new().await;
+    for index in 0..FILES {
+        let name = format!("{index}.txt");
+        let path = h.path(&name);
+        std::fs::write(&path, b"x").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mut item = ItemRecord::new(ACCOUNT, format!("F{index}"), name);
+        item.parent_id = Some(ROOT.into());
+        item.size = metadata.len();
+        item.etag = Some(format!("e{index}"));
+        item.ctag = Some(format!("c{index}"));
+        item.local_mtime = Some(time::OffsetDateTime::from(metadata.modified().unwrap()));
+        item.local_size = Some(metadata.len());
+        item.local_ino = Some(metadata.ino());
+        item.state = ItemState::Synced;
+        h.store.upsert_item(&item).unwrap();
+    }
+
+    // Warm the page cache so the number being compared is our own work.
+    h.engine
+        .sync_local_paths(std::slice::from_ref(&h.root))
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let summary = h
+        .engine
+        .sync_local_paths(std::slice::from_ref(&h.root))
+        .unwrap();
+    let elapsed = started.elapsed();
+    eprintln!("full scan of {FILES} unchanged files: {elapsed:?}");
+    assert_eq!(summary.failed, 0);
+    assert_eq!(h.store.pending_count(ACCOUNT).unwrap(), 0);
+}

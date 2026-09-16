@@ -372,16 +372,38 @@ impl Store {
     /// delayed delete immediately so a later disappearance starts a fresh
     /// quiet-window generation instead of inheriting the old deadline.
     pub fn cancel_pending_delete(&self, account_id: &str, item_id: &str) -> Result<usize> {
+        self.cancel_pending_deletes(account_id, std::slice::from_ref(&item_id))
+    }
+
+    /// Withdraw queued remote deletions for every one of these items.
+    ///
+    /// The local scan calls this for each entry it finds on disk, which as one
+    /// statement per file is one write transaction per file — the single
+    /// heaviest thing a full scan of a large drive does. One statement per
+    /// directory costs the same when nothing is queued, which is the usual
+    /// case.
+    pub fn cancel_pending_deletes(&self, account_id: &str, item_ids: &[&str]) -> Result<usize> {
+        if item_ids.is_empty() {
+            return Ok(0);
+        }
         self.with_conn(|conn| {
-            Ok(conn.execute(
+            let placeholders = std::iter::repeat_n("?", item_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
                 "DELETE FROM pending_ops
-                  WHERE account_id = ?1 AND item_id = ?2 AND kind = 'delete_remote'",
-                params![account_id, item_id],
-            )?)
+                  WHERE account_id = ?1 AND kind = 'delete_remote'
+                    AND item_id IN ({placeholders})"
+            );
+            let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(item_ids.len() + 1);
+            values.push(&account_id);
+            for id in item_ids {
+                values.push(id);
+            }
+            Ok(conn.execute(&sql, values.as_slice())?)
         })
     }
 
-    /// Record a failure and schedule the retry.
     /// Postpone an operation without holding it against its retry budget.
     ///
     /// Used when something other than the operation itself is in the way — no
@@ -398,6 +420,7 @@ impl Store {
         })
     }
 
+    /// Record a failure and schedule the retry.
     pub fn fail_op(
         &self,
         id: i64,
