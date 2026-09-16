@@ -73,36 +73,7 @@ impl Engine {
         let known = self.store.item(&remote.id)?;
 
         if remote.is_deleted() {
-            let Some(known) = known else { return Ok(()) };
-            let Some(path) = self.store.local_path(account, &known.id)? else {
-                self.store.delete_subtree(&known.id)?;
-                return Ok(());
-            };
-            let local = stat_of(&path);
-            // An owned, still-dehydrated placeholder holds no local content
-            // whatever its recorded stat says: a refresh rewrote its size on
-            // disk without touching `local_size`, and one created from the
-            // download branch never recorded a stat at all. Keeping it as a
-            // "local edit" left an orphan the user could see but never open.
-            let untouched_placeholder = !known.is_folder
-                && super::local::owned_placeholder_state(&self.rooted(account)?, &path, &known.id)
-                    == Some(PlaceholderState::Dehydrated);
-            match decide_remote(remote, Some(&known), local.as_ref()) {
-                RemoteAction::KeepLocalAndReupload if !untouched_placeholder => {
-                    // Detach it from the remote item that no longer exists and
-                    // re-offer the local content as something new.
-                    self.store.delete_subtree(&known.id)?;
-                    self.store.enqueue(
-                        &self.account_id,
-                        OpKind::Upload,
-                        None,
-                        Some(&path),
-                        None,
-                    )?;
-                }
-                _ => self.remove_local(&known, &path, summary)?,
-            }
-            return Ok(());
+            return self.apply_remote_tombstone(account, remote, known, summary);
         }
 
         // The drive root anchors every path; record it and stop. Its pin stays
@@ -166,71 +137,8 @@ impl Engine {
         // aside) must not run. The new content arrives when the file is next
         // opened. This is what makes a cloud change to an un-downloaded file
         // invisible to the user, as it should be.
-        if !remote.is_folder() && !remote.is_deleted() {
-            let rooted = self.rooted(account)?;
-            let placeholder = match rooted.open_read(&path) {
-                Ok(file)
-                    if Placeholder::state_file(&file) == PlaceholderState::Dehydrated
-                        && known.as_ref().is_some_and(|existing| {
-                            Placeholder::item_id_file(&file).as_deref() == Some(&existing.id)
-                        }) =>
-                {
-                    Some(file)
-                }
-                Ok(_) => None,
-                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error),
-            };
-            if let (Some(existing), Some(_probe)) = (&known, placeholder) {
-                let changed = existing.ctag.as_deref() != remote.ctag.as_deref()
-                    || existing.size != remote.size.unwrap_or(0);
-                if changed {
-                    // Fall back to the known record time if the delta page
-                    // omitted fileSystemInfo, so a refresh never stamps the
-                    // placeholder with "now".
-                    let mtime = remote.effective_mtime().or(existing.remote_mtime);
-                    let file = rooted.open_write(&path)?;
-                    if Placeholder::state_file(&file) != PlaceholderState::Dehydrated
-                        || Placeholder::item_id_file(&file).as_deref() != Some(&existing.id)
-                    {
-                        return Err(transfer::file_changed_error(
-                            &path,
-                            "refreshing the placeholder",
-                        ));
-                    }
-                    Placeholder::create_file(
-                        &file,
-                        remote.size.unwrap_or(0),
-                        &remote.id,
-                        remote.ctag.as_deref(),
-                        mtime,
-                    )?;
-                    tracing::debug!(name = %name, "refreshed placeholder from a remote change");
-                }
-                let mut record = record_from_remote(
-                    &self.account_id,
-                    remote,
-                    ItemState::Dehydrated,
-                    PinState::Inherit,
-                );
-                record.pin_state = existing.pin_state;
-                self.store.upsert_item(&record)?;
-                if changed {
-                    // The placeholder's on-disk size and mtime just changed;
-                    // keep the recorded local version in step so the scan does
-                    // not read the refresh as a local edit.
-                    if let Ok(Some(meta)) = self.rooted(account)?.metadata(&path) {
-                        let local = LocalStat::from_metadata(&meta);
-                        self.store.set_local_stat(
-                            &existing.id,
-                            OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
-                            Some(local.size),
-                            Some(local.ino),
-                        )?;
-                    }
-                }
-                return Ok(());
-            }
+        if self.refresh_dehydrated_placeholder(account, remote, &known, &path, &name)? {
+            return Ok(());
         }
 
         let action = decide_remote(remote, known.as_ref(), local.as_ref());
@@ -655,9 +563,129 @@ impl Engine {
         Ok(())
     }
 
-    /// Apply a remote rename/move to the existing local inode before updating
-    /// its database record. Folder descendants follow automatically because
-    /// their paths are derived from the renamed parent's id.
+    /// Apply a tombstone: the service says this item is gone.
+    fn apply_remote_tombstone(
+        &self,
+        account: &Account,
+        remote: &DriveItem,
+        known: Option<ItemRecord>,
+        summary: &mut SyncSummary,
+    ) -> Result<()> {
+        let Some(known) = known else { return Ok(()) };
+        let Some(path) = self.store.local_path(account, &known.id)? else {
+            self.store.delete_subtree(&known.id)?;
+            return Ok(());
+        };
+        let local = stat_of(&path);
+        // An owned, still-dehydrated placeholder holds no local content
+        // whatever its recorded stat says: a refresh rewrote its size on
+        // disk without touching `local_size`, and one created from the
+        // download branch never recorded a stat at all. Keeping it as a
+        // "local edit" left an orphan the user could see but never open.
+        let untouched_placeholder = !known.is_folder
+            && super::local::owned_placeholder_state(&self.rooted(account)?, &path, &known.id)
+                == Some(PlaceholderState::Dehydrated);
+        match decide_remote(remote, Some(&known), local.as_ref()) {
+            RemoteAction::KeepLocalAndReupload if !untouched_placeholder => {
+                // Detach it from the remote item that no longer exists and
+                // re-offer the local content as something new.
+                self.store.delete_subtree(&known.id)?;
+                self.store
+                    .enqueue(&self.account_id, OpKind::Upload, None, Some(&path), None)?;
+            }
+            _ => self.remove_local(&known, &path, summary)?,
+        }
+        Ok(())
+    }
+
+    /// Refresh a dehydrated placeholder whose remote content changed, in place.
+    ///
+    /// It stays a placeholder: new size, new timestamp, new ctag. Its on-disk
+    /// bytes are holes, not the user's edit, so the ordinary conflict and
+    /// download logic — which would see "local differs" and copy it aside —
+    /// must not run. The new content arrives when the file is next opened,
+    /// which is what makes a cloud change to an un-downloaded file invisible
+    /// to the user, as it should be.
+    ///
+    /// Returns whether this handled the item.
+    fn refresh_dehydrated_placeholder(
+        &self,
+        account: &Account,
+        remote: &DriveItem,
+        known: &Option<ItemRecord>,
+        path: &Path,
+        name: &str,
+    ) -> Result<bool> {
+        if remote.is_folder() || remote.is_deleted() {
+            return Ok(false);
+        }
+        let rooted = self.rooted(account)?;
+        let placeholder = match rooted.open_read(path) {
+            Ok(file)
+                if Placeholder::state_file(&file) == PlaceholderState::Dehydrated
+                    && known.as_ref().is_some_and(|existing| {
+                        Placeholder::item_id_file(&file).as_deref() == Some(&existing.id)
+                    }) =>
+            {
+                Some(file)
+            }
+            Ok(_) => None,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if let (Some(existing), Some(_probe)) = (&known, placeholder) {
+            let changed = existing.ctag.as_deref() != remote.ctag.as_deref()
+                || existing.size != remote.size.unwrap_or(0);
+            if changed {
+                // Fall back to the known record time if the delta page
+                // omitted fileSystemInfo, so a refresh never stamps the
+                // placeholder with "now".
+                let mtime = remote.effective_mtime().or(existing.remote_mtime);
+                let file = rooted.open_write(path)?;
+                if Placeholder::state_file(&file) != PlaceholderState::Dehydrated
+                    || Placeholder::item_id_file(&file).as_deref() != Some(&existing.id)
+                {
+                    return Err(transfer::file_changed_error(
+                        path,
+                        "refreshing the placeholder",
+                    ));
+                }
+                Placeholder::create_file(
+                    &file,
+                    remote.size.unwrap_or(0),
+                    &remote.id,
+                    remote.ctag.as_deref(),
+                    mtime,
+                )?;
+                tracing::debug!(name = %name, "refreshed placeholder from a remote change");
+            }
+            let mut record = record_from_remote(
+                &self.account_id,
+                remote,
+                ItemState::Dehydrated,
+                PinState::Inherit,
+            );
+            record.pin_state = existing.pin_state;
+            self.store.upsert_item(&record)?;
+            if changed {
+                // The placeholder's on-disk size and mtime just changed;
+                // keep the recorded local version in step so the scan does
+                // not read the refresh as a local edit.
+                if let Ok(Some(meta)) = self.rooted(account)?.metadata(path) {
+                    let local = LocalStat::from_metadata(&meta);
+                    self.store.set_local_stat(
+                        &existing.id,
+                        OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
+                        Some(local.size),
+                        Some(local.ino),
+                    )?;
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Move whatever holds `path` aside when it is an item this delta batch is
     /// about to move elsewhere. Returns where it was parked, or `None` when the
     /// occupant is not ours to move.
@@ -698,6 +726,9 @@ impl Engine {
         Ok(Some(parked))
     }
 
+    /// Apply a remote rename/move to the existing local inode before updating
+    /// its database record. Folder descendants follow automatically because
+    /// their paths are derived from the renamed parent's id.
     fn move_local_for_remote(
         &self,
         old_path: &Path,
