@@ -39,11 +39,18 @@ impl Engine {
                 self.full_resync(summary).await?;
             }
             Err(e) => {
-                self.emit(SyncEvent::Failed {
-                    name: "delta".into(),
-                    path: None,
-                    error: e.to_string(),
-                });
+                // A transient failure — typically the network not yet back
+                // after resume from suspend — is already reported through the
+                // returned error as the account's "offline" state, and the
+                // next poll retries it. Logging it as a failed activity too
+                // buries the real history under one entry per wake-up.
+                if !e.is_transient() {
+                    self.emit(SyncEvent::Failed {
+                        name: "delta".into(),
+                        path: None,
+                        error: e.to_string(),
+                    });
+                }
                 return Err(e);
             }
         }

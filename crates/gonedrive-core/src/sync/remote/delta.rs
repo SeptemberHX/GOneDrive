@@ -46,13 +46,16 @@ impl Engine {
         // poll, while the durable change cursor still advances normally.
         if self.on_demand_enabled() && account.delta_link.is_some() && existing.is_none() {
             if let Err(error) = self.populate_folder(std::path::Path::new("")).await {
-                summary.failed = summary.failed.saturating_add(1);
                 tracing::warn!(%error, "root population failed; delta processing will continue");
-                self.emit(SyncEvent::Failed {
-                    name: "OneDrive".into(),
-                    path: Some(account.root_local_path.clone()),
-                    error: error.to_string(),
-                });
+                // Transient failures are retried next poll; see `remote_phase`.
+                if !error.is_transient() {
+                    summary.failed = summary.failed.saturating_add(1);
+                    self.emit(SyncEvent::Failed {
+                        name: "OneDrive".into(),
+                        path: Some(account.root_local_path.clone()),
+                        error: error.to_string(),
+                    });
+                }
             }
         }
 
