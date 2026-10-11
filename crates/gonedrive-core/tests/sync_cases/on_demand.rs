@@ -124,6 +124,42 @@ async fn a_missing_placeholder_is_rebuilt_from_local_state() {
 }
 
 #[tokio::test]
+async fn a_placeholder_the_user_deleted_is_not_rebuilt_on_reconnect() {
+    // Every helper (re)connection rebuilt "missing" placeholders, including
+    // ones the user had deleted or renamed while the daemon was stopped: the
+    // delete was silently undone, and a renamed copy was orphaned. Once the
+    // inode was seen, its absence is the user's change for the scan to
+    // reconcile, not a placeholder to restore.
+    use gonedrive_core::sync::{
+        materialise_placeholder_for_account, placeholder_inventory_for_account,
+    };
+
+    let h = Harness::metadata_only().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "Docs"),
+            file("F1", "D1", "gone.bin", "c1", 8192, "2026-08-21T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    assert_eq!(h.sync().await.failed, 0);
+
+    let account = h.store.accounts().unwrap().pop().unwrap();
+    let path = materialise_placeholder_for_account(&h.store, &account, "F1").unwrap();
+    assert!(h.store.item("F1").unwrap().unwrap().local_ino.is_some());
+
+    std::fs::remove_file(&path).unwrap();
+    let inventory = placeholder_inventory_for_account(&h.store, &account).unwrap();
+    assert!(
+        inventory.missing.is_empty(),
+        "a placeholder the user deleted must not come back"
+    );
+}
+
+#[tokio::test]
 async fn a_mark_failure_keeps_a_locked_placeholder_in_the_reconnect_inventory() {
     use gonedrive_core::sync::{
         lock_unwatched_placeholder_for_account, materialise_placeholder_for_account,
@@ -1027,5 +1063,97 @@ async fn an_interrupted_overwrite_is_not_repaired_into_the_new_version() {
         h.store.pending_count(ACCOUNT).unwrap(),
         1,
         "the queued download must survive to fetch the new version"
+    );
+}
+
+#[tokio::test]
+async fn a_completed_fill_reported_as_failed_is_committed_not_reset() {
+    // The helper marks the inode hydrated before it reports the fill. A helper
+    // restart in between reported a failure for a complete file; the record
+    // went back to Dehydrated and the scan then uploaded the download straight
+    // back as a local edit.
+    use gonedrive_core::hydrate::Placeholder;
+    use gonedrive_core::sync::materialise_placeholder_for_account;
+    use std::os::unix::fs::PermissionsExt;
+
+    let content: &[u8] = b"downloaded bytes";
+    let hash = gonedrive_core::hash::quick_xor(content);
+    let h = Harness::metadata_only().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            json!({
+                "id": "F1", "name": "doc.txt", "size": content.len(),
+                "cTag": "c1", "eTag": "e1",
+                "file": {"mimeType": "text/plain", "hashes": {"quickXorHash": hash}},
+                "parentReference": {"driveId": "drive1", "id": ROOT},
+                "fileSystemInfo": {"lastModifiedDateTime": "2026-08-21T10:00:00Z"}
+            }),
+        ],
+        "v1",
+    )
+    .await;
+    assert_eq!(h.sync().await.failed, 0);
+
+    let account = h.store.accounts().unwrap().pop().unwrap();
+    let path = materialise_placeholder_for_account(&h.store, &account, "F1").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    h.store.set_item_state("F1", ItemState::Hydrating).unwrap();
+    // What the helper does before it answers: fill, then mark.
+    Placeholder::fill(&path, 0, content).unwrap();
+    Placeholder::mark_hydrated(&path, "F1", Some("c1")).unwrap();
+    Placeholder::set_content_hash(&path, &hash).unwrap();
+
+    h.engine.fail_hydration(&path).unwrap();
+
+    let record = h.store.item("F1").unwrap().unwrap();
+    assert_eq!(record.state, ItemState::Synced, "the complete fill is kept");
+    assert_eq!(
+        record.local_ino,
+        Some(std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap()))
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_placeholder_renamed_before_any_scan_is_not_recreated() {
+    // A placeholder published by a delta recorded no inode until a later scan
+    // visited its folder. Renamed before that, it was "never landed" to the
+    // planner, and the next cTag-only delta created it again under the old
+    // name — the renamed copy then went up as a second item.
+    let content: &[u8] = b"cloud bytes";
+    let hash = gonedrive_core::hash::quick_xor(content);
+    let item = |ctag: &str| {
+        json!({
+            "id": "F1", "name": "fresh.txt", "size": content.len(),
+            "cTag": ctag, "eTag": format!("e-{ctag}"),
+            "file": {"mimeType": "text/plain", "hashes": {"quickXorHash": hash}},
+            "parentReference": {"driveId": "drive1", "id": ROOT},
+            "fileSystemInfo": {"lastModifiedDateTime": "2026-08-21T10:00:00Z"}
+        })
+    };
+    let h = Harness::with_config(Config {
+        client_id: "test".into(),
+        download_new: DownloadPolicy::Never,
+        on_demand: true,
+        ..Config::default()
+    })
+    .await;
+    h.mock_delta(None, vec![root_item()], "v1").await;
+    assert_eq!(h.sync().await.failed, 0);
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![item("c1,1")], "v2").await;
+    h.engine.sync_remote().await.unwrap();
+    assert!(h.path("fresh.txt").exists(), "published as a placeholder");
+
+    std::fs::rename(h.path("fresh.txt"), h.path("renamed.txt")).unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v2")), vec![item("c1,2")], "v3").await;
+    h.engine.sync_remote().await.unwrap();
+    assert!(
+        !h.path("fresh.txt").exists(),
+        "the renamed placeholder must not come back under its old name"
     );
 }

@@ -128,6 +128,8 @@ async fn an_interrupted_download_resumes_from_its_partial() {
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     // An earlier attempt landed the first 6 bytes before the signal dropped.
     std::fs::write(partial_path(&dest), &content[..6]).unwrap();
+    let partial = std::fs::File::open(partial_path(&dest)).unwrap();
+    crate::hydrate::set_partial_etag(&partial, "etag-c1").unwrap();
 
     // Only a ranged, version-checked request is served. A full download
     // would 404 here, so the test can only pass if the resume path is taken
@@ -169,6 +171,70 @@ async fn an_interrupted_download_resumes_from_its_partial() {
 }
 
 #[tokio::test]
+async fn a_partial_of_an_older_version_is_never_resumed_into_a_newer_one() {
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // A delta can apply between two transfer slices and move the record to a
+    // new eTag. Resuming with If-Range set to that *new* eTag was honoured,
+    // and the new version's tail was appended to the old version's head.
+    let old: &[u8] = b"OLDOLDOLDOLDOLDO";
+    let new: &[u8] = b"new content, v2!";
+    let server = MockServer::start().await;
+    let graph = GraphClient::new(
+        reqwest::Client::new(),
+        crate::TokenSource::Static("t".into()),
+    )
+    .with_base_url(server.uri());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("Docs/report.docx");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::write(partial_path(&dest), &old[..6]).unwrap();
+    let partial = std::fs::File::open(partial_path(&dest)).unwrap();
+    crate::hydrate::set_partial_etag(&partial, "etag-v1").unwrap();
+
+    // The service would honour a range against v2's own eTag.
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/F1/content"))
+        .and(header_exists("Range"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", "bytes 6-15/16")
+                .set_body_bytes(&new[6..]),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/F1/content"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(new))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    download_to_file_limited(
+        &graph,
+        "F1",
+        &dest,
+        Some("etag-v2"),
+        None,
+        0,
+        &mut |_, _| true,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        new,
+        "v2 whole, never spliced"
+    );
+    let published = std::fs::File::open(&dest).unwrap();
+    assert_eq!(crate::hydrate::partial_etag(&published), None);
+}
+
+#[tokio::test]
 async fn an_oversized_partial_restarts_after_range_not_satisfiable() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -200,6 +266,11 @@ async fn an_oversized_partial_restarts_after_range_not_satisfiable() {
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("file.bin");
     std::fs::write(partial_path(&dest), b"too-long!!").unwrap();
+    crate::hydrate::set_partial_etag(
+        &std::fs::File::open(partial_path(&dest)).unwrap(),
+        "etag-c1",
+    )
+    .unwrap();
 
     let downloaded = download_to_file_limited(
         &graph,
@@ -243,6 +314,7 @@ async fn an_overlong_range_response_is_never_published_or_resumed() {
     let dest = dir.path().join("file.bin");
     let partial = partial_path(&dest);
     std::fs::write(&partial, b"1").unwrap();
+    crate::hydrate::set_partial_etag(&std::fs::File::open(&partial).unwrap(), "etag-c1").unwrap();
 
     let result = download_to_file_limited(
         &graph,

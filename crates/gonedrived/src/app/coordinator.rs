@@ -357,7 +357,7 @@ impl App {
             // chunk boundaries; an in-flight HTTP chunk may overrun that target,
             // but polling resumes immediately after its result is durable.
             let remote_due = force_remote || Instant::now() >= next_remote;
-            if remote_poll_ready(remote_due, outbound_transfer_running) {
+            if remote_poll_ready(remote_due, outbound_transfer_running, local_scan_running) {
                 let mut changes = 0u64;
                 let mut queued = 0u64;
                 let mut failure = None;
@@ -602,8 +602,11 @@ impl App {
                     tracing::info!("shutting down");
                     return;
                 }
+                // A due delta held back by a running upload or scan waits for
+                // that worker's result; an already-expired timer here would
+                // spin the loop until it finishes.
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(timer)),
-                    if !remote_due || !outbound_transfer_running => {}
+                    if !remote_due || !(outbound_transfer_running || local_scan_running) => {}
                 Some(batch) = discovery_rx.recv(), if discovery_running => {
                     discovery_running = false;
                     let verification = self.consume_full_scan(batch.result, &mut dirty_paths).await;
@@ -686,8 +689,19 @@ pub(super) fn missing_account_retry_due(explicit_wake: bool, state: &str) -> boo
 
 /// A delta must not observe a remote mutation that an outbound worker has
 /// completed at Graph but has not committed to the local store yet.
-pub(super) fn remote_poll_ready(remote_due: bool, outbound_running: bool) -> bool {
-    remote_due && !outbound_running
+///
+/// Nor may it run beside a local scan. The scan reads the directory, then the
+/// records, then decides; a delta applied in between moves files on disk
+/// before it updates their records, so the scan sees a remote rename as a new
+/// local file, or a just-created folder as one the cloud has never seen, and
+/// queues the wrong operation. Scans already wait for a pending delta before
+/// they start, so the two simply take turns.
+pub(super) fn remote_poll_ready(
+    remote_due: bool,
+    outbound_running: bool,
+    local_scan_running: bool,
+) -> bool {
+    remote_due && !outbound_running && !local_scan_running
 }
 
 pub(super) fn outbound_scope(

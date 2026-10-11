@@ -52,6 +52,27 @@ pub const XATTR_QUICKXOR: &str = "user.gonedrive.quickxor";
 pub const XATTR_SYNCING: &str = "user.gonedrive.syncing";
 /// Original permission bits while an unprotected placeholder is fail-closed.
 pub const XATTR_SAFETY_MODE: &str = "user.gonedrive.safety_mode";
+/// The eTag a partial download was started from, kept on the partial file
+/// itself. A resume is valid only against that exact version: appending a
+/// newer version's tail to an older version's head would publish a file that
+/// is neither. Removed before the finished file is published.
+pub(crate) const XATTR_PARTIAL_ETAG: &str = "user.gonedrive.partial_etag";
+
+/// The version a partial download belongs to, if it recorded one.
+pub(crate) fn partial_etag(file: &std::fs::File) -> Option<String> {
+    get_xattr_file(file, XATTR_PARTIAL_ETAG)
+        .ok()
+        .flatten()
+        .and_then(|value| String::from_utf8(value).ok())
+}
+
+pub(crate) fn set_partial_etag(file: &std::fs::File, etag: &str) -> Result<()> {
+    set_xattr_file(file, XATTR_PARTIAL_ETAG, etag.as_bytes())
+}
+
+pub(crate) fn clear_partial_etag(file: &std::fs::File) -> Result<()> {
+    remove_xattr_file(file, XATTR_PARTIAL_ETAG)
+}
 
 /// What a placeholder currently holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

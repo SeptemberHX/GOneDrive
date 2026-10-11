@@ -320,8 +320,24 @@ async fn download_to_file_limited_inner(
         Some(rooted) => rooted.metadata(&partial)?,
         None => tokio::fs::metadata(&partial).await.ok(),
     };
+    // The leftover bytes belong to whatever version was current when they
+    // were written. The record's eTag may have moved since (a delta can apply
+    // between two transfer slices), and an If-Range with the *new* eTag would
+    // then be honoured, appending the new version's tail to the old head.
+    let partial_version = match (etag, &partial_meta) {
+        (Some(_), Some(meta)) if meta.len() > 0 => {
+            let opened = match rooted {
+                Some(rooted) => rooted.open_read(&partial).ok(),
+                None => std::fs::File::open(&partial).ok(),
+            };
+            opened.and_then(|file| crate::hydrate::partial_etag(&file))
+        }
+        _ => None,
+    };
     let mut resume_from = match (etag, partial_meta) {
-        (Some(_), Some(meta)) if meta.len() > 0 => meta.len(),
+        (Some(etag), Some(meta)) if meta.len() > 0 && partial_version.as_deref() == Some(etag) => {
+            meta.len()
+        }
         _ => {
             remove_file(rooted, &partial).await;
             0
@@ -350,21 +366,19 @@ async fn download_to_file_limited_inner(
         response.content_length()
     };
 
-    let mut file = if let Some(rooted) = rooted {
-        let file = if resuming {
-            rooted.open_append(&partial)?
-        } else {
-            rooted.create_file(&partial, true)?
-        };
-        tokio::fs::File::from_std(file)
-    } else if resuming {
-        tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&partial)
-            .await?
-    } else {
-        tokio::fs::File::create(&partial).await?
+    let file = match (rooted, resuming) {
+        (Some(rooted), true) => rooted.open_append(&partial)?,
+        (Some(rooted), false) => rooted.create_file(&partial, true)?,
+        (None, true) => std::fs::OpenOptions::new().append(true).open(&partial)?,
+        (None, false) => std::fs::File::create(&partial)?,
     };
+    if !resuming {
+        match etag {
+            Some(etag) => crate::hydrate::set_partial_etag(&file, etag)?,
+            None => crate::hydrate::clear_partial_etag(&file)?,
+        }
+    }
+    let mut file = tokio::fs::File::from_std(file);
     let mut written = if resuming { resume_from } else { 0 };
     let mut stream = response.bytes_stream();
     let mut pacer = RatePacer::new(rate_limit);
@@ -431,6 +445,13 @@ async fn download_to_file_limited_inner(
         }
     }
 
+    {
+        let finished = match rooted {
+            Some(rooted) => rooted.open_read(&partial)?,
+            None => std::fs::File::open(&partial)?,
+        };
+        crate::hydrate::clear_partial_etag(&finished)?;
+    }
     if let Some(mtime) = mtime {
         // Prepare the timestamp before publishing the inode. Once the rename
         // happens, no follow-up write is allowed to race a user's edit.

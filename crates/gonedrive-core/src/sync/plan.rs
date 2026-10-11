@@ -181,6 +181,14 @@ pub fn decide_remote(
             // A file sits where the folder must go: the folder wins, and the
             // file is preserved as a conflict copy rather than deleted.
             Some(_) => RemoteAction::ConflictCopy,
+            // The folder was on disk and is gone: renamed, moved or deleted
+            // locally, not yet reported by the scan. Graph lists a folder
+            // whenever something inside it changes, so recreating it here
+            // put an empty copy back under the old name, and the scan then
+            // uploaded the renamed folder as a new one, losing its identity.
+            None if known.is_some_and(|known| known.local_ino.is_some()) => {
+                RemoteAction::Skip(SkipReason::UpToDate)
+            }
             None => RemoteAction::CreateDirectory,
         };
     }

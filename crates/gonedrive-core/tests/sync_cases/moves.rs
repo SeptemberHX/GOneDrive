@@ -632,3 +632,255 @@ async fn a_local_rename_survives_a_delta_that_arrives_before_the_scan() {
     assert_eq!(record.name, "报告-2020.docx", "one item, renamed in place");
     assert_eq!(record.state, ItemState::Synced);
 }
+
+#[tokio::test]
+async fn a_case_only_rename_reaches_the_cloud() {
+    // Records match case-insensitively, as OneDrive names do, so renaming
+    // Foo.txt to foo.txt matched the same record and nothing was queued. The
+    // cloud kept the old spelling, and the next remote edit landed at a path
+    // ext4 considers absent, beside the renamed file.
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            file("F1", ROOT, "Foo.txt", "c1", 5, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"hello").await;
+    h.sync().await;
+
+    std::fs::rename(h.path("Foo.txt"), h.path("foo.txt")).unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    let renamed = file("F1", ROOT, "foo.txt", "c1", 5, "2026-08-20T10:00:00Z");
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/F1"))
+        .and(body_partial_json(json!({"name": "foo.txt"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(renamed))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.failed, 0, "{summary:?}");
+    let record = h.store.item("F1").unwrap().unwrap();
+    assert_eq!(record.name, "foo.txt", "the cloud must get the new spelling");
+}
+
+#[tokio::test]
+async fn a_local_folder_rename_survives_a_delta_that_lists_the_folder() {
+    // Graph lists a folder whenever something inside it changes. A delta that
+    // names the folder under its old name, pulled before the scan reports the
+    // local rename, recreated it empty, and the renamed folder was then
+    // uploaded as a new one. Only the move is mocked.
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            folder("D1", ROOT, "Project"),
+            file("F1", "D1", "notes.txt", "c1", 5, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    h.mock_download("F1", b"hello").await;
+    h.sync().await;
+
+    std::fs::rename(h.path("Project"), h.path("Project-2026")).unwrap();
+
+    h.server.reset().await;
+    let mut echoed = folder("D1", ROOT, "Project");
+    echoed["eTag"] = json!("e-folder-2");
+    h.mock_delta(Some(("token", "v1")), vec![echoed], "v2").await;
+    let mut moved = folder("D1", ROOT, "Project-2026");
+    moved["eTag"] = json!("e-folder-3");
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/D1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(moved))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.failed, 0, "{summary:?}");
+    assert!(!h.path("Project").exists(), "the old folder must not come back");
+    assert_eq!(
+        std::fs::read(h.path("Project-2026/notes.txt")).unwrap(),
+        b"hello"
+    );
+    assert_eq!(h.store.item("D1").unwrap().unwrap().name, "Project-2026");
+}
+
+#[tokio::test]
+async fn a_file_renamed_over_an_equal_sized_sibling_uploads_its_content() {
+    // `mv b c; mv a b` with two files of the same size and modification
+    // second: size and mtime said b was unchanged, so the cloud kept b's old
+    // content while a was deleted. The inode differs; the content decides.
+    let a: &[u8] = b"AAAA content";
+    let b: &[u8] = b"BBBB content";
+    let stamp = "2026-08-20T10:00:00Z";
+    let hashed = |id: &str, name: &str, bytes: &[u8]| {
+        json!({
+            "id": id, "name": name, "size": bytes.len(),
+            "cTag": "c1", "eTag": "e1",
+            "file": {"mimeType": "text/plain",
+                     "hashes": {"quickXorHash": gonedrive_core::hash::quick_xor(bytes)}},
+            "parentReference": {"driveId": "drive1", "id": ROOT},
+            "fileSystemInfo": {"lastModifiedDateTime": stamp}
+        })
+    };
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![root_item(), hashed("FA", "a.txt", a), hashed("FB", "b.txt", b)],
+        "v1",
+    )
+    .await;
+    h.mock_download("FA", a).await;
+    h.mock_download("FB", b).await;
+    h.sync().await;
+    assert_eq!(mtime_secs(&h.path("a.txt")), mtime_secs(&h.path("b.txt")));
+
+    std::fs::rename(h.path("b.txt"), h.path("c.txt")).unwrap();
+    std::fs::rename(h.path("a.txt"), h.path("b.txt")).unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    let mut uploaded = hashed("FB", "b.txt", a);
+    uploaded["cTag"] = json!("c2");
+    uploaded["eTag"] = json!("e2");
+    Mock::given(method("PUT"))
+        .and(path("/me/drive/items/FB/content"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(uploaded))
+        .mount(&h.server)
+        .await;
+
+    h.sync().await;
+    let sent_to_b: Vec<Vec<u8>> = h
+        .server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| {
+            request.method == wiremock::http::Method::PUT
+                && request.url.path() == "/me/drive/items/FB/content"
+        })
+        .map(|request| request.body)
+        .collect();
+    assert_eq!(sent_to_b, vec![a.to_vec()], "b now holds a's content");
+}
+
+#[tokio::test]
+async fn a_local_rename_racing_a_cloud_edit_keeps_both_versions() {
+    // Renamed locally while another device edited the file: the delta found
+    // the old name empty and fetched the new version there, so the rename
+    // could not be paired, and the renamed original, still carrying the
+    // item's xattrs, was deferred for ever as an "incomplete copy". The
+    // user's own version never reached the cloud.
+    let mine: &[u8] = b"my version";
+    let theirs: &[u8] = b"their newer version";
+    let item = |ctag: &str, bytes: &[u8]| {
+        json!({
+            "id": "F1", "name": "plan.txt", "size": bytes.len(),
+            "cTag": ctag, "eTag": format!("e-{ctag}"),
+            "file": {"mimeType": "text/plain",
+                     "hashes": {"quickXorHash": gonedrive_core::hash::quick_xor(bytes)}},
+            "parentReference": {"driveId": "drive1", "id": ROOT},
+            "fileSystemInfo": {"lastModifiedDateTime": "2026-08-20T10:00:00Z"}
+        })
+    };
+    let h = Harness::new().await;
+    h.mock_delta(None, vec![root_item(), item("c1", mine)], "v1").await;
+    h.mock_download("F1", mine).await;
+    h.sync().await;
+
+    std::fs::rename(h.path("plan.txt"), h.path("plan-mine.txt")).unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![item("c2", theirs)], "v2")
+        .await;
+    h.mock_download("F1", theirs).await;
+    mock_upload(&h.server, "F9", "plan-mine.txt").await;
+    h.mock_delta(Some(("token", "v2")), vec![], "v3").await;
+
+    h.sync().await;
+    h.sync().await;
+
+    assert_eq!(std::fs::read(h.path("plan.txt")).unwrap(), theirs);
+    assert_eq!(std::fs::read(h.path("plan-mine.txt")).unwrap(), mine);
+    let uploaded: Vec<Vec<u8>> = h
+        .server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.method == wiremock::http::Method::PUT)
+        .map(|request| request.body)
+        .collect();
+    assert!(
+        uploaded.iter().any(|body| body == mine),
+        "the user's renamed version must be uploaded"
+    );
+    assert!(
+        !uploaded.iter().any(|body| body == theirs),
+        "the cloud's version must not be re-uploaded"
+    );
+}
+
+#[tokio::test]
+async fn a_folder_rename_with_a_stale_etag_retries_instead_of_conflict_copying() {
+    // A folder's eTag changes whenever its contents do, including after this
+    // device's own uploads. The rename's If-Match then failed with 412, and the
+    // whole folder was renamed aside as a conflict copy.
+    let h = Harness::new().await;
+    let mut project = folder("D1", ROOT, "Project");
+    project["eTag"] = json!("e-old");
+    h.mock_delta(None, vec![root_item(), project], "v1").await;
+    h.sync().await;
+
+    std::fs::rename(h.path("Project"), h.path("Project-final")).unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/D1"))
+        .and(header("If-Match", "e-old"))
+        .respond_with(ResponseTemplate::new(412).set_body_json(json!({
+            "error": {"code": "resourceModified", "message": "etag"}
+        })))
+        .mount(&h.server)
+        .await;
+    let mut current = folder("D1", ROOT, "Project");
+    current["eTag"] = json!("e-new");
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/D1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(current))
+        .mount(&h.server)
+        .await;
+    let mut moved = folder("D1", ROOT, "Project-final");
+    moved["eTag"] = json!("e-moved");
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/D1"))
+        .and(header("If-Match", "e-new"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(moved))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.failed, 0, "{summary:?}");
+    assert_eq!(summary.conflicts, 0, "{summary:?}");
+    assert!(h.path("Project-final").is_dir(), "the user's folder keeps its name");
+    let names: Vec<_> = std::fs::read_dir(h.path(""))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.contains("conflict") || name.contains("冲突")),
+        "no conflict copy of a folder: {names:?}"
+    );
+    assert_eq!(h.store.item("D1").unwrap().unwrap().name, "Project-final");
+}

@@ -387,6 +387,29 @@ impl Engine {
                     // it cannot be uploaded under the stale/competing identity.
                     continue;
                 }
+                // A case-only rename (`Foo.txt` → `foo.txt`). Records are
+                // matched case-insensitively, the way OneDrive names things, so
+                // this entry finds its record and nothing else looks changed.
+                // Left alone, the cloud and the record keep the old spelling;
+                // the next remote change then lands at a path ext4 considers
+                // absent, and the copy that appears there makes this file read
+                // as a stale edit that overwrites the newer cloud version.
+                // Only when the recorded spelling is gone: two entries that
+                // differ only in case are a collision, not a rename.
+                if let Some(record) = record {
+                    if record.name != *name
+                        && !moved_ids.contains(&record.id)
+                        && !entries.iter().any(|(other, _)| *other == record.name)
+                    {
+                        self.store.enqueue_move(
+                            &self.account_id,
+                            &record.id,
+                            &dir.join(&record.name),
+                            &entry_path,
+                        )?;
+                        moved_ids.insert(record.id.clone());
+                    }
+                }
                 // Unknown indexer markers are not uploaded; known ones are
                 // still counted in `entries`/`on_disk`, so they are not
                 // repeatedly queued as remote deletions either.
@@ -474,7 +497,40 @@ impl Engine {
                     continue;
                 }
 
-                match decide_local(name, record, Some(stat)) {
+                let mut action = decide_local(name, record, Some(stat));
+                // Size and second-resolution mtime cannot tell a renamed-over
+                // file from the one it replaced (`mv b c; mv a b` with two
+                // equal-sized files from the same second): the entry looked
+                // unchanged, so the cloud kept b's old content while a was
+                // deleted. A different inode with the same stat is rare, so
+                // only then is the content compared against the recorded hash.
+                if let (LocalAction::Nothing, Some(record)) = (&action, record) {
+                    if !stat.is_dir && record.local_ino.is_some_and(|ino| ino != stat.ino) {
+                        let path = dir.join(name);
+                        let differs = match (
+                            record.quickxor.as_deref(),
+                            crate::hash::quick_xor_file(&path),
+                        ) {
+                            (Some(known), Ok(current)) => known != current,
+                            // No recorded hash to compare: same content cannot
+                            // be proven, so upload rather than risk keeping the
+                            // replaced version in the cloud.
+                            (None, Ok(_)) => true,
+                            (_, Err(_)) => false,
+                        };
+                        if differs {
+                            action = LocalAction::UploadModified;
+                        } else {
+                            self.store.set_local_stat(
+                                &record.id,
+                                OffsetDateTime::from_unix_timestamp(stat.mtime).ok(),
+                                Some(stat.size),
+                                Some(stat.ino),
+                            )?;
+                        }
+                    }
+                }
+                match action {
                     LocalAction::CreateRemoteFolder => {
                         let new_path = dir.join(name);
                         let moved = self.moved_candidate(&account, &by_inode, &new_path, stat)?;
@@ -671,14 +727,10 @@ impl Engine {
                     }
                 }
                 None => {
+                    let complete = completed_writes.is_some_and(|paths| paths.contains(path))
+                        || self.displaced_original(&account, &by_inode, path, stat)?;
                     if !stat.is_dir
-                        && !self.prepare_copied_placeholder(
-                            &rooted,
-                            path,
-                            stat,
-                            None,
-                            completed_writes.is_some_and(|paths| paths.contains(path)),
-                        )?
+                        && !self.prepare_copied_placeholder(&rooted, path, stat, None, complete)?
                     {
                         continue;
                     }
@@ -886,6 +938,56 @@ impl Engine {
             return Ok(None);
         }
         Ok(Some((known, old)))
+    }
+
+    /// Whether `path` is an item's own original file, renamed away while the
+    /// cloud replaced that item's content.
+    ///
+    /// The delta that brought the new content found the old path empty and
+    /// fetched the new version there, so the rename cannot be paired any more:
+    /// the old path is occupied again, or a download for it is pending. The
+    /// renamed file still carries the item's xattrs, and without this it was
+    /// deferred for ever as an "incomplete copy" — the user's own version,
+    /// never uploaded. It is not a copy in progress: the scan-start snapshot
+    /// recorded this very inode for the item, and its birth predates the
+    /// record. Treating it as complete makes it a new item, so the user's
+    /// version and the cloud's both survive, as for any other conflict.
+    fn displaced_original(
+        &self,
+        account: &Account,
+        by_inode: &HashMap<u64, ItemRecord>,
+        path: &Path,
+        stat: &LocalStat,
+    ) -> Result<bool> {
+        if stat.is_dir || account.root_dev != Some(stat.dev) {
+            return Ok(false);
+        }
+        let Some(known) = by_inode.get(&stat.ino) else {
+            return Ok(false);
+        };
+        if known.is_folder {
+            return Ok(false);
+        }
+        let Some(old) = self.store.local_path(account, &known.id)? else {
+            return Ok(false);
+        };
+        if old == path {
+            return Ok(false);
+        }
+        // A hard link shares the inode, xattrs included; clearing them here
+        // would strip the item's own identity at its own path.
+        if crate::sync::engine::stat_of(&old).is_some_and(|other| other.ino == stat.ino) {
+            return Ok(false);
+        }
+        let birth = self
+            .rooted(account)
+            .ok()
+            .and_then(|rooted| rooted.open_read(path).ok())
+            .and_then(|file| birth_time(&file));
+        Ok(!inode_was_recycled(
+            birth,
+            self.store.item_recorded_at(&known.id)?,
+        ))
     }
 
     /// Turn a completed copy of one of our placeholders into an ordinary new

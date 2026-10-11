@@ -307,9 +307,10 @@ impl GraphClient {
         let body = NewFolder {
             name,
             folder: EmptyFacet {},
-            // A folder that already exists is not an error worth failing on;
-            // two clients racing to create the same directory is normal.
-            conflict_behavior: "replace",
+            // Never "replace": for a folder that already exists it replaces
+            // the item, sending the existing folder and everything in it to
+            // the recycle bin. The caller adopts the existing folder on 409.
+            conflict_behavior: "fail",
         };
         let base = &self.base;
         let response = self

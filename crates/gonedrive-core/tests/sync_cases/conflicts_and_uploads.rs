@@ -845,3 +845,67 @@ async fn an_edit_during_a_tracked_upload_is_queued_again() {
         Some("c2")
     );
 }
+
+#[tokio::test]
+async fn a_download_overtaken_by_a_newer_version_does_not_commit_the_older_one() {
+    // Download slices run beside delta passes. A delta that moved the item to
+    // v2 while v1 was streaming re-queued the download in the same row; the
+    // v1 commit then marked v1 as v2 and deleted the row, so v2 never arrived
+    // and the next local edit would overwrite it under a matching If-Match.
+    let v1: &[u8] = b"version one";
+    let v2: &[u8] = b"version two!";
+    let h = Harness::new().await;
+    h.mock_delta(
+        None,
+        vec![
+            root_item(),
+            file("F1", ROOT, "doc.txt", "c1", v1.len() as u64, "2026-08-20T10:00:00Z"),
+        ],
+        "v1",
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/F1/content"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(400))
+                .set_body_bytes(v1),
+        )
+        .mount(&h.server)
+        .await;
+    h.engine.sync_remote().await.unwrap();
+
+    let newer_delta = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Mounted with priority: the first delta mock matches any token.
+        Mock::given(method("GET"))
+            .and(path("/me/drive/root/delta"))
+            .and(query_param("token", "v1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [file("F1", ROOT, "doc.txt", "c2", v2.len() as u64, "2026-08-21T10:00:00Z")],
+                "@odata.deltaLink": format!("{}/me/drive/root/delta?token=v2", h.server.uri()),
+            })))
+            .with_priority(1)
+            .mount(&h.server)
+            .await;
+        h.engine.sync_remote().await.unwrap();
+    };
+    let transfer = h.engine.transfer_slice(
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+        QueueScope::Downloads,
+    );
+    let (transferred, ()) = tokio::join!(transfer, newer_delta);
+    transferred.unwrap();
+
+    let record = h.store.item("F1").unwrap().unwrap();
+    assert_eq!(record.ctag.as_deref(), Some("c2"));
+    assert_ne!(record.state, ItemState::Synced, "v1 must not be committed as v2");
+    assert!(
+        h.store
+            .pending_ops(ACCOUNT, 10)
+            .unwrap()
+            .iter()
+            .any(|op| op.kind == OpKind::Download && op.item_id.as_deref() == Some("F1")),
+        "the download of v2 stays queued"
+    );
+}

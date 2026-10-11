@@ -131,9 +131,11 @@ fn only_transient_startup_auth_failures_retry_without_user_input() {
 
 #[test]
 fn delta_waits_for_an_active_outbound_slice_to_commit() {
-    assert!(remote_poll_ready(true, false));
-    assert!(!remote_poll_ready(true, true));
-    assert!(!remote_poll_ready(false, false));
+    assert!(remote_poll_ready(true, false, false));
+    assert!(!remote_poll_ready(true, true, false));
+    assert!(!remote_poll_ready(false, false, false));
+    // A delta applied mid-scan moves files before it updates their records.
+    assert!(!remote_poll_ready(true, false, true));
 }
 
 #[test]

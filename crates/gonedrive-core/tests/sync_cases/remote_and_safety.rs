@@ -1042,3 +1042,67 @@ async fn a_stopped_engine_neither_writes_nor_reaches_the_service() {
     );
     assert!(h.engine.is_stopped());
 }
+
+#[tokio::test]
+async fn a_new_local_folder_adopts_an_existing_cloud_folder_instead_of_replacing_it() {
+    // Folder creation used conflictBehavior "replace", which for an existing
+    // folder replaces the item: the cloud folder and everything in it go to
+    // the recycle bin. A scan with a stale view (a lazily listed folder, or a
+    // race with the delta) can ask to create a folder that already exists.
+    let h = Harness::new().await;
+    h.mock_delta(None, vec![root_item()], "v1").await;
+    h.sync().await;
+
+    std::fs::create_dir(h.path("Shared")).unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+    Mock::given(method("POST"))
+        .and(path(format!("/me/drive/items/{ROOT}/children")))
+        .and(body_partial_json(
+            json!({"@microsoft.graph.conflictBehavior": "fail"}),
+        ))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "error": {"code": "nameAlreadyExists", "message": "exists"}
+        })))
+        .mount(&h.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/me/drive/items/{ROOT}:/Shared")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(folder("D7", ROOT, "Shared")))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.failed, 0, "{summary:?}");
+    let record = h.store.item("D7").unwrap().expect("the existing folder is adopted");
+    assert_eq!(record.name, "Shared");
+}
+
+#[tokio::test]
+async fn a_remote_delete_for_an_item_no_longer_tracked_is_dropped() {
+    // A scan can queue a delete for a row that is dropped before the op runs
+    // (an on-demand conversion pruning never-downloaded files). With no row
+    // there was no local path to re-check, and the delete still went out.
+    let h = Harness::new().await;
+    h.mock_delta(None, vec![root_item()], "v1").await;
+    h.sync().await;
+
+    h.store
+        .enqueue(ACCOUNT, OpKind::DeleteRemote, Some("GHOST"), None, None)
+        .unwrap();
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![], "v2").await;
+
+    h.sync().await;
+    let deletes = h
+        .server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.method == wiremock::http::Method::DELETE)
+        .count();
+    assert_eq!(deletes, 0, "an untracked item must never be deleted remotely");
+    assert!(h.store.pending_ops(ACCOUNT, 10).unwrap().is_empty());
+}

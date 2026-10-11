@@ -150,6 +150,7 @@ impl Engine {
 
         let action = decide_remote(remote, known.as_ref(), local.as_ref());
         let mut state = ItemState::Synced;
+        let mut published_placeholder = None;
         let mut directory_population = None;
         let local_was_modified =
             known
@@ -246,6 +247,7 @@ impl Engine {
                             remote.effective_mtime(),
                         )?;
                         self.note_placeholder(&path);
+                        published_placeholder = stat_of(&path);
                     }
                 }
             }
@@ -341,6 +343,19 @@ impl Engine {
             record.local_mtime = known.local_mtime;
             record.local_size = known.local_size;
             record.local_ino = known.local_ino;
+        }
+        // A placeholder published just now exists on disk from this moment.
+        // Recording it here rather than at the next scan of its folder means a
+        // rename or delete of it before that scan is recognised as one —
+        // otherwise a later cTag-only delta re-creates it under the old name.
+        if record.local_ino.is_none() {
+            if let Some(placeholder) = published_placeholder {
+                record.local_mtime = OffsetDateTime::from_unix_timestamp(placeholder.mtime).ok();
+                record.local_size = Some(placeholder.size);
+                record.local_ino = Some(placeholder.ino);
+            }
+        }
+        if let Some(known) = &known {
             if state == ItemState::DirtyRemote {
                 // Until the queued download atomically lands, these hashes
                 // describe the local byte version that is still on disk. The

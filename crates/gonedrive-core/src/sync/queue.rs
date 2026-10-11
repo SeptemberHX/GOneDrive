@@ -407,6 +407,33 @@ impl Engine {
         }
 
         let local = LocalStat::from_metadata(&published.metadata()?);
+        // A delta can apply while this download streams and move the item to
+        // a newer version, re-queueing its download in this same row.
+        // Committing would mark the older bytes as that newer version and
+        // drop the queued download: the cloud change would never arrive, and
+        // the next local edit would overwrite it under a matching If-Match.
+        // Record what is on disk now, so the next download does not mistake
+        // these bytes for a user's edit, and leave the row to retry.
+        let downloaded_version = record.etag.as_deref().or(record.ctag.as_deref());
+        let current = self.store.item(item_id)?;
+        if current
+            .as_ref()
+            .is_some_and(|now| now.etag.as_deref().or(now.ctag.as_deref()) != downloaded_version)
+        {
+            self.store.set_local_stat(
+                item_id,
+                OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
+                Some(local.size),
+                Some(local.ino),
+            )?;
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "{} changed in the cloud while downloading; fetching the newer version",
+                    path.display()
+                ),
+            )));
+        }
         let content_hash = Placeholder::content_hash_file(&published);
         self.store.commit_hydration(
             &account.id,
@@ -684,7 +711,24 @@ impl Engine {
             .to_string_lossy()
             .into_owned();
 
-        let item = self.graph.create_folder(parent_id, &name).await?;
+        let item = match self.graph.create_folder(parent_id, &name).await {
+            Ok(item) => item,
+            // The name is taken: another client made the folder first, or it
+            // existed in a part of the drive this device had not listed yet.
+            // Adopt it, contents and all; two clients creating the same
+            // directory is normal. A *file* by that name is a real conflict.
+            Err(Error::Graph { status: 409, .. }) => {
+                let existing = self.graph.child_by_name(parent_id, &name).await?;
+                if !existing.is_folder() {
+                    return Err(Error::other(format!(
+                        "cannot create folder {name}: a file with that name already exists in the cloud"
+                    )));
+                }
+                tracing::info!(path = %path.display(), item_id = %existing.id, "adopting an existing remote folder");
+                existing
+            }
+            Err(error) => return Err(error),
+        };
         let mut record = record_from_remote(
             &self.account_id,
             &item,
@@ -706,12 +750,20 @@ impl Engine {
             .item_id
             .as_deref()
             .ok_or_else(|| Error::other("delete operation without an item id"))?;
+        // Only an item this device still tracks is deleted. A row that is gone
+        // was dropped deliberately — pruned by an on-demand conversion, or
+        // superseded by a newer delta — after the scan that queued this op
+        // saw it missing. Without the row there is no local path to confirm
+        // the deletion against, so the op is void, never a remote delete.
+        let Some(record) = self.store.item(item_id)? else {
+            tracing::info!(
+                item_id,
+                "dropping a remote delete for an item no longer tracked"
+            );
+            return Ok(());
+        };
         // The name for the activity log, read before the record is gone.
-        let name = self
-            .store
-            .item(item_id)?
-            .map(|record| record.name)
-            .unwrap_or_default();
+        let name = record.name;
         let activity_path = self.store.local_path(&self.account()?, item_id)?;
         if let Some(path) = &activity_path {
             match std::fs::symlink_metadata(path) {
@@ -787,6 +839,28 @@ impl Engine {
             .await
         {
             Ok(item) => item,
+            // A folder's eTag moves whenever anything inside it changes —
+            // including this device's own uploads, before the delta reports
+            // them. That is no conflict with renaming the folder, and treating
+            // it as one renamed the user's whole folder to a conflict copy.
+            // Retry against the folder's current version: a concurrent remote
+            // rename loses to the local one, as it does for an unseen delta.
+            Err(Error::Graph { status: 412, .. }) if path.is_dir() => {
+                let current = self.graph.item(item_id).await?;
+                if !current.is_folder() {
+                    return Err(Error::other(format!(
+                        "remote item {item_id} is no longer a folder; not moving it"
+                    )));
+                }
+                self.graph
+                    .move_item(
+                        item_id,
+                        Some(&new_parent),
+                        new_name.as_deref(),
+                        current.etag.as_deref(),
+                    )
+                    .await?
+            }
             Err(Error::Graph { status: 412, .. }) => {
                 self.store.cancel_outbound_ops_for_version(
                     &self.account_id,

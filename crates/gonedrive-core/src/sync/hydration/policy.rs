@@ -119,11 +119,16 @@ fn missing_placeholder_was_published(
     record: &crate::db::ItemRecord,
     path: &Path,
 ) -> Result<bool> {
-    // Once an inode was observed, its absence needs repair/reconciliation even
-    // if its parent later became partial. The normal case for lazy metadata has
-    // no local observation and is governed by its parent's population marker.
+    // Once an inode was observed, the file existed and is gone: the user
+    // deleted, renamed or moved it, perhaps while the daemon was stopped.
+    // GOnedrive never removes a placeholder it cannot protect — it locks it in
+    // place instead — so rebuilding one here only undid the user's change and,
+    // for a rename, orphaned the renamed copy. The local scan reconciles it:
+    // it pairs a rename through the recorded inode and guards a delete. Only
+    // placeholders that were never observed (lazy metadata, an interrupted
+    // creation) are rebuilt, governed by their parent's population marker.
     if record.local_ino.is_some() {
-        return Ok(true);
+        return Ok(false);
     }
     if record.parent_id.as_deref() == account.root_item_id.as_deref() {
         return Ok(true);

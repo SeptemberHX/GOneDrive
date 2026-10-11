@@ -171,7 +171,32 @@ impl Engine {
     /// A staged fill failed after the record entered Hydrating. Put it back in
     /// a retryable placeholder state and release UI state.
     pub fn fail_hydration(&self, path: &Path) -> Result<()> {
-        let (_account, record, _file) = self.open_owned_placeholder(path, false)?;
+        let (account, record, file) = self.open_owned_placeholder(path, false)?;
+        // The helper marks the inode hydrated before it reports the fill, so a
+        // helper restart in between reports a failure for a file that is in
+        // fact complete. Resetting the record to Dehydrated then made the
+        // scan read the real bytes as a local edit and upload the download
+        // straight back. Trust the inode when it carries this version's hash,
+        // exactly as the startup repair does.
+        if Placeholder::state_file(&file) == PlaceholderState::Hydrated {
+            let content_hash = Placeholder::content_hash_file(&file);
+            if content_hash.is_some() && content_hash == record.quickxor {
+                let local = LocalStat::from_metadata(&file.metadata()?);
+                self.store.commit_hydration(
+                    &account.id,
+                    &record.id,
+                    OffsetDateTime::from_unix_timestamp(local.mtime).ok(),
+                    Some(local.size),
+                    Some(local.ino),
+                    content_hash.as_deref(),
+                )?;
+                self.emit(SyncEvent::HydrationFinished {
+                    path: path.to_path_buf(),
+                    ok: true,
+                });
+                return Ok(());
+            }
+        }
         let item_id = record.id;
         self.store.set_item_state(&item_id, ItemState::Dehydrated)?;
         self.emit(SyncEvent::HydrationFinished {
