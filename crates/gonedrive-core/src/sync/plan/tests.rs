@@ -251,11 +251,37 @@ fn an_unknown_file_already_on_disk_is_treated_as_a_conflict() {
 }
 
 #[test]
-fn a_known_file_missing_from_disk_is_refetched() {
+fn a_landed_file_gone_from_disk_is_left_to_the_local_scan() {
+    // Renamed or deleted locally, and the delta (a cTag-only bump, as OneDrive
+    // sends shortly after an upload) arrived before the scan reported it.
+    // Re-fetching would put a cloud-only copy back under the old name.
     let remote = remote_file("F1", "R", "a.txt", "c1", 10);
     let known = synced_record(&remote, &stat(10, 1));
     assert_eq!(
         decide_remote(&remote, Some(&known), None),
+        RemoteAction::Skip(SkipReason::UpToDate)
+    );
+}
+
+#[test]
+fn a_known_file_that_never_landed_is_fetched() {
+    let remote = remote_file("F1", "R", "a.txt", "c1", 10);
+    let known = record_from_remote("acct", &remote, ItemState::Synced, PinState::Pinned);
+    assert_eq!(known.local_ino, None);
+    assert_eq!(
+        decide_remote(&remote, Some(&known), None),
+        RemoteAction::Download { overwrite: false }
+    );
+}
+
+#[test]
+fn a_cloud_edit_to_a_file_gone_from_disk_is_fetched() {
+    // A local delete must not discard someone else's newer cloud version.
+    let old = remote_file("F1", "R", "a.txt", "c1", 10);
+    let known = synced_record(&old, &stat(10, 1));
+    let edited = remote_file("F1", "R", "a.txt", "c2", 12);
+    assert_eq!(
+        decide_remote(&edited, Some(&known), None),
         RemoteAction::Download { overwrite: false }
     );
 }

@@ -582,3 +582,53 @@ async fn a_folder_renamed_onto_a_deleted_folders_name_does_not_collide_with_it()
     assert!(h.store.item("YF").unwrap().is_none());
     assert!(h.store.due_outbound_ops(ACCOUNT, 10).unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_local_rename_survives_a_delta_that_arrives_before_the_scan() {
+    // Found live: renaming a freshly uploaded document left a cloud-only copy
+    // under the old name and uploaded the renamed file as a second item.
+    // OneDrive bumps a new file's cTag shortly after the upload; that delta is
+    // pulled before the local scan, still names the old path, and found it
+    // missing. Re-fetching it there put a placeholder back at the old name,
+    // which then stopped the scan from pairing the rename. Only the move is
+    // mocked: a content upload or a download fails the pass.
+    let content = b"report body";
+    let quickxor = gonedrive_core::hash::quick_xor(content);
+    let item = |ctag: &str| {
+        json!({
+            "id": "F1", "name": "报告-1.docx", "size": content.len(),
+            "cTag": ctag, "eTag": format!("e-{ctag}"),
+            "file": {"mimeType": "application/octet-stream", "hashes": {"quickXorHash": quickxor}},
+            "parentReference": {"driveId": "drive1", "id": ROOT},
+            "fileSystemInfo": {"lastModifiedDateTime": "2026-10-11T06:35:40Z"}
+        })
+    };
+    let h = Harness::new().await;
+    h.mock_delta(None, vec![root_item(), item("c1,2")], "v1").await;
+    h.mock_download("F1", content).await;
+    h.sync().await;
+    assert_eq!(std::fs::read(h.path("报告-1.docx")).unwrap(), content);
+
+    std::fs::rename(h.path("报告-1.docx"), h.path("报告-2020.docx")).unwrap();
+
+    h.server.reset().await;
+    h.mock_delta(Some(("token", "v1")), vec![item("c1,3")], "v2").await;
+    let mut moved = item("c1,3");
+    moved["name"] = json!("报告-2020.docx");
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/F1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(moved))
+        .mount(&h.server)
+        .await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary.failed, 0, "{summary:?}");
+    assert!(
+        !h.path("报告-1.docx").exists(),
+        "the old name must not come back"
+    );
+    assert_eq!(std::fs::read(h.path("报告-2020.docx")).unwrap(), content);
+    let record = h.store.item("F1").unwrap().unwrap();
+    assert_eq!(record.name, "报告-2020.docx", "one item, renamed in place");
+    assert_eq!(record.state, ItemState::Synced);
+}

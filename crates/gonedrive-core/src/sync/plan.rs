@@ -192,8 +192,21 @@ pub fn decide_remote(
         // database was lost. Treat it as a conflict rather than overwriting
         // content we cannot prove is a copy of the remote version.
         (None, Some(_)) => RemoteAction::ConflictCopy,
-        // Known to us but absent on disk: the user deleted it, or a previous
-        // download failed. Re-fetch.
+        // Known, and it had landed on disk, but it is gone and the service's
+        // content is what we already had: the user renamed or deleted it, and
+        // the local scan has not reported that yet. Leave the absence to the
+        // scan, which pairs a rename through the recorded inode and guards a
+        // delete. Re-fetching here put a cloud-only copy back under the old
+        // name, which then blocked the rename pairing and turned the rename
+        // into an upload of a second item.
+        (Some(known), None)
+            if known.local_ino.is_some() && !remote_content_changed(known, remote) =>
+        {
+            RemoteAction::Skip(SkipReason::UpToDate)
+        }
+        // Known but never landed (a download that failed or never ran), or
+        // gone locally while someone changed it in the cloud: fetch it, so a
+        // newer cloud version is never lost to a local delete.
         (Some(_), None) => RemoteAction::Download { overwrite: false },
         (Some(known), Some(local)) => {
             let remote_changed = remote_content_changed(known, remote);
