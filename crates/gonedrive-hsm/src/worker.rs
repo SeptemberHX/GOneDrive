@@ -729,7 +729,22 @@ pub(super) fn hydration_reader(pid: i32, source: &Path) -> String {
 
 pub(super) fn writable_copy_destination(pid: i32, source: &Path) -> Option<PathBuf> {
     let source_name = source.file_name()?;
-    let descriptors = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    let descriptors = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        Ok(descriptors) => descriptors,
+        Err(error) => {
+            // EACCES here means the unit lost CAP_SYS_PTRACE: every
+            // file-manager copy would then be refused as a browse. Say so once
+            // rather than on every folder sniff.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!(pid, %error, "cannot inspect a file manager's descriptors; its copies will be refused");
+            }
+            return None;
+        }
+    };
     for descriptor in descriptors.flatten() {
         let fd = descriptor.file_name();
         let flags = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", fd.to_string_lossy()))

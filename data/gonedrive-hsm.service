@@ -29,8 +29,11 @@ LimitNOFILE=524288
 
 # Runs as root for CAP_SYS_ADMIN (fanotify pre-content). CAP_FOWNER is needed
 # only to restore a user's placeholder mode after a replacement mark succeeds.
+# CAP_SYS_PTRACE lets root read another uid's /proc/<pid>/fd: without it the
+# helper cannot see the destination Nautilus holds open, every file-manager
+# copy of a placeholder is refused as a browse, and Nautilus reports EPERM.
 # The socket still restricts every operation to files owned by its peer uid.
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_SYS_PTRACE
 NoNewPrivileges=true
 ProtectSystem=strict
 # ProtectHome must remain unset: hydration, xattr updates, and safety-mode
