@@ -314,7 +314,7 @@ async fn a_download_preserves_a_hidden_local_edit_as_a_conflict_copy() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains("的冲突副本"))
+        .filter(|n| n.contains("的冲突副本") || n.contains("conflicted copy"))
         .collect();
     assert_eq!(
         copies.len(),
@@ -363,7 +363,7 @@ async fn an_upload_that_would_overwrite_a_newer_remote_becomes_a_conflict() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains("的冲突副本"))
+        .filter(|n| n.contains("的冲突副本") || n.contains("conflicted copy"))
         .collect();
     assert_eq!(
         copies.len(),

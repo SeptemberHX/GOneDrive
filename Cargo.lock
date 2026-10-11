@@ -1062,6 +1062,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "getrandom 0.4.3",
+ "gonedrive-ipc",
  "hex",
  "libc",
  "oo7",

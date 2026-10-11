@@ -245,7 +245,8 @@ impl App {
             app.set_paused(false).await;
             app.set_state(
                 "idle",
-                Some(format!(
+                Some(gonedrive_ipc::trf!(
+                    "Switching the sync mode needs the daemon to restart, but the automatic restart failed ({failure}). Run systemctl --user restart gonedrived yourself.",
                     "切换同步模式需要重启守护进程，但自动重启失败（{failure}）。请手动运行 systemctl --user restart gonedrived"
                 )),
             )

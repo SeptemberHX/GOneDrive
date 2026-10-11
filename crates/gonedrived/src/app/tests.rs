@@ -7,9 +7,9 @@ use gonedrive_ipc::reader_policy::FILE_MANAGER_COPY_READER;
 use super::inflight::PathLocks;
 use super::{
     core_error_status, decide_stage, is_account_level_state, is_browsing_reader,
-    missing_account_retry_due, outbound_scope, pending_snapshot, phase_completion_state,
-    phase_state, remote_poll_ready, summary_has_reportable_activity, sync_barrier_ready,
-    update_pending_status, StagePlan, KEYRING_LOCKED_MESSAGE, PARTIAL_HYDRATION_CEILING,
+    keyring_locked_message, missing_account_retry_due, outbound_scope, pending_snapshot,
+    phase_completion_state, phase_state, remote_poll_ready, summary_has_reportable_activity,
+    sync_barrier_ready, update_pending_status, StagePlan, PARTIAL_HYDRATION_CEILING,
 };
 
 #[test]
@@ -112,7 +112,7 @@ fn a_locked_keyring_is_not_reported_as_an_expired_login() {
         "prompt dismissed".into(),
     ));
     assert_eq!(state, "keyring_locked");
-    assert_eq!(message, KEYRING_LOCKED_MESSAGE);
+    assert_eq!(message, keyring_locked_message());
 
     let (state, _) = core_error_status(&gonedrive_core::Error::AuthRequired("revoked".into()));
     assert_eq!(state, "signed_out");

@@ -16,8 +16,7 @@ Built with Rust, GTK 4 and libadwaita.
 
 </div>
 
-> [!NOTE]
-> The user interface (panel, tray menu and Nautilus menu) is currently in **Simplified Chinese only**. The command line, logs and documentation are in English. Translations are welcome.
+The interface is available in **English** and **Simplified Chinese** and follows your system language.
 
 ---
 
@@ -72,7 +71,7 @@ To upgrade, download the newer `.deb` and repeat step 2.
 
 ## Getting started
 
-1. Open **GOnedrive** from the app grid and click **登录** (Sign in).
+1. Open **GOnedrive** from the app grid and click **Sign in to OneDrive**.
 2. Your browser opens Microsoft's sign-in page. Sign in with your own Microsoft account and grant access. Credentials are stored in the system keyring.
 3. Your drive's top-level folders appear in `~/OneDrive`. Syncing continues in the background, even with the window closed.
 
@@ -158,7 +157,7 @@ gonedrived indexer --include
 <details>
 <summary><b>A "conflict copy" file appeared</b></summary>
 
-When the same file is changed locally and in the cloud at the same time, GOnedrive overwrites neither. The cloud version keeps the original name, and the local version is renamed to `name (<hostname> 的冲突副本 <timestamp>).ext` and uploaded. Keep the one you want and delete the other.
+When the same file is changed locally and in the cloud at the same time, GOnedrive overwrites neither. The cloud version keeps the original name, and the local version is renamed to `name (<hostname> conflicted copy <timestamp>).ext` and uploaded. Keep the one you want and delete the other.
 </details>
 
 <details>

@@ -39,6 +39,30 @@ def load_extension():
 ext = load_extension()
 
 
+class LanguageTests(unittest.TestCase):
+    """The menu follows the same language rule as the panel."""
+
+    def test_chinese_sessions_get_chinese(self):
+        for env in (
+            {"LANG": "zh_CN.UTF-8"},
+            {"LANG": "zh_TW.UTF-8"},
+            {"LANG": "en_US.UTF-8", "LC_MESSAGES": "zh_CN.UTF-8"},
+            {"LANG": "en_US.UTF-8", "LANGUAGE": "zh_CN:en"},
+        ):
+            self.assertTrue(ext._prefers_chinese(env), env)
+
+    def test_everything_else_gets_english(self):
+        for env in (
+            {},
+            {"LANG": "en_US.UTF-8"},
+            {"LANG": "de_DE.UTF-8"},
+            {"LANG": "zh_CN.UTF-8", "LANGUAGE": "en_GB:zh_CN"},
+            {"LANG": "zh_CN.UTF-8", "LC_ALL": "C"},
+            {"LANGUAGE": "zh_CN", "LANG": "C.UTF-8"},
+        ):
+            self.assertFalse(ext._prefers_chinese(env), env)
+
+
 class StatusTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

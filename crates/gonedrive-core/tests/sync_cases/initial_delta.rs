@@ -207,7 +207,7 @@ async fn a_remote_folder_collision_preserves_the_local_file_without_downloading_
     let copies: Vec<_> = std::fs::read_dir(&h.root)
         .unwrap()
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().contains("的冲突副本"))
+        .filter(|entry| { let n = entry.file_name().to_string_lossy().into_owned(); n.contains("的冲突副本") || n.contains("conflicted copy") })
         .collect();
     assert_eq!(copies.len(), 1);
     assert_eq!(

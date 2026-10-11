@@ -8,11 +8,17 @@
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
 
+pub mod i18n;
 pub mod reader_policy;
 
 pub const SERVICE_NAME: &str = "org.gonedrive.Daemon";
 pub const OBJECT_PATH: &str = "/org/gonedrive/Daemon";
 pub const INTERFACE: &str = "org.gonedrive.Daemon1";
+
+/// The `detail` of a `downloaded` activity that a read triggered, as opposed to
+/// a sync pass. It is a stored token, not display text: existing activity logs
+/// carry exactly this value, so it stays as is whatever the interface language.
+pub const ON_DEMAND_DETAIL: &str = "按需";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AccountInfo {

@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use gonedrive_ipc::Hydration;
+use gonedrive_ipc::{tr, trf, Hydration};
 use gtk::{gio, glib};
 
 use crate::backend::{Command, UiEvent};
@@ -64,7 +64,8 @@ pub struct Monitor {
     /// understated the header and, worse, hid the window as soon as the six
     /// displayed transfers finished — while the rest were still running.
     active: RefCell<HashSet<String>>,
-    /// The header title: "下载中" for one file, "N 个文件下载中" for several.
+    /// The header title: "Downloading from OneDrive" for one file, "Downloading N
+    /// files" for several.
     title: gtk::Label,
     /// Shown only on failure — the error explanation. Hidden otherwise.
     status: gtk::Label,
@@ -77,7 +78,7 @@ impl Monitor {
     pub fn build(app: &adw::Application, commands: async_channel::Sender<Command>) -> Rc<Self> {
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .title("正在从 OneDrive 下载")
+            .title(tr!("Downloading from OneDrive", "正在从 OneDrive 下载"))
             .resizable(false)
             .build();
         // A height of -1 means "as tall as the content needs". Leaving it at the
@@ -93,7 +94,7 @@ impl Monitor {
         // A flat "downloading" title on the left: a glyph plus a live count.
         let glyph = gtk::Image::from_icon_name("folder-download-symbolic");
         glyph.add_css_class("dim-label");
-        let title = gtk::Label::new(Some("OneDrive 下载中"));
+        let title = gtk::Label::new(Some(single_title()));
         title.add_css_class("heading");
         let title_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -206,7 +207,11 @@ impl Monitor {
                 let pct = (fraction * 100.0).round() as u32;
                 let remaining = hydration.total.saturating_sub(hydration.transferred);
                 let eta = if row.rate > 1.0 && remaining > 0 {
-                    format!(" · 剩余约 {}", human_duration(remaining as f64 / row.rate))
+                    trf!(
+                        " · about {} left",
+                        " · 剩余约 {}",
+                        human_duration(remaining as f64 / row.rate)
+                    )
                 } else {
                     String::new()
                 };
@@ -219,15 +224,15 @@ impl Monitor {
                 // The size is unknown until the first response header lands. A
                 // pulsing bar is honest about that; a 0% bar looks stalled.
                 row.progress.pulse();
-                row.detail.set_text("正在连接…");
+                row.detail.set_text(tr!("Connecting…", "正在连接…"));
             }
         }
 
         drop(rows);
         let count = self.active.borrow().len();
         self.title.set_text(&match count {
-            0 | 1 => "OneDrive 下载中".to_string(),
-            n => format!("OneDrive · {n} 个文件下载中"),
+            0 | 1 => single_title().to_string(),
+            n => several_title(n),
         });
         // Present only when the window first appears. Every progress tick
         // used to re-present it, which on X11 steals focus from whatever the
@@ -260,7 +265,7 @@ impl Monitor {
         let cancel = gtk::Button::builder()
             .icon_name("window-close-symbolic")
             .valign(gtk::Align::Center)
-            .tooltip_text("停止下载")
+            .tooltip_text(tr!("Stop download", "停止下载"))
             .build();
         cancel.add_css_class("flat");
         cancel.add_css_class("circular");
@@ -321,8 +326,8 @@ impl Monitor {
             self.schedule_close(ok, &name);
         } else {
             self.title.set_text(&match remaining {
-                1 => "OneDrive 下载中".to_string(),
-                n => format!("OneDrive · {n} 个文件下载中"),
+                1 => single_title().to_string(),
+                n => several_title(n),
             });
         }
     }
@@ -335,14 +340,21 @@ impl Monitor {
     fn schedule_close(self: &Rc<Self>, ok: bool, name: &str) {
         self.cancel_close();
         if ok {
-            // No "完成": nothing to announce, just get out of the way.
+            // No "done": nothing to announce, just get out of the way.
             self.window.set_visible(false);
         } else {
             self.status.set_visible(true);
             self.status.set_text(&if name.is_empty() {
-                "下载未完成，打开该文件的程序会收到读取错误".to_string()
+                tr!(
+                    "The download did not finish; the program opening the file will get a read error",
+                    "下载未完成，打开该文件的程序会收到读取错误"
+                )
+                .to_string()
             } else {
-                format!("{name} 下载未完成，打开它的程序会收到读取错误")
+                trf!(
+                    "{name} did not finish downloading; the program opening it will get a read error",
+                    "{name} 下载未完成，打开它的程序会收到读取错误"
+                )
             });
         }
         let linger = if ok { LINGER } else { FAILURE_LINGER };
@@ -363,24 +375,35 @@ impl Monitor {
     }
 }
 
-/// A rough, human duration: "8 秒", "2 分 10 秒", "1 小时 5 分".
+fn single_title() -> &'static str {
+    tr!("Downloading from OneDrive", "OneDrive 下载中")
+}
+
+fn several_title(count: usize) -> String {
+    trf!(
+        "OneDrive · downloading {count} files",
+        "OneDrive · {count} 个文件下载中"
+    )
+}
+
+/// A rough, human duration: "8 s", "2 min 10 s", "1 h 5 min".
 fn human_duration(secs: f64) -> String {
     let s = secs.round().max(1.0) as u64;
     if s < 60 {
-        format!("{s} 秒")
+        trf!("{s} s", "{s} 秒")
     } else if s < 3600 {
         let (m, r) = (s / 60, s % 60);
         if r == 0 {
-            format!("{m} 分")
+            trf!("{m} min", "{m} 分")
         } else {
-            format!("{m} 分 {r} 秒")
+            trf!("{m} min {r} s", "{m} 分 {r} 秒")
         }
     } else {
         let (h, m) = (s / 3600, (s % 3600) / 60);
         if m == 0 {
-            format!("{h} 小时")
+            trf!("{h} h", "{h} 小时")
         } else {
-            format!("{h} 小时 {m} 分")
+            trf!("{h} h {m} min", "{h} 小时 {m} 分")
         }
     }
 }

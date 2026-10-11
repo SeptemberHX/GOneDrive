@@ -3,7 +3,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use adw::prelude::*;
-use gonedrive_ipc::Activity;
+use gonedrive_ipc::{tr, trf, Activity, ON_DEMAND_DETAIL};
 use gtk::glib::variant::ToVariant;
 use gtk::{gio, glib};
 
@@ -16,40 +16,40 @@ struct Visual {
 
 fn visual(kind: &str, detail: &str) -> Visual {
     match kind {
-        "downloaded" if detail == "按需" => Visual {
+        "downloaded" if detail == ON_DEMAND_DETAIL => Visual {
             icon: "document-open-symbolic",
             variant: "od-tile-blue",
-            verb: "按需下载",
+            verb: tr!("Downloaded on demand", "按需下载"),
             consumes_detail: true,
         },
         "downloaded" => Visual {
             icon: "go-down-symbolic",
             variant: "od-tile-blue",
-            verb: "同步下载",
+            verb: tr!("Downloaded", "同步下载"),
             consumes_detail: false,
         },
         "uploaded" => Visual {
             icon: "go-up-symbolic",
             variant: "od-tile-green",
-            verb: "已上传",
+            verb: tr!("Uploaded", "已上传"),
             consumes_detail: false,
         },
         "deleted" => Visual {
             icon: "user-trash-symbolic",
             variant: "od-tile-grey",
-            verb: "已删除",
+            verb: tr!("Deleted", "已删除"),
             consumes_detail: false,
         },
         "conflict" => Visual {
             icon: "dialog-warning-symbolic",
             variant: "od-tile-amber",
-            verb: "冲突已保留两份",
+            verb: tr!("Conflict: both versions kept", "冲突已保留两份"),
             consumes_detail: false,
         },
         _ => Visual {
             icon: "dialog-error-symbolic",
             variant: "od-tile-red",
-            verb: "失败",
+            verb: tr!("Failed", "失败"),
             consumes_detail: false,
         },
     }
@@ -88,7 +88,10 @@ pub(super) fn row(item: &Activity, root: &Path) -> adw::ActionRow {
         format!("{} · {} · {detail}", visual.verb, relative_time(item.when))
     };
     let path = if item.path.is_empty() {
-        "OneDrive/（旧记录未保存路径）"
+        tr!(
+            "OneDrive/(path not recorded)",
+            "OneDrive/（旧记录未保存路径）"
+        )
     } else {
         &item.path
     };
@@ -103,7 +106,7 @@ pub(super) fn row(item: &Activity, root: &Path) -> adw::ActionRow {
     row.set_title(&glib::markup_escape_text(&item.name));
     row.set_subtitle(&subtitle);
     row.set_tooltip_text(Some(if target.is_some() {
-        "在文件中显示"
+        tr!("Show in Files", "在文件中显示")
     } else {
         path
     }));
@@ -111,7 +114,7 @@ pub(super) fn row(item: &Activity, root: &Path) -> adw::ActionRow {
     if let Some(target) = target {
         let reveal = gtk::Image::from_icon_name("folder-open-symbolic");
         reveal.add_css_class("od-reveal");
-        reveal.set_tooltip_text(Some("在文件中显示"));
+        reveal.set_tooltip_text(Some(tr!("Show in Files", "在文件中显示")));
         row.add_suffix(&reveal);
         let root = root.to_path_buf();
         row.connect_activated(move |_| reveal_activity_target(&root, &target));
@@ -235,14 +238,14 @@ fn relative_time(when: i64) -> String {
         .unwrap_or(when);
     let elapsed = now.saturating_sub(when);
     match elapsed {
-        i64::MIN..=59 => "刚刚".into(),
-        60..=3599 => format!("{} 分钟前", elapsed / 60),
-        3600..=86_399 => format!("{} 小时前", elapsed / 3600),
+        i64::MIN..=59 => tr!("just now", "刚刚").into(),
+        60..=3599 => trf!("{} min ago", "{} 分钟前", elapsed / 60),
+        3600..=86_399 => trf!("{} h ago", "{} 小时前", elapsed / 3600),
         _ => glib::DateTime::from_unix_utc(when)
             .and_then(|time| time.to_local())
-            .and_then(|time| time.format("%-m月%-d日"))
+            .and_then(|time| time.format(tr!("%b %-d", "%-m月%-d日")))
             .map(|text| text.to_string())
-            .unwrap_or_else(|_| format!("{} 天前", elapsed / 86_400)),
+            .unwrap_or_else(|_| trf!("{} d ago", "{} 天前", elapsed / 86_400)),
     }
 }
 
@@ -364,11 +367,11 @@ mod tests {
     #[test]
     fn download_activity_names_its_source_without_a_display() {
         let synced = visual("downloaded", "");
-        assert_eq!(synced.verb, "同步下载");
+        assert_eq!(synced.verb, tr!("Downloaded", "同步下载"));
         assert!(!synced.consumes_detail);
 
-        let on_demand = visual("downloaded", "按需");
-        assert_eq!(on_demand.verb, "按需下载");
+        let on_demand = visual("downloaded", ON_DEMAND_DETAIL);
+        assert_eq!(on_demand.verb, tr!("Downloaded on demand", "按需下载"));
         assert!(on_demand.consumes_detail);
     }
 }

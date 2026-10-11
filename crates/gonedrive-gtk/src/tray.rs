@@ -5,7 +5,8 @@
 //! answering the shell whether or not a window is open. It talks to the UI the
 //! same way everything else does: through the channels.
 
-use gonedrive_ipc::{AccountInfo, SyncStatus};
+use gonedrive_ipc::i18n::items;
+use gonedrive_ipc::{tr, trf, AccountInfo, SyncStatus};
 use ksni::menu::{CheckmarkItem, StandardItem, SubMenu};
 use ksni::{Handle, MenuItem, Tray, TrayMethods};
 
@@ -80,22 +81,24 @@ impl GonedriveTray {
     /// the inert first row of the menu.
     fn summary(&self) -> String {
         match self.status.state.as_str() {
-            "syncing" | "enumerating" => "正在同步…".into(),
+            "syncing" | "enumerating" => tr!("Syncing…", "正在同步…").into(),
             "downloading" => match self.status.current_item.as_str() {
-                "" => "正在下载".into(),
-                name => format!("正在下载 {}", menu_text(name)),
+                "" => tr!("Downloading", "正在下载").into(),
+                name => trf!("Downloading {}", "正在下载 {}", menu_text(name)),
             },
             "uploading" => match self.status.current_item.as_str() {
-                "" => "正在上传".into(),
-                name => format!("正在上传 {}", menu_text(name)),
+                "" => tr!("Uploading", "正在上传").into(),
+                name => trf!("Uploading {}", "正在上传 {}", menu_text(name)),
             },
-            "paused" => "已暂停".into(),
-            "offline" => "离线，稍后重试".into(),
-            "keyring_locked" => "请解锁钥匙环".into(),
-            "signed_out" => "需要重新登录".into(),
-            "error" => "同步出错".into(),
-            _ if self.status.pending > 0 => format!("等待处理 {} 项", self.status.pending),
-            _ => "已是最新".into(),
+            "paused" => tr!("Paused", "已暂停").into(),
+            "offline" => tr!("Offline; will retry", "离线，稍后重试").into(),
+            "keyring_locked" => tr!("Unlock your keyring", "请解锁钥匙环").into(),
+            "signed_out" => tr!("Please sign in again", "需要重新登录").into(),
+            "error" => tr!("Sync error", "同步出错").into(),
+            _ if self.status.pending > 0 => {
+                trf!("{} waiting", "等待处理 {}", items(self.status.pending))
+            }
+            _ => tr!("Up to date", "已是最新").into(),
         }
     }
 }
@@ -163,7 +166,7 @@ impl Tray for GonedriveTray {
                     a.display_name.clone()
                 }
             })
-            .unwrap_or_else(|| "未登录".into());
+            .unwrap_or_else(|| tr!("Not signed in", "未登录").into());
         let account = menu_text(&account);
 
         vec![
@@ -182,7 +185,7 @@ impl Tray for GonedriveTray {
             .into(),
             MenuItem::Separator,
             StandardItem {
-                label: "打开 OneDrive 文件夹".into(),
+                label: tr!("Open OneDrive folder", "打开 OneDrive 文件夹").into(),
                 icon_name: "folder-open-symbolic".into(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.actions.send_blocking(TrayAction::OpenFolder);
@@ -191,7 +194,7 @@ impl Tray for GonedriveTray {
             }
             .into(),
             StandardItem {
-                label: "显示 GOnedrive".into(),
+                label: tr!("Show GOnedrive", "显示 GOnedrive").into(),
                 icon_name: "view-list-symbolic".into(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.actions.send_blocking(TrayAction::ShowPanel);
@@ -201,7 +204,7 @@ impl Tray for GonedriveTray {
             .into(),
             MenuItem::Separator,
             CheckmarkItem {
-                label: "暂停同步".into(),
+                label: tr!("Pause syncing", "暂停同步").into(),
                 checked: self.is_paused(),
                 activate: Box::new(|tray: &mut Self| {
                     let paused = !tray.is_paused();
@@ -211,7 +214,7 @@ impl Tray for GonedriveTray {
             }
             .into(),
             StandardItem {
-                label: "立即同步".into(),
+                label: tr!("Sync now", "立即同步").into(),
                 icon_name: "view-refresh-symbolic".into(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.commands.send_blocking(Command::SyncNow);
@@ -221,10 +224,10 @@ impl Tray for GonedriveTray {
             .into(),
             MenuItem::Separator,
             SubMenu {
-                label: "更多".into(),
+                label: tr!("More", "更多").into(),
                 submenu: vec![
                     StandardItem {
-                        label: "重启同步后台".into(),
+                        label: tr!("Restart sync service", "重启同步后台").into(),
                         icon_name: "system-reboot-symbolic".into(),
                         activate: Box::new(|tray: &mut Self| {
                             let _ = tray.actions.send_blocking(TrayAction::RestartDaemon);
@@ -233,7 +236,7 @@ impl Tray for GonedriveTray {
                     }
                     .into(),
                     StandardItem {
-                        label: "重启文件按需服务…".into(),
+                        label: tr!("Restart files-on-demand service…", "重启文件按需服务…").into(),
                         icon_name: "system-run-symbolic".into(),
                         activate: Box::new(|tray: &mut Self| {
                             let _ = tray.actions.send_blocking(TrayAction::RestartFilesOnDemand);
@@ -243,7 +246,7 @@ impl Tray for GonedriveTray {
                     .into(),
                     MenuItem::Separator,
                     StandardItem {
-                        label: "退出 GOnedrive".into(),
+                        label: tr!("Quit GOnedrive", "退出 GOnedrive").into(),
                         icon_name: "application-exit-symbolic".into(),
                         activate: Box::new(|tray: &mut Self| {
                             let _ = tray.actions.send_blocking(TrayAction::Quit);

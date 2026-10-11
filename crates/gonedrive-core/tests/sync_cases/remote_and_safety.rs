@@ -416,7 +416,7 @@ async fn a_file_changed_on_both_sides_keeps_both_versions() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains("的冲突副本"))
+        .filter(|n| n.contains("的冲突副本") || n.contains("conflicted copy"))
         .collect();
     assert_eq!(
         copies.len(),

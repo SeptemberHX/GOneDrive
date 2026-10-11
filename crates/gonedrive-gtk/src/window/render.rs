@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gonedrive_ipc::{AccountInfo, Activity, FolderEntry, SyncStatus};
+use gonedrive_ipc::i18n::items;
+use gonedrive_ipc::{tr, trf, AccountInfo, Activity, FolderEntry, SyncStatus};
 use gtk::{gio, glib};
 
 use super::activity::row as activity_row;
@@ -64,16 +65,25 @@ impl Ui {
                     .set_sensitive(self.account_id.borrow().is_some());
                 if summary.is_some() {
                     self.show_banner(if mode == "on-demand" {
-                        "已切换为按需下载：本机已有的文件保留，未打开过的文件夹会在首次打开时加载。"
+                        tr!(
+                            "Switched to files on demand: files already on this device stay, and folders you have never opened load the first time you open them.",
+                            "已切换为按需下载：本机已有的文件保留，未打开过的文件夹会在首次打开时加载。"
+                        )
                     } else {
-                        "已切换为全量同步：后台服务正在重启，随后开始下载整个 OneDrive。"
+                        tr!(
+                            "Switched to full sync: the background service is restarting and will then download your entire OneDrive.",
+                            "已切换为全量同步：后台服务正在重启，随后开始下载整个 OneDrive。"
+                        )
                     });
                 }
             }
             UiEvent::SyncModeFailed(error) => {
                 self.on_demand_switch
                     .set_sensitive(self.account_id.borrow().is_some());
-                self.show_banner(&format!("切换同步模式失败：{error}"));
+                self.show_banner(&trf!(
+                    "Could not switch sync mode: {error}",
+                    "切换同步模式失败：{error}"
+                ));
             }
             UiEvent::Status(status) => {
                 self.apply_status(&status);
@@ -88,8 +98,10 @@ impl Ui {
             }
             UiEvent::LoginStarted(url) => {
                 self.login_hint.set_visible(true);
-                self.login_hint
-                    .set_text(&format!("浏览器没有打开？手动访问：\n{url}"));
+                self.login_hint.set_text(&trf!(
+                    "Browser did not open? Visit:\n{url}",
+                    "浏览器没有打开？手动访问：\n{url}"
+                ));
             }
             UiEvent::LoginCompleted => {
                 self.login_in_flight.set(false);
@@ -100,22 +112,26 @@ impl Ui {
             UiEvent::LoginFailed(message) => {
                 self.login_in_flight.set(false);
                 self.reset_login_button();
-                self.show_banner(&format!("登录失败：{message}"));
+                self.show_banner(&trf!("Sign-in failed: {message}", "登录失败：{message}"));
             }
             UiEvent::Conflict { original, copy } => {
-                self.show_banner(&format!(
+                self.show_banner(&trf!(
+                    "{original} changed on both sides; your local version was kept as {copy}",
                     "{original} 在两端都被修改，本地版本已保留为 {copy}"
                 ));
             }
             UiEvent::ItemFailed { name, error } => {
-                self.show_banner(&format!("{name} 同步失败：{error}"));
+                self.show_banner(&trf!(
+                    "{name} could not be synced: {error}",
+                    "{name} 同步失败：{error}"
+                ));
             }
             UiEvent::HydrationStarted(h) | UiEvent::HydrationProgress(h) => {
                 self.transfer_box.set_visible(true);
                 self.transfer_label.set_text(&if h.total > 0 {
                     format!("{} · {} / {}", h.name, human(h.transferred), human(h.total))
                 } else {
-                    format!("{} · 正在连接…", h.name)
+                    trf!("{} · Connecting…", "{} · 正在连接…", h.name)
                 });
                 let fraction = if h.total > 0 {
                     h.transferred as f64 / h.total as f64
@@ -132,7 +148,8 @@ impl Ui {
 
     fn reset_login_button(&self) {
         self.login_button.set_sensitive(true);
-        self.login_button.set_label("登录 OneDrive");
+        self.login_button
+            .set_label(tr!("Sign in to OneDrive", "登录 OneDrive"));
     }
 
     fn show_banner(&self, message: &str) {
@@ -160,15 +177,17 @@ impl Ui {
         if account.quota_total > 0 {
             let used = account.quota_used as f64 / account.quota_total as f64;
             self.quota_bar.set_fraction(used.clamp(0.0, 1.0));
-            self.quota_used.set_text(&format!(
+            self.quota_used.set_text(&trf!(
+                "{} of {} used",
                 "已用 {} / {}",
                 human(account.quota_used),
                 human(account.quota_total)
             ));
             let free = account.quota_total.saturating_sub(account.quota_used);
-            self.quota_free.set_text(&format!("剩余 {}", human(free)));
+            self.quota_free
+                .set_text(&trf!("{} free", "剩余 {}", human(free)));
         } else {
-            self.quota_used.set_text("配额未知");
+            self.quota_used.set_text(tr!("Quota unknown", "配额未知"));
             self.quota_free.set_text("");
         }
     }
@@ -182,21 +201,44 @@ impl Ui {
         self.status_icon.set_visible(!busy);
 
         let (title, icon) = match status.state.as_str() {
-            "enumerating" => ("正在读取文件列表…", "emblem-synchronizing-symbolic"),
-            "syncing" => ("正在同步…", "emblem-synchronizing-symbolic"),
-            "downloading" => ("正在下载", "emblem-synchronizing-symbolic"),
-            "uploading" => ("正在上传", "emblem-synchronizing-symbolic"),
+            "enumerating" => (
+                tr!("Reading the file list…", "正在读取文件列表…"),
+                "emblem-synchronizing-symbolic",
+            ),
+            "syncing" => (
+                tr!("Syncing…", "正在同步…"),
+                "emblem-synchronizing-symbolic",
+            ),
+            "downloading" => (
+                tr!("Downloading", "正在下载"),
+                "emblem-synchronizing-symbolic",
+            ),
+            "uploading" => (
+                tr!("Uploading", "正在上传"),
+                "emblem-synchronizing-symbolic",
+            ),
             "paused" if status.pending > 0 => return self.apply_pending(status),
-            "paused" => ("已暂停", "media-playback-pause-symbolic"),
-            "offline" => ("离线，稍后重试", "network-offline-symbolic"),
-            "keyring_locked" => ("请解锁钥匙环", "dialog-password-symbolic"),
-            "signed_out" => ("需要重新登录", "dialog-warning-symbolic"),
-            "error" => ("同步出错", "dialog-error-symbolic"),
+            "paused" => (tr!("Paused", "已暂停"), "media-playback-pause-symbolic"),
+            "offline" => (
+                tr!("Offline; will retry", "离线，稍后重试"),
+                "network-offline-symbolic",
+            ),
+            "keyring_locked" => (
+                tr!("Unlock your keyring", "请解锁钥匙环"),
+                "dialog-password-symbolic",
+            ),
+            "signed_out" => (
+                tr!("Please sign in again", "需要重新登录"),
+                "dialog-warning-symbolic",
+            ),
+            "error" => (tr!("Sync error", "同步出错"), "dialog-error-symbolic"),
             _ if status.pending > 0 => return self.apply_pending(status),
             // Be defensive across upgrades and event races: an error message
             // must never be presented under a green "up to date" title.
-            _ if !status.last_error.is_empty() => ("同步出错", "dialog-error-symbolic"),
-            _ => ("已是最新", "emblem-ok-symbolic"),
+            _ if !status.last_error.is_empty() => {
+                (tr!("Sync error", "同步出错"), "dialog-error-symbolic")
+            }
+            _ => (tr!("Up to date", "已是最新"), "emblem-ok-symbolic"),
         };
         self.status_title
             .set_markup(&format!("<b>{}</b>", glib::markup_escape_text(title)));
@@ -250,9 +292,13 @@ impl Ui {
                 .set_icon_name(Some("media-playback-pause-symbolic"));
         }
         let title = if paused {
-            format!("已暂停 · 等待处理 {} 项", status.pending)
+            trf!(
+                "Paused · {} waiting",
+                "已暂停 · 等待处理 {}",
+                items(status.pending)
+            )
         } else {
-            format!("等待处理 {} 项", status.pending)
+            trf!("{} waiting", "等待处理 {}", items(status.pending))
         };
         self.status_title
             .set_markup(&format!("<b>{}</b>", glib::markup_escape_text(&title)));
@@ -263,10 +309,10 @@ impl Ui {
             .collect::<Vec<_>>();
         let hidden = status.pending.saturating_sub(lines.len() as u64);
         if hidden > 0 {
-            lines.push(format!("另有 {hidden} 项"));
+            lines.push(trf!("and {hidden} more", "另有 {hidden} 项"));
         }
         if lines.is_empty() {
-            lines.push("正在等待下一轮同步".into());
+            lines.push(tr!("Waiting for the next sync", "正在等待下一轮同步").into());
         }
         self.status_sub.set_text(&lines.join("\n"));
         self.status_sub.set_visible(true);
@@ -299,17 +345,25 @@ impl Ui {
             let (dot, word, extra) = if entry.selected {
                 (
                     "<span foreground='#5bd98a'>●</span>",
-                    "本机",
-                    if entry.explicit { "" } else { " · 随上级" },
+                    tr!("On this device", "本机"),
+                    if entry.explicit {
+                        ""
+                    } else {
+                        tr!(" · from parent", " · 随上级")
+                    },
                 )
             } else {
-                ("<span foreground='#4aa3e8'>☁</span>", "仅在线", "")
+                (
+                    "<span foreground='#4aa3e8'>☁</span>",
+                    tr!("Online-only", "仅在线"),
+                    "",
+                )
             };
             let size = if entry.is_folder {
                 let count = if entry.items_known {
-                    format!("{} 项", entry.items)
+                    items(entry.items)
                 } else {
-                    "项目数未知".into()
+                    tr!("Item count unknown", "项目数未知").into()
                 };
                 format!("{dot} {word}{extra} · {count}")
             } else {
@@ -337,7 +391,7 @@ impl Ui {
             let keep = gtk::Switch::builder()
                 .active(entry.selected)
                 .valign(gtk::Align::Center)
-                .tooltip_text("保留在此设备")
+                .tooltip_text(tr!("Keep on this device", "保留在此设备"))
                 .build();
             let commands = self.commands.clone();
             let root = self.root_path.clone();
@@ -403,17 +457,23 @@ fn file_icon(name: &str, is_folder: bool) -> gtk::Image {
 
 fn format_pending_item(item: &gonedrive_ipc::PendingItem) -> String {
     let verb = match item.kind.as_str() {
-        "download" => "下载",
-        "upload" => "上传",
-        "create_remote_folder" => "新建云端文件夹",
-        "delete_remote" => "删除云端项目",
-        "move_remote" => "移动云端项目",
-        _ => "同步",
+        "download" => tr!("Download", "下载"),
+        "upload" => tr!("Upload", "上传"),
+        "create_remote_folder" => tr!("Create cloud folder", "新建云端文件夹"),
+        "delete_remote" => tr!("Delete from cloud", "删除云端项目"),
+        "move_remote" => tr!("Move in cloud", "移动云端项目"),
+        _ => tr!("Sync", "同步"),
     };
     if item.attempts == 0 {
         format!("{verb} · {}", item.path)
     } else {
-        format!("{verb} · {} · 已重试 {} 次", item.path, item.attempts)
+        if gonedrive_ipc::i18n::is_chinese() {
+            format!("{verb} · {} · 已重试 {} 次", item.path, item.attempts)
+        } else if item.attempts == 1 {
+            format!("{verb} · {} · retried once", item.path)
+        } else {
+            format!("{verb} · {} · retried {} times", item.path, item.attempts)
+        }
     }
 }
 

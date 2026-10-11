@@ -97,11 +97,20 @@ pub fn fold_case(name: &str) -> String {
     name.to_lowercase()
 }
 
-/// Build the conflict-copy name the client uses when both sides changed.
-///
-/// Mirrors the Windows client's `name-HOST 的冲突副本-timestamp.ext` shape so a
-/// user with both clients sees a consistent convention.
+/// Build the conflict-copy name the client uses when both sides changed:
+/// `name (HOST conflicted copy timestamp).ext`, or `name (HOST 的冲突副本
+/// timestamp).ext` in a Chinese session. Nothing parses these names back, so
+/// the wording can follow the interface language.
 pub fn conflict_copy_name(name: &str, host: &str, when: time::OffsetDateTime) -> String {
+    conflict_copy_name_in(name, host, when, gonedrive_ipc::i18n::is_chinese())
+}
+
+fn conflict_copy_name_in(
+    name: &str,
+    host: &str,
+    when: time::OffsetDateTime,
+    chinese: bool,
+) -> String {
     let (stem, ext) = split_extension(name);
     let stamp = format!(
         "{:04}-{:02}-{:02} {:02}{:02}{:02}",
@@ -118,9 +127,14 @@ pub fn conflict_copy_name(name: &str, host: &str, when: time::OffsetDateTime) ->
         .chars()
         .filter(|c| !ILLEGAL_CHARS.contains(c) && !c.is_control())
         .collect();
+    let label = if chinese {
+        "的冲突副本"
+    } else {
+        "conflicted copy"
+    };
     match ext {
-        Some(ext) => format!("{stem} ({host} 的冲突副本 {stamp}).{ext}"),
-        None => format!("{stem} ({host} 的冲突副本 {stamp})"),
+        Some(ext) => format!("{stem} ({host} {label} {stamp}).{ext}"),
+        None => format!("{stem} ({host} {label} {stamp})"),
     }
 }
 
@@ -281,8 +295,13 @@ mod tests {
     #[test]
     fn conflict_copy_name_is_itself_valid() {
         let when = datetime!(2026-08-27 14:05:09 UTC);
-        let name = conflict_copy_name("report.docx", "thinkpad", when);
+        let name = conflict_copy_name_in("report.docx", "thinkpad", when, true);
         assert_eq!(name, "report (thinkpad 的冲突副本 2026-08-27 140509).docx");
+        let name = conflict_copy_name_in("report.docx", "thinkpad", when, false);
+        assert_eq!(
+            name,
+            "report (thinkpad conflicted copy 2026-08-27 140509).docx"
+        );
         assert!(validate_name(&name).is_ok());
 
         // A host name containing illegal characters must not poison the result.

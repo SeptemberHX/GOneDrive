@@ -8,6 +8,7 @@ description = "Core sync engine, Microsoft Graph client and state store for GOne
 
 [dependencies]
 anyhow.workspace = true
+gonedrive-ipc.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -30,6 +30,29 @@ BUS_NAME = "org.gonedrive.Daemon"
 OBJECT_PATH = "/org/gonedrive/Daemon"
 INTERFACE = "org.gonedrive.Daemon1"
 
+
+def _prefers_chinese(env=os.environ):
+    """Chinese for a Chinese session, English otherwise.
+
+    The same rule as gonedrive_ipc::i18n::prefers_chinese, so the menu and the
+    panel never disagree: no translation under the C locale, otherwise the
+    first LANGUAGE entry, then LC_ALL, LC_MESSAGES and LANG.
+    """
+    locale = env.get("LC_ALL") or env.get("LC_MESSAGES") or env.get("LANG")
+    if not locale or locale in ("C", "POSIX") or locale.startswith("C."):
+        return False
+    language = next((e for e in (env.get("LANGUAGE") or "").split(":") if e), None)
+    return (language or locale).startswith("zh")
+
+
+CHINESE = _prefers_chinese()
+
+
+def _(en, zh):
+    """The interface text in this session's language."""
+    return zh if CHINESE else en
+
+
 # Emblem names, minus the "emblem-" prefix Nautilus adds back.
 EMBLEM_CLOUD = "gonedrive-cloud"
 EMBLEM_LOCAL = "gonedrive-local"
@@ -106,8 +129,10 @@ def describe_scope(managed):
     if len(managed) == 1:
         file, path = managed[0]
         name = os.path.basename(path)
-        return f"整个文件夹「{name}」" if file.is_directory() else f"「{name}」"
-    return f"选中的 {len(managed)} 项"
+        if file.is_directory():
+            return _(f'the folder "{name}"', f"整个文件夹「{name}」")
+        return _(f'"{name}"', f"「{name}」")
+    return _(f"the {len(managed)} selected items", f"选中的 {len(managed)} 项")
 
 
 def menu_item_name(namespace, action):
@@ -138,20 +163,20 @@ class Status:
         self.label = label
 
 
-ONLINE_ONLY = Status(EMBLEM_CLOUD, "仅在线")
-AVAILABLE = Status(EMBLEM_LOCAL, "在此设备上可用")
-ALWAYS_KEEP = Status(EMBLEM_PINNED, "始终保留在此设备")
-SYNCING = Status(EMBLEM_SYNCING, "正在同步")
-FAILED = Status(EMBLEM_ERROR, "同步出错")
+ONLINE_ONLY = Status(EMBLEM_CLOUD, _("Online-only", "仅在线"))
+AVAILABLE = Status(EMBLEM_LOCAL, _("Available on this device", "在此设备上可用"))
+ALWAYS_KEEP = Status(EMBLEM_PINNED, _("Always keep on this device", "始终保留在此设备"))
+SYNCING = Status(EMBLEM_SYNCING, _("Syncing", "正在同步"))
+FAILED = Status(EMBLEM_ERROR, _("Sync error", "同步出错"))
 
 
 # Folders carry the same xattrs but read as a different pair of states: a
 # directory is a container, not a file, so "online-only" means nothing inside
 # is here and "available" means some content is. Windows badges folders too,
 # and a tree with unbadged folders looks half-managed.
-FOLDER_ONLINE = Status(EMBLEM_CLOUD, "仅在线")
-FOLDER_LOCAL = Status(EMBLEM_LOCAL, "包含本地内容")
-FOLDER_PINNED = Status(EMBLEM_PINNED, "始终保留在此设备")
+FOLDER_ONLINE = Status(EMBLEM_CLOUD, _("Online-only", "仅在线"))
+FOLDER_LOCAL = Status(EMBLEM_LOCAL, _("Has local content", "包含本地内容"))
+FOLDER_PINNED = Status(EMBLEM_PINNED, _("Always keep on this device", "始终保留在此设备"))
 
 
 def status_of(path, is_dir=False, managed_without_xattr=False):
@@ -218,8 +243,8 @@ class GOnedriveExtension(
             Nautilus.Column(
                 name="GOnedrive::status",
                 attribute="gonedrive_status",
-                label="状态",
-                description="文件内容是否在本机",
+                label=_("Status", "状态"),
+                description=_("Whether the file's content is on this device", "文件内容是否在本机"),
             )
         ]
 
@@ -270,8 +295,11 @@ class GOnedriveExtension(
         if any(s in (ONLINE_ONLY, AVAILABLE) for s in statuses) or folders:
             keep = Nautilus.MenuItem(
                 name=menu_item_name(namespace, "pin"),
-                label=f"始终保留{scope}",
-                tip="下载并保留，之后新增的内容也会自动下载",
+                label=_(f"Always keep {scope} on this device", f"始终保留{scope}"),
+                tip=_(
+                    "Download and keep it; anything added later downloads too",
+                    "下载并保留，之后新增的内容也会自动下载",
+                ),
             )
             keep.connect("activate", self._on_pin, paths, "pinned")
             items.append(keep)
@@ -279,8 +307,11 @@ class GOnedriveExtension(
         if any(s in (AVAILABLE, ALWAYS_KEEP) for s in statuses) or folders:
             free = Nautilus.MenuItem(
                 name=menu_item_name(namespace, "free"),
-                label=f"释放{scope}的空间",
-                tip="移除本机内容，文件保留，打开时自动重新下载",
+                label=_(f"Free up space used by {scope}", f"释放{scope}的空间"),
+                tip=_(
+                    "Remove the local copy; the file stays and downloads again when opened",
+                    "移除本机内容，文件保留，打开时自动重新下载",
+                ),
             )
             free.connect("activate", self._on_free, paths)
             items.append(free)
@@ -288,8 +319,8 @@ class GOnedriveExtension(
         if any(s is ONLINE_ONLY for s in statuses):
             fetch = Nautilus.MenuItem(
                 name=menu_item_name(namespace, "fetch"),
-                label=f"立即下载{scope}",
-                tip="现在就把内容取回本机",
+                label=_(f"Download {scope} now", f"立即下载{scope}"),
+                tip=_("Bring the content to this device now", "现在就把内容取回本机"),
             )
             fetch.connect("activate", self._on_fetch, paths)
             items.append(fetch)

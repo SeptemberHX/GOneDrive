@@ -79,6 +79,9 @@ def load_extension():
     spec = importlib.util.spec_from_file_location("gonedrive_installed", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # These replays assert the Chinese menu labels the incidents were reported
+    # with, whatever language the test session runs in.
+    module.CHINESE = True
     return module
 
 

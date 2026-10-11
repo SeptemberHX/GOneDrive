@@ -51,8 +51,12 @@ const CREDENTIAL_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// instead, the ordinary poll timer would put the prompt back on screen every
 /// few minutes.
 const KEYRING_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-const KEYRING_LOCKED_MESSAGE: &str =
-    "系统钥匙环已锁定。请先解锁登录钥匙环，然后点击“立即同步”重试；已保存的登录凭据仍然保留。";
+fn keyring_locked_message() -> &'static str {
+    gonedrive_ipc::tr!(
+        "The system keyring is locked. Unlock your login keyring, then click \"Sync now\" to retry; your saved sign-in is kept.",
+        "系统钥匙环已锁定。请先解锁登录钥匙环，然后点击“立即同步”重试；已保存的登录凭据仍然保留。"
+    )
+}
 
 /// What to do for a blocked read, decided purely from the request — no I/O, so
 /// the browsing/copier/consumer policy can be tested on its own.
@@ -167,7 +171,7 @@ pub(super) fn is_account_level_state(state: &str) -> bool {
 fn core_error_status(error: &Error) -> (&'static str, String) {
     match error {
         Error::AuthRequired(message) => ("signed_out", message.clone()),
-        Error::KeyringLocked(_) => ("keyring_locked", KEYRING_LOCKED_MESSAGE.into()),
+        Error::KeyringLocked(_) => ("keyring_locked", keyring_locked_message().into()),
         error if error.is_transient() => ("offline", detailed_error(error)),
         error => ("error", detailed_error(error)),
     }
@@ -790,7 +794,7 @@ impl App {
                                         "downloaded",
                                         name,
                                         activity_path,
-                                        "按需".into(),
+                                        gonedrive_ipc::ON_DEMAND_DETAIL.into(),
                                     )
                                     .await;
                                 }
@@ -1249,7 +1253,13 @@ fn pending_snapshot(store: &Store) -> gonedrive_core::Result<(u64, Vec<PendingIt
                         .as_deref()
                         .and_then(|id| store.item(id).ok().flatten())
                         .map(|item| format!("OneDrive/{}", item.name))
-                        .unwrap_or_else(|| "OneDrive/（路径不可用）".into())
+                        .unwrap_or_else(|| {
+                            gonedrive_ipc::tr!(
+                                "OneDrive/(path unavailable)",
+                                "OneDrive/（路径不可用）"
+                            )
+                            .into()
+                        })
                 });
             preview.push(PendingItem {
                 kind: op.kind.as_str().into(),

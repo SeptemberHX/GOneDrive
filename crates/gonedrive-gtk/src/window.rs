@@ -16,6 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gonedrive_ipc::tr;
 use gtk::{gio, glib};
 
 pub struct Ui {
@@ -143,15 +144,21 @@ impl Ui {
         stack.add_named(
             &adw::StatusPage::builder()
                 .icon_name("network-offline-symbolic")
-                .title("后台服务未运行")
-                .description("在终端运行 `gonedrived run` 后，此窗口会自动连接。")
+                .title(tr!(
+                    "The background service is not running",
+                    "后台服务未运行"
+                ))
+                .description(tr!(
+                    "Run `gonedrived run` in a terminal and this window connects automatically.",
+                    "在终端运行 `gonedrived run` 后，此窗口会自动连接。"
+                ))
                 .build(),
             Some("offline"),
         );
 
         // ---- page: signed out --------------------------------------------
         let login_button = gtk::Button::builder()
-            .label("登录 OneDrive")
+            .label(tr!("Sign in to OneDrive", "登录 OneDrive"))
             .halign(gtk::Align::Center)
             .build();
         login_button.add_css_class("od-primary");
@@ -174,8 +181,11 @@ impl Ui {
         login_box.append(&login_hint);
 
         let login_page = adw::StatusPage::builder()
-            .title("连接你的 OneDrive")
-            .description("登录后即可双向同步，并按需下载 —— 文件在磁盘上可见，打开才下载。")
+            .title(tr!("Connect your OneDrive", "连接你的 OneDrive"))
+            .description(tr!(
+                "Sign in for two-way sync with files on demand: every file is visible on disk and downloads when you open it.",
+                "登录后即可双向同步，并按需下载 —— 文件在磁盘上可见，打开才下载。"
+            ))
             .child(&login_box)
             .build();
         match crate::trayicon::cloud_texture(96) {
@@ -190,7 +200,7 @@ impl Ui {
         // == home ==
         let (overview, home_fields, sync_button, open_button) = Self::build_home();
         views
-            .add_titled(&overview, Some("overview"), "主页")
+            .add_titled(&overview, Some("overview"), tr!("Home", "主页"))
             .set_icon_name(Some("go-home-symbolic"));
 
         // == activity ==
@@ -200,8 +210,11 @@ impl Ui {
         activity_list.add_css_class("boxed-list");
         let activity_empty = adw::StatusPage::builder()
             .icon_name("document-open-recent-symbolic")
-            .title("还没有活动")
-            .description("同步的文件会显示在这里。")
+            .title(tr!("No activity yet", "还没有活动"))
+            .description(tr!(
+                "Synced files will show up here.",
+                "同步的文件会显示在这里。"
+            ))
             .build();
         let activity_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -218,13 +231,13 @@ impl Ui {
             .vexpand(true)
             .build();
         views
-            .add_titled(&activity_scroll, Some("activity"), "活动")
+            .add_titled(&activity_scroll, Some("activity"), tr!("Activity", "活动"))
             .set_icon_name(Some("document-open-recent-symbolic"));
 
         // == files (on-demand chooser) ==
         let (folders_scroll, folders_list, folders_path, folders_back) = Self::build_files();
         views
-            .add_titled(&folders_scroll, Some("folders"), "文件")
+            .add_titled(&folders_scroll, Some("folders"), tr!("Files", "文件"))
             .set_icon_name(Some("folder-symbolic"));
 
         {
@@ -257,13 +270,19 @@ impl Ui {
         // Header: title + a primary menu. Settings/about/open-folder live here,
         // so the three views are all the tab bar carries.
         let menu = gio::Menu::new();
-        menu.append(Some("设置"), Some("win.settings"));
-        menu.append(Some("打开 OneDrive 文件夹"), Some("app.open-folder"));
-        menu.append(Some("关于 GOnedrive"), Some("app.about"));
+        menu.append(Some(tr!("Settings", "设置")), Some("win.settings"));
+        menu.append(
+            Some(tr!("Open OneDrive folder", "打开 OneDrive 文件夹")),
+            Some("app.open-folder"),
+        );
+        menu.append(
+            Some(tr!("About GOnedrive", "关于 GOnedrive")),
+            Some("app.about"),
+        );
         let menu_button = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
             .menu_model(&menu)
-            .tooltip_text("菜单")
+            .tooltip_text(tr!("Menu", "菜单"))
             .build();
 
         let header = adw::HeaderBar::new();
@@ -375,7 +394,7 @@ impl Ui {
         let in_flight = self.login_in_flight.clone();
         self.login_button.connect_clicked(move |button| {
             button.set_sensitive(false);
-            button.set_label("正在打开浏览器…");
+            button.set_label(tr!("Opening the browser…", "正在打开浏览器…"));
             in_flight.set(true);
             let _ = commands.send_blocking(Command::StartLogin);
         });
@@ -415,13 +434,18 @@ impl Ui {
                 }
                 // Off means the whole drive comes down: worth a confirmation.
                 let dialog = adw::AlertDialog::new(
-                    Some("下载整个 OneDrive？"),
-                    Some(
+                    Some(tr!("Download your entire OneDrive?", "下载整个 OneDrive？")),
+                    Some(tr!(
+                        "With files on demand off, GOnedrive reads your whole drive again and downloads every file to this device. \
+                         This can take a lot of disk space and time. The background service restarts to apply the change.",
                         "关闭按需下载后，GOnedrive 会重新读取整个网盘并把所有文件下载到本机。\
-                         这可能占用大量磁盘空间和时间。后台服务会重启以应用此设置。",
-                    ),
+                         这可能占用大量磁盘空间和时间。后台服务会重启以应用此设置。"
+                    )),
                 );
-                dialog.add_responses(&[("cancel", "取消"), ("full", "全部下载")]);
+                dialog.add_responses(&[
+                    ("cancel", tr!("Cancel", "取消")),
+                    ("full", tr!("Download everything", "全部下载")),
+                ]);
                 dialog.set_response_appearance("full", adw::ResponseAppearance::Destructive);
                 dialog.set_default_response(Some("cancel"));
                 dialog.set_close_response("cancel");

@@ -1,6 +1,7 @@
 //! Builders for the dashboard, files-on-demand, and settings views.
 
 use adw::prelude::*;
+use gonedrive_ipc::tr;
 
 use super::Ui;
 
@@ -49,7 +50,7 @@ impl Ui {
             .hexpand(true)
             .build();
         let account_name = gtk::Label::builder().xalign(0.0).build();
-        account_name.set_markup("<b>未登录</b>");
+        account_name.set_markup(&format!("<b>{}</b>", tr!("Not signed in", "未登录")));
         account_name.set_ellipsize(gtk::pango::EllipsizeMode::End);
         let account_email = gtk::Label::builder().xalign(0.0).build();
         account_email.add_css_class("dim-label");
@@ -92,7 +93,7 @@ impl Ui {
             .hexpand(true)
             .build();
         let status_title = gtk::Label::builder().xalign(0.0).build();
-        status_title.set_markup("<b>已是最新</b>");
+        status_title.set_markup(&format!("<b>{}</b>", tr!("Up to date", "已是最新")));
         let status_sub = gtk::Label::builder()
             .xalign(0.0)
             .wrap(true)
@@ -124,10 +125,16 @@ impl Ui {
         // --- quick actions ---
         let actions = gtk::Box::builder().spacing(10).homogeneous(true).build();
         let sync_button = gtk::Button::builder().build();
-        sync_button.set_child(Some(&action_content("view-refresh-symbolic", "立即同步")));
+        sync_button.set_child(Some(&action_content(
+            "view-refresh-symbolic",
+            tr!("Sync now", "立即同步"),
+        )));
         sync_button.add_css_class("od-primary");
         let open_button = gtk::Button::builder().build();
-        open_button.set_child(Some(&action_content("folder-open-symbolic", "打开文件夹")));
+        open_button.set_child(Some(&action_content(
+            "folder-open-symbolic",
+            tr!("Open folder", "打开文件夹"),
+        )));
         actions.append(&sync_button);
         actions.append(&open_button);
         root.append(&actions);
@@ -141,9 +148,11 @@ impl Ui {
             .build();
         let peek_head = gtk::Box::builder().build();
         let peek_label = gtk::Label::builder().xalign(0.0).hexpand(true).build();
-        peek_label.set_markup("<b>最近活动</b>");
+        peek_label.set_markup(&format!("<b>{}</b>", tr!("Recent activity", "最近活动")));
         peek_label.add_css_class("caption-heading");
-        let peek_all = gtk::Button::builder().label("查看全部").build();
+        let peek_all = gtk::Button::builder()
+            .label(tr!("Show all", "查看全部"))
+            .build();
         peek_all.add_css_class("flat");
         peek_head.append(&peek_label);
         peek_head.append(&peek_all);
@@ -186,7 +195,7 @@ impl Ui {
     pub(super) fn build_files() -> (gtk::ScrolledWindow, gtk::ListBox, gtk::Label, gtk::Button) {
         let folders_back = gtk::Button::builder()
             .icon_name("go-previous-symbolic")
-            .tooltip_text("上一级")
+            .tooltip_text(tr!("Up one level", "上一级"))
             .sensitive(false)
             .build();
         folders_back.add_css_class("flat");
@@ -201,7 +210,10 @@ impl Ui {
         crumb.append(&folders_path);
 
         let hint = gtk::Label::builder()
-            .label("开关打开＝保留在本机；关闭＝释放空间，文件仍可随时打开。")
+            .label(tr!(
+                "On keeps it on this device. Off frees up the space; the files can still be opened at any time.",
+                "开关打开＝保留在本机；关闭＝释放空间，文件仍可随时打开。"
+            ))
             .wrap(true)
             .xalign(0.0)
             .build();
@@ -241,21 +253,28 @@ impl Ui {
         adw::ActionRow,
         gtk::Button,
     ) {
-        let dialog = adw::PreferencesDialog::builder().title("设置").build();
+        let dialog = adw::PreferencesDialog::builder()
+            .title(tr!("Settings", "设置"))
+            .build();
         let page = adw::PreferencesPage::new();
 
-        let sync_group = adw::PreferencesGroup::builder().title("同步").build();
+        let sync_group = adw::PreferencesGroup::builder()
+            .title(tr!("Sync", "同步"))
+            .build();
         let pause_switch = gtk::Switch::builder().valign(gtk::Align::Center).build();
         let pause_row = adw::ActionRow::builder()
-            .title("暂停同步")
-            .subtitle("暂停期间本地改动会累积，恢复后一并处理")
+            .title(tr!("Pause syncing", "暂停同步"))
+            .subtitle(tr!(
+                "Local changes are collected while paused and synced when you resume",
+                "暂停期间本地改动会累积，恢复后一并处理"
+            ))
             .build();
         pause_row.add_suffix(&pause_switch);
         pause_row.set_activatable_widget(Some(&pause_switch));
         sync_group.add(&pause_row);
 
         let folder_row = adw::ActionRow::builder()
-            .title("同步文件夹")
+            .title(tr!("Sync folder", "同步文件夹"))
             .subtitle("")
             .activatable(true)
             .build();
@@ -265,29 +284,39 @@ impl Ui {
 
         // Files on demand is the default; turning it off means "download the
         // whole drive", which the window confirms before sending.
-        let files_group = adw::PreferencesGroup::builder().title("文件").build();
+        let files_group = adw::PreferencesGroup::builder()
+            .title(tr!("Files", "文件"))
+            .build();
         let on_demand_switch = gtk::Switch::builder()
             .valign(gtk::Align::Center)
             .sensitive(false)
             .build();
         let on_demand_row = adw::ActionRow::builder()
-            .title("按需下载")
-            .subtitle("文件在打开时才下载，只索引浏览过的文件夹；关闭后会下载整个 OneDrive")
+            .title(tr!("Files on demand", "按需下载"))
+            .subtitle(tr!(
+                "Files download when opened, and only folders you browse are listed. Turning this off downloads your entire OneDrive",
+                "文件在打开时才下载，只索引浏览过的文件夹；关闭后会下载整个 OneDrive"
+            ))
             .build();
         on_demand_row.add_suffix(&on_demand_switch);
         on_demand_row.set_activatable_widget(Some(&on_demand_switch));
         files_group.add(&on_demand_row);
         page.add(&files_group);
 
-        let danger = adw::PreferencesGroup::builder().title("账户").build();
+        let danger = adw::PreferencesGroup::builder()
+            .title(tr!("Account", "账户"))
+            .build();
         let signout_button = gtk::Button::builder()
-            .label("退出登录")
+            .label(tr!("Sign out", "退出登录"))
             .valign(gtk::Align::Center)
             .build();
         signout_button.add_css_class("destructive-action");
         let signout_row = adw::ActionRow::builder()
-            .title("退出登录")
-            .subtitle("凭据会被移除，本地文件保留")
+            .title(tr!("Sign out", "退出登录"))
+            .subtitle(tr!(
+                "Your credentials are removed; local files are kept",
+                "凭据会被移除，本地文件保留"
+            ))
             .build();
         signout_row.add_suffix(&signout_button);
         danger.add(&signout_row);

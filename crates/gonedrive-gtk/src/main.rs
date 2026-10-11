@@ -14,6 +14,7 @@ mod window;
 use std::io::IsTerminal;
 
 use adw::prelude::*;
+use gonedrive_ipc::tr;
 use gtk::gio;
 use gtk::glib;
 
@@ -362,7 +363,10 @@ fn register_actions(
             .application_icon("org.gonedrive.Gonedrive")
             .version(env!("CARGO_PKG_VERSION"))
             .developer_name("GOnedrive")
-            .comments("Linux 上的 OneDrive 客户端：双向同步，按需下载。")
+            .comments(tr!(
+                "A OneDrive client for Linux: two-way sync and files on demand.",
+                "Linux 上的 OneDrive 客户端：双向同步，按需下载。"
+            ))
             .license_type(gtk::License::Gpl30)
             .build()
             .present(Some(&parent));
@@ -381,11 +385,14 @@ fn register_actions(
         // Signing out drops credentials, so it gets a confirmation; the local
         // files survive either way and the dialog says so.
         let dialog = adw::AlertDialog::builder()
-            .heading("退出登录？")
-            .body("将从密钥环中移除凭据并停止同步。本地文件会保留在磁盘上，不会被删除。")
+            .heading(tr!("Sign out?", "退出登录？"))
+            .body(tr!(
+                "Your credentials are removed from the keyring and syncing stops. Local files stay on disk and are not deleted.",
+                "将从密钥环中移除凭据并停止同步。本地文件会保留在磁盘上，不会被删除。"
+            ))
             .build();
-        dialog.add_response("cancel", "取消");
-        dialog.add_response("sign-out", "退出登录");
+        dialog.add_response("cancel", tr!("Cancel", "取消"));
+        dialog.add_response("sign-out", tr!("Sign out", "退出登录"));
         dialog.set_response_appearance("sign-out", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
 

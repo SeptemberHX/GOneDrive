@@ -778,7 +778,10 @@ impl Engine {
         self.emit(SyncEvent::Failed {
             name,
             path: None,
-            error: format!("远端变更长时间无法应用：{reason}"),
+            error: gonedrive_ipc::trf!(
+                "A remote change could not be applied for hours: {reason}",
+                "远端变更长时间无法应用：{reason}"
+            ),
         });
         self.store
             .touch_deferred_remote(&self.account_id, &item.id)?;
