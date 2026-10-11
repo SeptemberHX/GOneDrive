@@ -1,0 +1,148 @@
+# GitHub Actions — check, test and package GOnedrive into a .deb.
+#
+# Every push and pull request runs the quality gates and uploads the .deb as a
+# build artifact. Pushing a tag like `v0.1.6` (it must match the version in
+# Cargo.toml) additionally publishes a GitHub Release with the .deb attached.
+#
+# Optional repository variable (Settings → Secrets and variables → Actions →
+# Variables): GONEDRIVE_CLIENT_ID, the Entra application id baked into the
+# binaries. It is public configuration, not a secret. Without it the package
+# still builds, but each user must set `client_id` in their config to sign in.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # The code targets GTK 4.18 / libadwaita 1.7 and Linux 6.14 fanotify, so
+    # the build base is an Ubuntu that ships them. 26.04 LTS keeps receiving
+    # archive updates; non-LTS releases drop off the mirrors after nine months
+    # and break `apt-get update`. The resulting .deb runs on 26.04 and newer.
+    container:
+      image: ubuntu:26.04
+    steps:
+      - name: Install system build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates \
+            libgtk-4-dev libadwaita-1-dev \
+            python3 xvfb xauth dbus-x11 dpkg-dev
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --component rustfmt --component clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Resolve Entra client id
+        env:
+          CLIENT_ID: ${{ vars.GONEDRIVE_CLIENT_ID }}
+        run: |
+          if [ -n "${CLIENT_ID:-}" ]; then
+            printf 'GONEDRIVE_CLIENT_ID=%s\n' "$CLIENT_ID" >> "$GITHUB_ENV"
+            echo "Using GONEDRIVE_CLIENT_ID from the repository variable."
+          else
+            echo "::warning::GONEDRIVE_CLIENT_ID is not set; the package will require per-user client_id configuration."
+          fi
+
+      # A release whose tag disagrees with Cargo.toml would ship a .deb whose
+      # file name and package version contradict the release it is attached to.
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      # --- quality gates -------------------------------------------------
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The GTK tests need a display and a session bus. With CI set they refuse
+      # to skip, so a missing xvfb fails loudly instead of passing silently.
+      - name: Test
+        env:
+          CI: "true"
+        run: xvfb-run -a dbus-run-session -- cargo test --workspace
+
+      - name: Nautilus extension tests
+        run: python3 -m unittest discover -s data/nautilus/tests -v
+
+      # This client holds OAuth tokens and moves documents over TLS, so a known
+      # vulnerability in the dependency tree blocks the build. Unmaintained-
+      # crate warnings are reported but do not.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit dependencies
+        run: cargo audit
+
+      # --- the deliverable -----------------------------------------------
+      - name: Build .deb
+        run: |
+          ./build-deb.sh
+          sha256sum gonedrive_*.deb > SHA256SUMS
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gonedrive-deb
+          path: |
+            gonedrive_*.deb
+            SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download .deb artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gonedrive-deb
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            gonedrive_*.deb
+            SHA256SUMS
+          generate_release_notes: true
