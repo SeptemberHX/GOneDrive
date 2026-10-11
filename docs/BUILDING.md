@@ -2,7 +2,7 @@
 
 **English** | [简体中文](BUILDING.zh-CN.md)
 
-> Most users should install the `.deb` from [Releases](https://github.com/monotune/GOnedrive/releases) as described in the [README](../README.md). This page is for people who build, package or work on GOnedrive themselves.
+> Most users should install the `.deb` from [Releases](https://github.com/SeptemberHX/GOneDrive/releases) as described in the [README](../README.md). This page is for people who build, package or work on GOnedrive themselves.
 
 ## Build
 

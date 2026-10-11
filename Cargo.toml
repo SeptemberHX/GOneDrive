@@ -13,7 +13,7 @@ version = "0.1.6"
 edition = "2021"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/monotune/GOnedrive"
+repository = "https://github.com/SeptemberHX/GOneDrive"
 
 [workspace.dependencies]
 gonedrive-core = { path = "crates/gonedrive-core" }

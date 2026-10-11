@@ -2,7 +2,7 @@
 
 [English](BUILDING.md) | **简体中文**
 
-> 普通用户请直接用 [Releases](https://github.com/monotune/GOnedrive/releases) 里的 deb 包，见 [README](../README.zh-CN.md)。本文面向自己编译、打包或参与开发的人。
+> 普通用户请直接用 [Releases](https://github.com/SeptemberHX/GOneDrive/releases) 里的 deb 包，见 [README](../README.zh-CN.md)。本文面向自己编译、打包或参与开发的人。
 
 ## 构建
 

@@ -5,7 +5,7 @@
 #   enable:  systemctl --user enable --now gonedrived.service
 [Unit]
 Description=GOnedrive sync daemon
-Documentation=https://github.com/monotune/GOnedrive
+Documentation=https://github.com/SeptemberHX/GOneDrive
 # The daemon needs the session bus for its own interface and the Secret
 # Service for the refresh token.
 After=graphical-session.target

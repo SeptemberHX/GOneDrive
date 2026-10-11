@@ -10,8 +10,8 @@
 
 *A OneDrive client for Linux with two-way sync and true files-on-demand, built with Rust, GTK 4 and libadwaita.*
 
-[![CI](https://github.com/monotune/GOnedrive/actions/workflows/ci.yml/badge.svg)](https://github.com/monotune/GOnedrive/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/monotune/GOnedrive)](https://github.com/monotune/GOnedrive/releases)
+[![CI](https://github.com/SeptemberHX/GOneDrive/actions/workflows/ci.yml/badge.svg)](https://github.com/SeptemberHX/GOneDrive/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SeptemberHX/GOneDrive)](https://github.com/SeptemberHX/GOneDrive/releases)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
 </div>
@@ -54,7 +54,7 @@
 
 ## 安装
 
-1. 从 [Releases](https://github.com/monotune/GOnedrive/releases/latest) 下载最新的 `gonedrive_<版本>_amd64.deb`。
+1. 从 [Releases](https://github.com/SeptemberHX/GOneDrive/releases/latest) 下载最新的 `gonedrive_<版本>_amd64.deb`。
 2. 安装：
 
    ```bash

@@ -10,8 +10,8 @@
 
 Built with Rust, GTK 4 and libadwaita.
 
-[![CI](https://github.com/monotune/GOnedrive/actions/workflows/ci.yml/badge.svg)](https://github.com/monotune/GOnedrive/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/monotune/GOnedrive)](https://github.com/monotune/GOnedrive/releases)
+[![CI](https://github.com/SeptemberHX/GOneDrive/actions/workflows/ci.yml/badge.svg)](https://github.com/SeptemberHX/GOneDrive/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SeptemberHX/GOneDrive)](https://github.com/SeptemberHX/GOneDrive/releases)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
 </div>
@@ -57,7 +57,7 @@ Other distributions with kernel ≥ 6.14, GTK ≥ 4.18 and libadwaita ≥ 1.7 ca
 
 ## Install
 
-1. Download the latest `gonedrive_<version>_amd64.deb` from [Releases](https://github.com/monotune/GOnedrive/releases/latest).
+1. Download the latest `gonedrive_<version>_amd64.deb` from [Releases](https://github.com/SeptemberHX/GOneDrive/releases/latest).
 2. Install it:
 
    ```bash

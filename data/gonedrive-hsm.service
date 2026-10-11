@@ -9,7 +9,7 @@
 #   enable:  sudo systemctl enable --now gonedrive-hsm.service
 [Unit]
 Description=GOnedrive files-on-demand helper
-Documentation=https://github.com/monotune/GOnedrive
+Documentation=https://github.com/SeptemberHX/GOneDrive
 
 [Service]
 Type=simple
